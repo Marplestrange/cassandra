@@ -55014,7 +55014,20 @@ def _ged_lister_index(quoi: str, query: str) -> dict:
                           "modifie": (d["modifie"] or d["cree_le"] or "")[:16],
                           "chemin": d["chemin"], "de": d["prov_from"],
                           "sujet": d["prov_sujet"], "empreinte": d["empreinte"],
-                          "source": d["source"]})
+                          "source": d["source"],
+                          "_rp": os.path.realpath(_p) if str(d.get("source") or "").startswith("local:") else ""})
+        # UN FICHIER, UNE LIGNE (07-10) : une source parente masquée (/srv/documents) garde ses lignes
+        # d'index, et chaque fichier d'un compte y figurait deux fois — Récents doublé, et autant de faux
+        # doublons. Même fichier sur le disque : on garde la ligne de la source la plus précise.
+        _garde = {}
+        for x in items:
+            if x["_rp"]:
+                g = _garde.get(x["_rp"])
+                if g is None or len(x["source"]) > len(g["source"]):
+                    _garde[x["_rp"]] = x
+        items = [x for x in items if not x["_rp"] or _garde.get(x["_rp"]) is x]
+        for x in items:
+            x.pop("_rp", None)
         if quoi == "doublons":
             compte = {}
             for x in items:
