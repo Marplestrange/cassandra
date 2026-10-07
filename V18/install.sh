@@ -486,14 +486,24 @@ def _prelogin_iters(server, email):
     pre, _ = _req("POST", server.rstrip("/") + "/identity/accounts/prelogin", {"email": email.strip().lower()})
     if pre is None: pre, _ = _req("POST", server.rstrip("/") + "/api/accounts/prelogin", {"email": email.strip().lower()})
     return int((pre or {}).get("kdfIterations") or (pre or {}).get("KdfIterations") or 600000)
-def login(server, email, password):
+def login(server, email, password, api=None):
     server = server.rstrip("/"); email = email.strip().lower()
     it = _prelogin_iters(server, email)
     master_key = hashlib.pbkdf2_hmac("sha256", password.encode(), email.encode(), it, 32)
-    mph = b64(hashlib.pbkdf2_hmac("sha256", master_key, password.encode(), 1, 32))
-    form = {"grant_type": "password", "username": email, "password": mph, "scope": "api offline_access",
-            "client_id": "cli", "deviceType": "14", "deviceIdentifier": str(uuid.uuid4()), "deviceName": "cassandra"}
-    tok, err = _req("POST", server + "/identity/connect/token", form, form=True)
+    # Un appareil STABLE par compte : un uuid4 à chaque connexion en inscrivait un nouveau à chaque fois.
+    appareil = {"deviceType": "14", "deviceName": "cassandra",
+                "deviceIdentifier": str(uuid.uuid5(uuid.NAMESPACE_DNS, "cassandra." + email))}
+    if api:
+        # LA CLÉ D'API PERSONNELLE (client_id « user.… », client_secret) : elle ne passe pas par le second facteur
+        # du compte — la personne garde sa clé physique sur le coffre web, Cassandra entre sans elle. La clé du
+        # coffre se déchiffre toujours avec le mot de passe maître : la clé d'API seule n'ouvre rien.
+        form = dict(appareil, grant_type="client_credentials", client_id=str(api[0]), client_secret=str(api[1]), scope="api")
+    else:
+        mph = b64(hashlib.pbkdf2_hmac("sha256", master_key, password.encode(), 1, 32))
+        form = dict(appareil, grant_type="password", username=email, password=mph, scope="api offline_access", client_id="cli")
+    # Vaultwarden >= 1.37 refuse le jeton sans Bitwarden-Client-Version (400, puis 429 à force d'essais).
+    tok, err = _req("POST", server + "/identity/connect/token", form, form=True,
+                    headers={"Bitwarden-Client-Name": "cli", "Bitwarden-Client-Version": "2025.9.0", "Device-Type": "14"})
     if tok is None: return None, "token: " + str(err)
     access = tok.get("access_token"); enc_key_str = tok.get("Key") or tok.get("key")
     s_enc = _hkdf_expand(master_key, "enc", 32); s_mac = _hkdf_expand(master_key, "mac", 32)
