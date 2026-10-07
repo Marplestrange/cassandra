@@ -1,0 +1,27 @@
+# Secrets et configuration locale — ne jamais commiter
+.env
+*.env
+config.json
+*.key
+*.pem
+id_rsa*
+id_ed25519*
+secrets*
+
+# Données d'exécution
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+data/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Système
+.DS_Store
+Thumbs.db
