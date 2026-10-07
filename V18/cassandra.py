@@ -107975,7 +107975,9 @@ async function verifySession() {
     if (!sessionId) return false;
     try {
         const r = await fetch('/api/verify', { headers: { 'X-Session-Token': sessionId } });
-        if (r.ok) return true;
+        // Toujours 200 : une session expirée gardée dans l'onglet passait pour valide, l'application
+        // s'ouvrait puis tombait au premier 401. La réponse est dans `valid`.
+        if (r.ok && (await r.json()).valid === true) return true;
         logout();
         return false;
     } catch(e) { logout(); return false; }
@@ -108314,14 +108316,29 @@ function cassOublierCompte(){
 // D'où le paramètre. Il n'est pas une commodité : c'est lui qui empêche la
 // boucle, et il l'empêche sans qu'on ait à savoir QUELLE requête échoue.
 async function logout(volontaire) {
+    // UN 401 PEUT ARRIVER EN RETARD (07-10, « j'en fais les frais très régulièrement ») : une requête partie
+    // AVANT la connexion (l'horloge de l'en-tête, sans jeton) revient refusée APRÈS — et la déconnexion
+    // automatique fermait la session qu'on venait d'ouvrir, côté serveur compris. Le 401 parle de l'ancien
+    // jeton, pas forcément de celui-ci : avant de défaire, on demande au serveur si CE jeton vit encore.
+    const _sid = sessionId;
+    if (volontaire !== true && _sid) {
+        try{
+            // /api/verify répond toujours 200 : la réponse est dans `valid`, pas dans le statut.
+            const v = await fetch('/api/verify', { headers: { 'X-Session-Token': _sid } });
+            if (v.ok && (await v.json()).valid === true) return;
+        }catch(e){}
+    }
+    // Une connexion a eu lieu pendant l'attente : ce n'est plus la même session, on n'y touche pas.
+    if (volontaire !== true && sessionId !== _sid) return;
     // ON ATTEND que le serveur ferme la session AVANT de recharger : lancée
     // sans attendre, la requête est annulée par le rechargement et la session
     // resterait ouverte côté serveur jusqu'à expiration.
     try{
         await fetch('/api/logout', { method:'POST',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({session:sessionId}) });
+            body:JSON.stringify({session:_sid}) });
     }catch(e){}
+    if (volontaire !== true && sessionId !== _sid) return;
     sessionId = '';
     if (volontaire === true) {
         cassOublierCompte();
