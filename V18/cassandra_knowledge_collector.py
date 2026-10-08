@@ -3921,10 +3921,16 @@ def causes_probables(conn, entite: str, maintenant_local: str = None) -> list:
     depuis = (t - timedelta(minutes=CAUSES_FENETRE_MIN)).isoformat()
     rows = conn.execute(
         "SELECT ts, entity_type, entity_name, change_type, new_value FROM changelog WHERE ts >= ? AND ts <= ? "
-        "AND entity_type IN (%s) AND entity_name <> ? ORDER BY ts DESC LIMIT 8" % ",".join("?" * len(_CAUSES_TYPES)),
+        "AND entity_type IN (%s) AND entity_name <> ? ORDER BY ts DESC LIMIT 40" % ",".join("?" * len(_CAUSES_TYPES)),
         [depuis, t.isoformat()] + list(_CAUSES_TYPES) + [entite]).fetchall()
     out = []
     for ts, typ, nom, chg, nv in rows:
+        # Les unités systemd éphémères (timedated, hostnamed, sessions…) naissent et meurent à la demande : leur
+        # apparition ou disparition n'explique rien. Seul un service qui CHANGE d'état est une cause plausible.
+        if typ == "service" and chg in ("added", "removed"):
+            continue
+        if len(out) >= 8:
+            break
         if typ == "config_file":
             txt = "%s modifié : %s" % (nom, (nv or "")[:140])
         elif typ == "paquet":
@@ -5129,14 +5135,20 @@ def build_world_model():
 # ============================================================
 # SOCKET SERVER
 # ============================================================
+# LE SOCKET N'APPARTIENT QU'À CELUI QUI L'A CRÉÉ (08-10). Le nettoyage s'enregistrait À L'IMPORT du module : tout
+# programme qui importait le collecteur (un banc, un essai, l'autotest) effaçait en sortant le socket du collecteur EN
+# SERVICE — Cassandra lisait alors « collecteur muet », et la vigie des alertes devenait aveugle. Désormais, seul le
+# serveur qui a lié le socket le retire, et seulement si c'est encore le sien (même inode).
+_SOCKET_CREE = {"inode": None}
+
+
 def cleanup_socket():
     try:
-        if Path(SOCKET_PATH).exists():
-            Path(SOCKET_PATH).unlink()
+        p = Path(SOCKET_PATH)
+        if _SOCKET_CREE["inode"] is not None and p.exists() and p.stat().st_ino == _SOCKET_CREE["inode"]:
+            p.unlink()
     except Exception:
         pass
-
-atexit.register(cleanup_socket)
 
 
 class SharedMemorySocket:
@@ -5302,7 +5314,11 @@ class SharedMemorySocket:
                 pass
 
     def start(self):
-        cleanup_socket()
+        try:     # un socket orphelin (collecteur précédent tué sans nettoyage) : le serveur qui démarre le remplace
+            if Path(SOCKET_PATH).exists():
+                Path(SOCKET_PATH).unlink()
+        except Exception:
+            pass
         try:
             os.makedirs(os.path.dirname(SOCKET_PATH), mode=0o700, exist_ok=True)
             try:
@@ -5314,6 +5330,8 @@ class SharedMemorySocket:
             self.sock.listen(10)
             self.sock.settimeout(1.0)
             os.chmod(SOCKET_PATH, 0o600)   # root only : données système sensibles (serveur multi-tenant)
+            _SOCKET_CREE["inode"] = os.stat(SOCKET_PATH).st_ino
+            atexit.register(cleanup_socket)
             print(f"[SOCKET] Démarré sur {SOCKET_PATH}")
 
             while self.running:
