@@ -99550,6 +99550,17 @@ select.cv-mod{font-size:11px!important;color:var(--txt-soft)!important;
 @media (max-width:1400px){.pj-pane .nx{grid-template-columns:minmax(0,1fr)}.pj-pane .nx-items{max-height:260px}}
 .nx-meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0 14px}
 .nx-ink{min-height:360px}
+/* LE CONFORT DE LECTURE EN SOMBRE (07-10) : là où l'on LIT — le courriel ouvert, le document de l'Atelier, la note —
+   un anthracite plein (#1e1f24) et un blanc cassé (#e4e4e7), au lieu du noir et du blanc purs qui fatiguent l'œil
+   sur la durée. Plein, pas de verre : la pluie du fond ne défile plus derrière le texte. */
+:root[data-theme="dark"]{--lecture-fond:#1e1f24;--lecture-txt:#e4e4e7}
+:root[data-theme="dark"] #bu-mail-lecture,:root[data-theme="dark"] .card:has(#at-ed),:root[data-theme="dark"] .card:has(.nx-papier){
+  background:var(--lecture-fond)!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+:root[data-theme="dark"] .at-ed{background:var(--lecture-fond)}
+:root[data-theme="dark"] #mail-reader,:root[data-theme="dark"] .at-ed .ink-mde,:root[data-theme="dark"] .nx-papier{color:var(--lecture-txt)}
+:root[data-theme="dark"] #mail-html{background:var(--lecture-fond)!important}
+/* 2 : la ligne de lecture se tient sous ~78 signes (le document de l'Atelier l'était déjà). */
+.nx-ink .cm-content{max-width:78ch}
 .rg-tete{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px;margin-bottom:14px}
 .rg-lab{font-family:'JetBrains Mono',monospace;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--txt-muted);font-weight:600}
 .rg{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,340px);gap:14px;align-items:start}
@@ -115935,7 +115946,7 @@ function mailRenderReader(){
         // est une page normale) — RIEN d'autre : pas de script, pas de navigation du cadre.
         ? '<iframe id="mail-html" sandbox="allow-popups allow-popups-to-escape-sandbox" style="width:100%;height:100%;min-height:340px;border:none;'+
           'background:var(--surface-solid)" srcdoc="'+escapeAttr(mailWrapHtml(d.html))+'"></iframe>'
-        : '<div style="padding:17px 19px;font-size:13px;color:var(--txt-soft);line-height:1.68;'+
+        : '<div style="padding:17px 19px;font-size:13px;color:var(--txt-soft);line-height:1.68;max-width:78ch;'+
           'white-space:pre-wrap">'+_mailTexteLiens(d.body||'(message vide)')+'</div>';
     // COMBIEN, ET DE QUOI. « Images bloquées » ne disait ni le nombre ni qu'un pixel de
     // suivi ne se révèle jamais : on décidait d'afficher sans savoir ce qui partirait.
@@ -116048,10 +116059,11 @@ function mailWrapHtml(h){
     // `no-referrer` : la page ouverte depuis un lien ne sait pas qu'on vient de Cassandra.
     const sombre=_mailSombre();
     return '<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer">'+
-        '<style>html{background:#fff}body{font:13px/1.55 system-ui,sans-serif;color:#111;background:#fff;margin:12px}'+
+        '<style>html{background:#fff}body{font:13px/1.6 system-ui,sans-serif;color:#111;background:#fff;margin:12px auto;padding:0 10px;max-width:78ch}'+
         'img{max-width:100%;height:auto}table{max-width:100%}a{color:#0a58ca}'+
-        (sombre?'html{filter:invert(1) contrast(.8) hue-rotate(180deg)}'+
-                'img,picture,video,svg,canvas,[style*="background-image"],[background]{filter:contrast(1.25) invert(1) hue-rotate(180deg)}':'')+
+        // contrast(.765) : le blanc tombe sur #1e1e1e (l'anthracite du volet), le noir sur #e1e1e1 (blanc cassé).
+        (sombre?'html{filter:invert(1) contrast(.765) hue-rotate(180deg)}'+
+                'img,picture,video,svg,canvas,[style*="background-image"],[background]{filter:contrast(1.307) invert(1) hue-rotate(180deg)}':'')+
         '</style>'+(h||'');
 }
 function mailCouleursOrigine(){
@@ -118179,7 +118191,8 @@ function _inkRetinter(){
     // Et le courriel ouvert dans le Courrier, peint de même (voir mailCorpsDoc).
     try{ if(typeof mailRepeindre==='function') mailRepeindre(); }catch(x){}
 }
-try{ matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){ _inkRetinter(); }); }catch(e){}
+try{ matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){
+    if(typeof themeActuel==='function'&&themeActuel()==='auto') appliquerTheme('auto'); else _inkRetinter(); }); }catch(e){}
 function atEtat(msg,err){
     if(!AT.noeud) return;
     const e=AT.noeud.querySelector('#at-etat'), doc=AT.doc, txt=!!(doc&&!doc.binaire);
@@ -139872,8 +139885,10 @@ function themeActuel(){
 function appliquerTheme(t) {
     if (TH_ETATS.every(function(x){ return x[0] !== t; })) t = 'light';
     const r = document.documentElement;
-    // En « système », on RETIRE l'attribut : les media queries reprennent la main.
-    if (t === 'auto') r.removeAttribute('data-theme');
+    // « SYSTÈME » COMPLET (07-10) : retirer l'attribut laissait les media queries faire le reste — or presque
+    // toute l'interface ne connaît que :root[data-theme="dark"], et Windows en sombre donnait une interface claire
+    // aux îlots sombres. On pose le thème que le système demande, et on le suit quand il change.
+    if (t === 'auto') r.setAttribute('data-theme', matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
     else r.setAttribute('data-theme', t);
     const e = TH_ETATS.find(function(x){ return x[0] === t; });
     const b = document.getElementById('theme-btn');
