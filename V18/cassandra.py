@@ -18785,6 +18785,12 @@ def _perception_monde(q: str, deja: set, limite: int = 12, stricte: bool = False
             rows = filtre(rows)
         except Exception:
             pass
+    _acq = globals().get("sensorium_appliquer_acquits")
+    if callable(_acq):
+        try:
+            rows = _acq(rows)
+        except Exception:
+            pass
     out = []
 
     def _cite(nom):
@@ -18835,6 +18841,8 @@ def _perception_monde(q: str, deja: set, limite: int = 12, stricte: bool = False
 
     for r in rows:
         wk, cat, val, ts = str(r.get("wkey") or ""), str(r.get("category") or ""), str(r.get("value") or ""), r.get("observed_at")
+        if r.get("acquit"):
+            val += " (acceptée : %s)" % (r["acquit"].get("raison") or "sans raison")
         # 08-10 : une alerte porte la cause probable trouvée par le collecteur (ce qui a changé juste avant)
         if r.get("severity") == "warning" and r.get("detail"):
             try:
@@ -22289,6 +22297,12 @@ _NT_SUJET_SPECIAL = "$sujet"       # dans `aller` : l'argument est le sujet de l
 # de sujet pour lesquels l'action a un sens : « Vider la corbeille » n'a rien à faire sous « Redémarrage
 # requis ». Une ligne SANS sujet n'offre aucune action : un bouton sans cible est décoratif (tour 24).
 _NOTIF_SOURCES = {
+    # 08-10 : le sensorium — une alerte durable (10 min) devient un ÉTAT, fermé par la même mesure dès qu'elle
+    # redevient normale ; le message Telegram disparaît avec elle.
+    "sensorium": {
+        "nom": "Sensorium", "c": "warn", "niveau": "avoir", "nature": "etat",
+        "aller": ("sensorium", None, None),
+        "actions": []},
     "systeme": {
         "nom": "Système", "c": "danger", "niveau": "avoir", "nature": "etat",
         "aller": ("overview", None, None),
@@ -22818,12 +22832,26 @@ def notif_resoudre_cle(cle: str, par: str = "auto", detail: str = "", verrou_s: 
         conn = None
         try:
             conn = sqlite3.connect(MEMORY_DB_PATH, timeout=verrou_s)
+            # Ce qui va être fermé, pour prévenir l'écran et retirer les messages Telegram. Facultatif : rien de ce qui
+            # suit la fermeture ne doit pouvoir l'empêcher.
+            try:
+                fermees = conn.execute("SELECT id, COALESCE(titre, '') FROM notifs WHERE cle = ? AND resolue = 0", (cle,)).fetchall()
+            except Exception:
+                fermees = []
             cur = conn.execute(
                 "UPDATE notifs SET resolue = 1, niveau = 'regle', resolue_le = datetime('now'), "
                 "resolue_par = ?, corps = CASE WHEN ? <> '' THEN ? ELSE corps END, "
                 "duree_min = CAST((julianday('now') - julianday(ts)) * 1440 AS INTEGER) "
                 "WHERE cle = ? AND resolue = 0", (par, detail, detail, cle))
             conn.commit()
+            # 08-10 : fermée ici, l'écran ne le savait qu'au rechargement et Telegram jamais — la notification
+            # périmée restait dans la conversation. L'écran est prévenu, le message retiré.
+            _apres = globals().get("_nt_apres_fermeture")
+            if cur.rowcount and fermees and callable(_apres):
+                try:
+                    _apres([(r[0], r[1]) for r in fermees])
+                except Exception as _e:
+                    logging.info("[NOTIF] après fermeture de « %s » : %s", cle, _e)
             return cur.rowcount
         except sqlite3.OperationalError as e:
             derniere = e
@@ -22856,7 +22884,7 @@ def notif_resoudre(nid, par: str = "vous", detail: str = "") -> dict:
                            "WHERE id = ? AND resolue = 0", (par, detail, detail, int(nid)))
         conn.commit(); conn.close()
         if cur.rowcount:
-            _nt_pousser(int(nid), "ferme")
+            _nt_apres_fermeture([(int(nid), "")])
         return {"ok": True, "fermee": bool(cur.rowcount)}
     except Exception as e:
         return {"ok": False, "reason": str(e)}
@@ -23356,10 +23384,64 @@ def _nt_mail(compte: str, ligne: dict) -> bool:
 
 def _nt_telegram(compte: str, ligne: dict) -> dict:
     try:
-        return tg_envoyer(compte, _nt_texte(ligne)) or {}
+        r = tg_envoyer(compte, _nt_texte(ligne)) or {}
     except Exception as e:
         logging.info("[NOTIF] Telegram vers %s : %s", compte, e)
         return {"ok": False, "error": str(e)}
+    # 08-10 : on garde de quoi retirer le message quand la notification se ferme — un « état » réglé
+    # ne doit pas rester dans la conversation comme s'il était toujours vrai.
+    if r.get("ok") and r.get("message_id") and ligne.get("id"):
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            try:
+                conn.execute("CREATE TABLE IF NOT EXISTS notif_tg (notif INTEGER, compte TEXT, chat_id TEXT, message_id INTEGER, "
+                             "ts TEXT DEFAULT (datetime('now')))")
+                conn.execute("INSERT INTO notif_tg (notif, compte, chat_id, message_id) VALUES (?,?,?,?)",
+                             (int(ligne["id"]), compte, str(r.get("chat_id") or ""), int(r["message_id"])))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logging.info("[NOTIF] trace Telegram : %s", e)
+    return r
+
+
+def _nt_telegram_retirer(nid: int, titre: str = "") -> int:
+    """La notification est réglée : ses messages Telegram disparaissent de la conversation. Telegram ne laisse un
+    robot supprimer ses messages que 48 h ; au-delà, le message est réécrit « ✅ Résolu »."""
+    n = 0
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS notif_tg (notif INTEGER, compte TEXT, chat_id TEXT, message_id INTEGER, "
+                         "ts TEXT DEFAULT (datetime('now')))")
+            lignes = conn.execute("SELECT compte, chat_id, message_id FROM notif_tg WHERE notif = ?", (int(nid),)).fetchall()
+            for compte, chat, mid in lignes:
+                jeton = _tg_jeton(compte) if "_tg_jeton" in globals() else ""
+                r = _tg_req(jeton, "deleteMessage", {"chat_id": chat, "message_id": int(mid)})
+                if not r.get("ok"):
+                    _tg_req(jeton, "editMessageText", {"chat_id": chat, "message_id": int(mid),
+                                                       "text": "✅ Résolu — %s" % (titre or "la cause a disparu")[:300]})
+                n += 1
+            conn.execute("DELETE FROM notif_tg WHERE notif = ?", (int(nid),))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logging.info("[NOTIF] retrait Telegram %s : %s", nid, e)
+    return n
+
+
+def _nt_apres_fermeture(ids_titres) -> None:
+    """Ce qui suit la fermeture d'une notification : l'écran le sait tout de suite, Telegram retire le message."""
+    for nid, titre in ids_titres:
+        try:
+            _nt_pousser(int(nid), "ferme")
+        except Exception:
+            pass
+    if ids_titres:
+        threading.Thread(target=lambda: [ _nt_telegram_retirer(i, t) for i, t in ids_titres ],
+                         daemon=True, name="notif-retrait").start()
 
 
 def _nt_canaux(ligne: dict, monte: bool = False) -> None:
@@ -43759,6 +43841,7 @@ def tg_envoyer(user: str, texte: str) -> dict:
                 {"chat_id": _dest, "text": texte[:4000]})
     if not r.get("ok"):
         return {"ok": False, "error": str(r.get("description") or r.get("error"))[:140]}
+    _mid = ((r.get("result") or {}).get("message_id")) if isinstance(r.get("result"), dict) else None
     conn = None
     try:
         conn = _tg_conn()
@@ -43773,7 +43856,8 @@ def tg_envoyer(user: str, texte: str) -> dict:
                 conn.close()
             except Exception:
                 pass
-    return {"ok": True}
+    # L'identifiant du message : de quoi le RETIRER quand la cause disparaît (08-10)
+    return {"ok": True, "message_id": _mid, "chat_id": _dest}
 
 
 def tg_fil(user: str, limite: int = 100) -> dict:
@@ -78610,6 +78694,223 @@ def _flotte_sensorium_boucle() -> None:
         time.sleep(FLOTTE_SENSORIUM_PERIODE)
 
 
+# ── LE SENSORIUM QUI PRÉVIENT, SANS POLLUER (08-10) ───────────────────────────────────────
+# Une alerte n'est notifiée que si elle DURE (10 min) ; elle se ferme dès que la mesure est revenue normale
+# depuis 2 min, et ses messages Telegram disparaissent. Une alerte ACCEPTÉE (« je sais, c'est normal ») se
+# tait jusqu'à son échéance — ou jusqu'à ce que son chiffre empire. Un collecteur muet ne ferme rien : le
+# silence n'est pas une guérison.
+SENSORIUM_NOTIF_APRES_S = 600
+SENSORIUM_FERMER_APRES_S = 120
+_SENSORIUM_CRITIQUES = ("stockage.", "montage.", "web.", "controle.tls.", "systemd.failed_units")
+
+
+def _sensorium_conn():
+    conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE IF NOT EXISTS sensorium_acquits (wkey TEXT PRIMARY KEY, raison TEXT, jusqua TEXT, valeur TEXT, "
+                 "par TEXT, ts TEXT DEFAULT (datetime('now')))")
+    conn.execute("CREATE TABLE IF NOT EXISTS sensorium_alertes (wkey TEXT PRIMARY KEY, depuis TEXT, ok_depuis TEXT, "
+                 "nid INTEGER DEFAULT 0, valeur TEXT)")
+    return conn
+
+
+def _sensorium_nombre(v) -> float:
+    m = re.search(r"-?\d+(?:[.,]\d+)?", str(v or ""))
+    return float(m.group(0).replace(",", ".")) if m else None
+
+
+def sensorium_acquits() -> dict:
+    conn = _sensorium_conn()
+    try:
+        now = _memoire_now()
+        conn.execute("DELETE FROM sensorium_acquits WHERE jusqua <> '' AND jusqua < ?", (now,))
+        conn.commit()
+        return {r["wkey"]: dict(r) for r in conn.execute("SELECT * FROM sensorium_acquits")}
+    finally:
+        conn.close()
+
+
+def _sensorium_acquis(r: dict, acquits: dict) -> bool:
+    """Acceptée, et pas pire qu'au moment où on l'a acceptée."""
+    a = acquits.get(str(r.get("wkey") or ""))
+    if not a:
+        return False
+    avant, maintenant = _sensorium_nombre(a.get("valeur")), _sensorium_nombre(r.get("value"))
+    if avant is not None and maintenant is not None:
+        return maintenant <= avant
+    return str(a.get("valeur") or "") == str(r.get("value") or "")
+
+
+def sensorium_appliquer_acquits(rows: list, acquits: dict = None) -> list:
+    """Une alerte acceptée se lit « acceptée : raison » et ne compte plus comme alerte."""
+    acquits = sensorium_acquits() if acquits is None else acquits
+    out = []
+    for r in rows:
+        if isinstance(r, dict) and r.get("severity") == "warning" and _sensorium_acquis(r, acquits):
+            a = acquits[str(r.get("wkey"))]
+            r = dict(r)
+            r["severity"] = "info"
+            r["acquit"] = {"raison": a.get("raison") or "", "jusqua": a.get("jusqua") or "", "par": a.get("par") or ""}
+        out.append(r)
+    return out
+
+
+def sensorium_accepter(wkey: str, raison: str, jours, acteur: str = "") -> dict:
+    wkey = str(wkey or "").strip()[:200]
+    rows = {str(r.get("wkey")): r for r in (world_model_from_socket() or []) if isinstance(r, dict)}
+    if wkey not in rows:
+        return {"ok": False, "erreur": "mesure inconnue"}
+    try:
+        j = max(0, min(365, int(jours or 0)))
+    except Exception:
+        j = 30
+    jusqua = (_utcnow() + timedelta(days=j)).strftime("%Y-%m-%d %H:%M:%S") if j else ""
+    conn = _sensorium_conn()
+    try:
+        conn.execute("INSERT INTO sensorium_acquits (wkey, raison, jusqua, valeur, par) VALUES (?,?,?,?,?) "
+                     "ON CONFLICT(wkey) DO UPDATE SET raison=excluded.raison, jusqua=excluded.jusqua, valeur=excluded.valeur, "
+                     "par=excluded.par, ts=datetime('now')",
+                     (wkey, str(raison or "")[:300], jusqua, str(rows[wkey].get("value") or "")[:300], acteur))
+        conn.commit()
+    finally:
+        conn.close()
+    notif_resoudre_cle("sensorium:" + wkey, par=acteur or "vous", detail="Acceptée : %s" % (raison or "sans raison"))
+    return {"ok": True, "wkey": wkey, "jusqua": jusqua}
+
+
+def sensorium_retirer_acquit(wkey: str) -> dict:
+    conn = _sensorium_conn()
+    try:
+        n = conn.execute("DELETE FROM sensorium_acquits WHERE wkey = ?", (str(wkey or ""),)).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "retire": bool(n)}
+
+
+def _sensorium_libelle(wkey: str) -> str:
+    fam, _, reste = wkey.partition(".")
+    noms = {"service": "Service", "docker": "Conteneur", "web": "Site", "ssl": "Certificat", "machine": "Machine",
+            "sauvegarde": "Sauvegarde", "montage": "Disque", "stockage": "Stockage", "controle": "Contrôle",
+            "capteur": "Capteur", "prevision": "Prévision", "courriel": "Courriel", "ssh": "SSH", "erreurs": "Erreurs",
+            "conteneur_ressources": "Conteneur", "system": "Système", "systemd": "Systemd", "maj": "Mises à jour"}
+    return "%s %s" % (noms.get(fam, fam.capitalize()), reste.replace("_", " ")) if reste else wkey
+
+
+def _sensorium_alertes_passe() -> dict:
+    rows = world_model_from_socket() or []
+    if not rows:
+        return {"ok": False, "raison": "collecteur muet : rien n'est fermé"}
+    try:
+        rows = _flotte_filtrer_rows(rows)
+    except Exception:
+        pass
+    acquits = sensorium_acquits()
+    actives = {str(r.get("wkey")): r for r in rows
+               if isinstance(r, dict) and r.get("severity") == "warning" and not _sensorium_acquis(r, acquits)}
+    now = _utcnow()
+    fmt = "%Y-%m-%d %H:%M:%S"
+    ouvertes, fermees = 0, 0
+    conn = _sensorium_conn()
+    try:
+        etat = {r["wkey"]: dict(r) for r in conn.execute("SELECT * FROM sensorium_alertes")}
+        for wk, r in actives.items():
+            val = str(r.get("value") or "")
+            e = etat.get(wk)
+            if not e:
+                conn.execute("INSERT INTO sensorium_alertes (wkey, depuis, ok_depuis, nid, valeur) VALUES (?,?,NULL,0,?)",
+                             (wk, now.strftime(fmt), val))
+                continue
+            if e.get("ok_depuis"):
+                conn.execute("UPDATE sensorium_alertes SET ok_depuis = NULL WHERE wkey = ?", (wk,))
+            age = (now - datetime.strptime(e["depuis"], fmt)).total_seconds()
+            if age >= SENSORIUM_NOTIF_APRES_S and (not e.get("nid") or e.get("valeur") != val):
+                niveau = "critique" if wk.startswith(_SENSORIUM_CRITIQUES) else "avoir"
+                causes = []
+                try:
+                    causes = (json.loads(r.get("detail") or "{}") or {}).get("causes_probables") or []
+                except Exception:
+                    causes = []
+                n = notif("%s : %s" % (_sensorium_libelle(wk), val[:140]),
+                          corps=("En alerte depuis %d min." % (age // 60)) + (("\nCause probable : %s" % causes[0]) if causes else ""),
+                          source="sensorium", niveau=niveau, sujet=wk[:120], cle="sensorium:" + wk, nature="etat")
+                conn.execute("UPDATE sensorium_alertes SET nid = ?, valeur = ? WHERE wkey = ?", (int(n.get("id") or 0), val, wk))
+                ouvertes += 0 if e.get("nid") else 1
+        for wk, e in etat.items():
+            if wk in actives:
+                continue
+            if not e.get("ok_depuis"):
+                conn.execute("UPDATE sensorium_alertes SET ok_depuis = ? WHERE wkey = ?", (now.strftime(fmt), wk))
+                continue
+            if (now - datetime.strptime(e["ok_depuis"], fmt)).total_seconds() >= SENSORIUM_FERMER_APRES_S or wk in acquits:
+                if e.get("nid"):
+                    actuelle = next((str(r.get("value") or "") for r in rows if str(r.get("wkey")) == wk), "")
+                    notif_resoudre_cle("sensorium:" + wk, par="sensorium",
+                                       detail=("Acceptée." if wk in acquits else ("Revenu à la normale%s." % ((" : " + actuelle[:140]) if actuelle else ""))))
+                    fermees += 1
+                conn.execute("DELETE FROM sensorium_alertes WHERE wkey = ?", (wk,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "alertes": len(actives), "ouvertes": ouvertes, "fermees": fermees}
+
+
+def _sensorium_alertes_boucle() -> None:
+    time.sleep(180)          # laisser le collecteur faire son premier tour après un redémarrage
+    while True:
+        try:
+            r = _sensorium_alertes_passe()
+            if r.get("ouvertes") or r.get("fermees"):
+                logging.info("[SENSORIUM] alertes : %s", r)
+        except Exception as e:
+            logging.warning("[SENSORIUM] alertes : %s", e)
+        time.sleep(60)
+
+
+# ── Réparer en un clic : le geste du catalogue qui répond à l'alerte, toujours confirmé ──
+def _sensorium_compose_dossier(conteneur: str) -> str:
+    try:
+        out = subprocess.run(["docker", "inspect", "-f", "{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}", conteneur],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        return out if out and out != "<no value>" else ""
+    except Exception:
+        return ""
+
+
+def sensorium_gestes(r: dict) -> list:
+    wk, val = str(r.get("wkey") or ""), str(r.get("value") or "")
+    g = []
+    if wk.startswith("service.") and r.get("severity") == "warning":
+        u = wk[8:]
+        g.append({"id": "redemarrer", "libelle": "Redémarrer %s" % u, "nom": "service", "params": {"op": "restart", "unite": u}})
+    elif wk.startswith("web.") and ("ne répond" in val or val.startswith("erreur")):
+        g.append({"id": "nginx", "libelle": "Redémarrer nginx", "nom": "service", "params": {"op": "restart", "unite": "nginx"}})
+    elif wk.startswith("docker.") and r.get("severity") == "warning":
+        d = _sensorium_compose_dossier(wk[7:])
+        if d:
+            g.append({"id": "relancer", "libelle": "Relancer le conteneur (docker compose up)", "nom": "compose", "params": {"op": "up", "dossier": d}})
+    elif wk == "journaux.journald" and r.get("severity") == "warning":
+        g.append({"id": "alleger", "libelle": "Réduire le journal système à 200 Mo", "nom": "menage", "params": {"op": "journal"}})
+    elif wk == "maj.paquets" and r.get("severity") == "warning":
+        g.append({"id": "maj", "libelle": "Appliquer les mises à jour", "nom": "apt", "params": {"op": "maj"}})
+    return g
+
+
+def sensorium_reparer(wkey: str, geste: str, acteur: str = "") -> dict:
+    r = next((x for x in (world_model_from_socket() or []) if isinstance(x, dict) and str(x.get("wkey")) == str(wkey)), None)
+    if not r:
+        return {"ok": False, "erreur": "mesure inconnue"}
+    g = next((x for x in sensorium_gestes(r) if x["id"] == geste), None)
+    if not g:
+        return {"ok": False, "erreur": "ce geste ne s'applique pas (ou plus) à cette mesure"}
+    try:
+        log_admin_action("", "sensorium_reparer", "DEBUT", "mesure=%s geste=%s par=%s" % (wkey[:80], geste, acteur))
+    except Exception:
+        pass
+    res = catalogue_executer(g["nom"], g["params"])
+    return {"ok": bool(res.get("ok")), "geste": g["libelle"], "resultat": {k: (str(v)[:1500] if isinstance(v, str) else v) for k, v in (res or {}).items()}}
+
+
 def sensorium_etat() -> dict:
     """L'état complet pour la page Sensorium : le modèle du monde (filtré par l'engagement de la flotte), les
     changements récents, les corrélations, et la santé du lien avec le collecteur."""
@@ -78624,6 +78925,13 @@ def sensorium_etat() -> dict:
         rows = _flotte_filtrer_rows(rows)
     except Exception:
         pass
+    try:
+        rows = sensorium_appliquer_acquits(rows)
+        for r in rows:
+            if isinstance(r, dict) and r.get("severity") == "warning":
+                r["gestes"] = [{"id": g["id"], "libelle": g["libelle"]} for g in sensorium_gestes(r)]
+    except Exception as e:
+        logging.info("[SENSORIUM] acquits/gestes : %s", e)
     try:
         changes = world_changes_from_socket() or []
     except Exception:
@@ -95081,6 +95389,15 @@ class CassandraHandler(BaseHTTPRequestHandler):
             try:
                 if path == "/api/sensorium/etat":
                     self.send_json(sensorium_etat()); return
+                if path == "/api/sensorium/accepter":
+                    self.send_json(sensorium_accepter(str(data.get("wkey") or ""), str(data.get("raison") or ""), data.get("jours"),
+                                                      get_session_user(_ssid))); return
+                if path == "/api/sensorium/retirer":
+                    self.send_json(sensorium_retirer_acquit(str(data.get("wkey") or ""))); return
+                if path == "/api/sensorium/reparer":
+                    if not data.get("confirme"):
+                        self.send_json({"ok": False, "erreur": "confirmation requise"}); return
+                    self.send_json(sensorium_reparer(str(data.get("wkey") or ""), str(data.get("geste") or ""), get_session_user(_ssid))); return
                 if path == "/api/sensorium/flotte":
                     threading.Thread(target=flotte_sensorium_passe, daemon=True, name="flotte-sensorium-demande").start()
                     self.send_json({"ok": True, "lance": True}); return
@@ -114947,11 +115264,31 @@ function snRail(){
   const b = document.getElementById('sn-badge'); if(b){ b.style.display = nW?'':'none'; b.textContent = nW; }
 }
 function _snLigne(r, avecFam){
-  const wk = String(r.wkey||''), w = r.severity==='warning', causes = _snCauses(r);
-  return `<div class="mx-row"><span class="mx-dot ${w?'warn':'ok'}"></span>
-    <div class="mx-rt"><b>${_snE(_snNom(wk))}${avecFam?` <span class="mx-pill">${_snE(wk.split('.')[0])}</span>`:''}</b><span>${_snE(r.value)}</span>
+  const wk = String(r.wkey||''), w = r.severity==='warning', causes = _snCauses(r), a = r.acquit;
+  const gestes = (r.gestes||[]).map(g=>`<button class="mx-btn" onclick='snReparer(${JSON.stringify(wk)}, ${JSON.stringify(g.id)}, ${JSON.stringify(g.libelle)})'>${_snE(g.libelle)}</button>`).join('');
+  const acc = w ? `<button class="mx-btn" onclick='snAccepter(${JSON.stringify(wk)})' title="Je sais, c'est normal : se taire jusqu'à l'échéance (revient si ça empire)">Accepter…</button>`
+           : (a ? `<button class="mx-btn" onclick='snRetirerAcquit(${JSON.stringify(wk)})'>Ne plus accepter</button>` : '');
+  return `<div class="mx-row"><span class="mx-dot ${w?'warn':(a?'':'ok')}"></span>
+    <div class="mx-rt"><b>${_snE(_snNom(wk))}${avecFam?` <span class="mx-pill">${_snE(wk.split('.')[0])}</span>`:''}${a?` <span class="mx-pill">acceptée</span>`:''}</b><span>${_snE(r.value)}</span>
+    ${a?`<span>acceptée : ${_snE(a.raison||'sans raison')}${a.jusqua?' · jusqu\'au '+_snE(String(a.jusqua).slice(0,10)):''}</span>`:''}
     ${causes.length?`<span style="color:var(--warn)">cause probable : ${_snE(causes[0])}${causes.length>1?` <span class="mx-st">(+${causes.length-1})</span>`:''}</span>`:''}</div>
-    <span class="mx-st" title="${_snE(r.observed_at||'')}">il y a ${_snAge(r.observed_at)}</span></div>`;
+    <div class="mx-gest"><span class="mx-st" title="${_snE(r.observed_at||'')}">il y a ${_snAge(r.observed_at)}</span>${gestes}${acc}</div></div>`;
+}
+async function snAccepter(wk){
+  const raison = prompt("Pourquoi cette alerte est-elle normale ?\n(elle se taira, et reviendra si son chiffre empire)", "");
+  if(raison===null) return;
+  const jours = prompt("Pendant combien de jours ? (0 = sans échéance)", "30");
+  if(jours===null) return;
+  const r = await apiPost('/api/sensorium/accepter', {wkey:wk, raison:raison, jours:parseInt(jours||'30',10)||0});
+  if(!r || !r.ok){ alert('Impossible : '+((r&&r.erreur)||'?')); return; }
+  snEntrer();
+}
+async function snRetirerAcquit(wk){ await apiPost('/api/sensorium/retirer', {wkey:wk}); snEntrer(); }
+async function snReparer(wk, geste, libelle){
+  if(!confirm(libelle+' ?\n\nLe geste passe par le catalogue sécurisé de Cassandra.')) return;
+  const r = await apiPost('/api/sensorium/reparer', {wkey:wk, geste:geste, confirme:true});
+  alert((r&&r.ok?'Fait : ':'Échec : ')+((r&&(r.geste||r.erreur))||'')+(r&&r.resultat&&r.resultat.sortie?'\n\n'+String(r.resultat.sortie).slice(0,600):''));
+  setTimeout(snEntrer, 4000);
 }
 function snRendre(){
   const page = document.getElementById('sn-page'); if(!page) return;
@@ -147722,7 +148059,8 @@ if __name__ == "__main__":
             logging.info("[MEM] veille non armee : %s" % str(_e)[:120])
         start_proactive()             # [PROACTIVE] veille Sensorium → détection → action sous garde
         threading.Thread(target=_memoire_sauvegarde_boucle, daemon=True, name="memoire-sauvegarde").start()
-        threading.Thread(target=_flotte_sensorium_boucle, daemon=True, name="flotte-sensorium").start()  # [SENSORIUM] la flotte, toutes les 15 min (08-10)  # [MEMORY] une copie par jour (lot 0, 21-09)
+        threading.Thread(target=_flotte_sensorium_boucle, daemon=True, name="flotte-sensorium").start()
+        threading.Thread(target=_sensorium_alertes_boucle, daemon=True, name="sensorium-alertes").start()  # notifications qui s'effacent seules (08-10)  # [SENSORIUM] la flotte, toutes les 15 min (08-10)  # [MEMORY] une copie par jour (lot 0, 21-09)
         salon_presence_demarrer()     # [SALON] les résidents répondent à ce qui leur est adressé
         start_itare_autonome()        # [ITARE] étage autonome local (OFF par défaut, toggle: itare_autonome_enabled)
         start_vault_seed()            # [VAULT] rapatrie les secrets dans le coffre (filet : fichiers conservés)
