@@ -115953,6 +115953,11 @@ function mailRenderReader(){
         : ((d.html && MAIL.showImages && nPix)
           ? '<div style="padding:8px 19px;background:var(--ov-03);border-bottom:1px solid var(--line);'+
             'font-size:11px;color:var(--txt-faint)">Images affichées.'+escapeHtml(_pix)+'</div>' : '');
+    const sombreBar=(d.html && typeof _atApparence==='function' && _atApparence()==='dark')
+        ? '<div style="padding:5px 19px;border-bottom:1px solid var(--line);font-size:10.5px;color:var(--txt-faint);text-align:right">'+
+          (_mailSombre()?'Affiché en sombre · ':'Couleurs d\'origine · ')+
+          '<span onclick="mailCouleursOrigine()" style="cursor:pointer;text-decoration:underline">'+
+          (_mailSombre()?'Couleurs d\'origine':'Revenir au sombre')+'</span></div>' : '';
     const nom=d.from_name||_mailName(d.from||'');
     r.innerHTML=
       '<div style="padding:16px 19px 14px;border-bottom:1px solid var(--line)">'+
@@ -115977,7 +115982,7 @@ function mailRenderReader(){
       '<div id="itare-mail-summary" style="display:none;margin:12px 19px 0;background:var(--acc-10);'+
       'border:1px solid var(--acc-20);border-radius:12px;padding:12px 14px;font-size:12.5px;'+
       'line-height:1.55;color:var(--txt)"></div>'+
-      imgBar+pjHtml+
+      imgBar+sombreBar+pjHtml+
       '<div style="flex:1;min-height:0;overflow:auto">'+corps+'</div>'+
       // Vos réponses vivent dans « Envoyés », ses questions dans la réception :
       // un fil lu depuis un seul dossier est amputé de la moitié de la
@@ -116030,13 +116035,32 @@ function _mailTexteLiens(t){
         return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>'+fin;
     });
 }
+// LE COURRIEL EN MODE SOMBRE (07-10, « le fond reste blanc ») : un message HTML porte ses propres couleurs —
+// tableaux blancs, textes noirs — et changer le fond n'y suffit pas. On l'inverse en douceur, comme Thunderbird ou
+// Dark Reader : invert + contrast(.8) envoie le blanc sur #1a1a1a et le noir sur un gris clair, hue-rotate garde
+// les teintes (un lien bleu reste bleu). Les images reçoivent l'inverse EXACT — contrast(1.25) puis invert — et
+// gardent leurs vraies couleurs. « Couleurs d'origine » rend le message tel qu'envoyé, pour celui-ci seulement.
+function _mailSombre(){
+    const k=String((ETAT.courrier&&ETAT.courrier._itareMailUid)||'');
+    return typeof _atApparence==='function' && _atApparence()==='dark' && !(k && MAIL.origine===k);
+}
 function mailWrapHtml(h){
     // `no-referrer` : la page ouverte depuis un lien ne sait pas qu'on vient de Cassandra.
+    const sombre=_mailSombre();
     return '<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer">'+
-        '<style>body{font:13px/1.55 system-ui,sans-serif;color:#111;background:var(--on-accent);margin:12px}'+
-        'img{max-width:100%;height:auto}table{max-width:100%}a{color:#0a58ca}</style>'+
-        (h||'');
+        '<style>html{background:#fff}body{font:13px/1.55 system-ui,sans-serif;color:#111;background:#fff;margin:12px}'+
+        'img{max-width:100%;height:auto}table{max-width:100%}a{color:#0a58ca}'+
+        (sombre?'html{filter:invert(1) contrast(.8) hue-rotate(180deg)}'+
+                'img,picture,video,svg,canvas,[style*="background-image"],[background]{filter:contrast(1.25) invert(1) hue-rotate(180deg)}':'')+
+        '</style>'+(h||'');
 }
+function mailCouleursOrigine(){
+    const k=String((ETAT.courrier&&ETAT.courrier._itareMailUid)||''); if(!MAIL.cur||!k) return;
+    MAIL.origine=(MAIL.origine===k)?null:k;
+    mailRenderReader();
+}
+// Appelée par _inkRetinter quand le thème change : le message ouvert se repeint.
+function mailRepeindre(){ if(document.getElementById('mail-html') && MAIL.cur) mailRenderReader(); }
 
 // Révéler les images d'un corps : les attributs inertes redeviennent chargeants.
 // Les `data-tracker-*` — les pixels de 1×1 — n'en font pas partie et restent muets.
@@ -118128,8 +118152,34 @@ function atChargerInk(){
     return _atInkP;
 }
 function _atApparence(){
-    try{ return /dark/.test(getComputedStyle(document.documentElement).colorScheme||'')?'dark':'light'; }catch(e){ return 'light'; }
+    // En « Système », :root déclare color-scheme: light et seules les variables passent au sombre : on lit alors
+    // le système lui-même, sinon l'éditeur restait clair dans une interface sombre (07-10).
+    try{
+        if(!document.documentElement.getAttribute('data-theme')) return matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
+        return /dark/.test(getComputedStyle(document.documentElement).colorScheme||'')?'dark':'light';
+    }catch(e){ return 'light'; }
 }
+// L'ÉDITEUR SUIT LE THÈME (07-10, « le fond reste blanc ») : ink-mde choisit ses couleurs à sa création et ne les
+// change plus. Changer de thème, ou le système en mode « Système », laissait l'éditeur ouvert dans l'ancien.
+// Chaque éditeur vivant se retrouve par son hôte (h._ink, h._ed) et se reteint sans perdre texte ni réglages.
+function _inkRetinter(){
+    const a=_atApparence();
+    document.querySelectorAll('.ink-mde').forEach(function(e){
+        let h=e.parentElement, ed=null;
+        for(let i=0;i<3&&h&&!ed;i++,h=h.parentElement) ed=h._ink||h._ed||null;
+        if(!ed||typeof ed.options!=='function') return;
+        try{
+            const o=ed.options()||{}, it=o.interface||{};
+            if(it.appearance===a) return;
+            ed.reconfigure(Object.assign({},o,{interface:Object.assign({},it,{appearance:a})}));
+        }catch(x){}
+    });
+    // L'aperçu de l'Atelier est une page à part, peinte à son rendu : on la repeint.
+    try{ if(typeof AT!=='undefined'&&AT.apercu&&AT.noeud&&typeof atApercuRendre==='function') atApercuRendre(); }catch(x){}
+    // Et le courriel ouvert dans le Courrier, peint de même (voir mailCorpsDoc).
+    try{ if(typeof mailRepeindre==='function') mailRepeindre(); }catch(x){}
+}
+try{ matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){ _inkRetinter(); }); }catch(e){}
 function atEtat(msg,err){
     if(!AT.noeud) return;
     const e=AT.noeud.querySelector('#at-etat'), doc=AT.doc, txt=!!(doc&&!doc.binaire);
@@ -118185,7 +118235,7 @@ async function atEditeur(texte){
     AT.base=texte; AT.sale=false;
     if(AT.ed){ AT.ed.update(texte); return; }
     hote.innerHTML='';
-    AT.ed=EditeurInk.ink(hote,{doc:texte,
+    AT.ed=hote._ink=EditeurInk.ink(hote,{doc:texte,
         interface:{appearance:_atApparence(),attribution:false,toolbar:!AT.lecture,spellcheck:true,lists:true,images:true,readonly:!!AT.lecture},
         hooks:{afterUpdate:function(d){ const avant=AT.sale; AT.sale=(d!==AT.base); if(avant!==AT.sale) atEtat(); atMinuteur(); }}});
 }
@@ -131877,7 +131927,7 @@ async function nxOuvrir(id, force){
     try{ await atChargerInk(); }
     catch(e){ document.getElementById('nx-ink').innerHTML='<div class="pj-vide" style="color:var(--danger)">'+escapeHtml(e.message)+'</div>'; return; }
     if(NX.sel!==id) return;
-    NX.ed=EditeurInk.ink(document.getElementById('nx-ink'),{doc:NX.base,
+    NX.ed=document.getElementById('nx-ink')._ink=EditeurInk.ink(document.getElementById('nx-ink'),{doc:NX.base,
         interface:{appearance:_atApparence(),attribution:false,toolbar:true,spellcheck:true,lists:true,images:true,readonly:false},
         hooks:{afterUpdate:function(){ nxSale(); }}});
     w.onkeydown=function(e){ if((e.ctrlKey||e.metaKey)&&(e.key==='s'||e.key==='S')){ e.preventDefault(); nxEnregistrer(); } };
@@ -139831,6 +139881,7 @@ function appliquerTheme(t) {
     document.querySelectorAll('#um-seg [data-th]').forEach(function(x){
         x.setAttribute('aria-pressed', String(x.dataset.th === t)); });
     try { localStorage.setItem('cass_theme', t); } catch(e2) {}
+    if (typeof _inkRetinter === 'function') _inkRetinter();
 }
 function basculerTheme() {
     const i = TH_ETATS.findIndex(function(x){ return x[0] === themeActuel(); });
