@@ -1775,8 +1775,10 @@ def collect_web_sites():
                 # Un 502/503 ou un silence peut être l'instant d'un redémarrage (un déploiement redémarre
                 # l'application ET le collecteur) : revérifié 3 s plus tard avant d'être une alerte (08-10).
                 c = _sonde_http(st["domain"], st.get("listen_ip") or "")
-                if c in ("000", "502", "503", "504"):
-                    time.sleep(3)
+                for attente in (3, 12):       # un redémarrage d'application dure une quinzaine de secondes
+                    if c not in ("000", "502", "503", "504"):
+                        break
+                    time.sleep(attente)
                     c = _sonde_http(st["domain"], st.get("listen_ip") or "")
                 return c
             for site, code in zip(sites, ex.map(_sonde_confirmee, sites)):
