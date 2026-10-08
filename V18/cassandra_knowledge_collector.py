@@ -2771,8 +2771,8 @@ def collect_config_snapshots() -> list:
                 conn.execute("INSERT INTO config_contenu (path, texte) VALUES (?,?) ON CONFLICT(path) DO UPDATE SET texte=excluded.texte",
                              (path, etat))
 
-        # Persistance atomique
-        conn.execute("BEGIN")
+        # Persistance atomique — la transaction est déjà ouverte par les écritures de config_contenu
+        # (sqlite3 l'ouvre seul au premier INSERT) : un BEGIN ici échouait et perdait toute la passe (08-10).
         conn.executemany(
             "INSERT INTO config_snapshots (path, sha256, size, mtime, last_check) "
             "VALUES (?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
