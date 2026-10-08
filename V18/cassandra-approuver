@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# ============================================================
+#  cassandra-approuver — le geste HUMAIN qui approuve une conf.
+#
+#    cassandra-approuver <famille> <nom.conf> [--oui]
+#
+#  Copie un brouillon de /opt/cassandra/travail/conf/<famille>/<nom.conf>
+#  vers /opt/cassandra/conf_approuve/<famille>/<nom.conf>, le diff sous les
+#  yeux. Le fichier approuvé est la SEULE source que le catalogue `conf`
+#  accepte pour poser une configuration (posée avec filet : sauvegarde,
+#  test, reload, retour arrière).
+#
+#  Familles admises : nginx, nginxd, default (/etc/default — la cible ne
+#  porte pas le suffixe .conf : `default/prometheus.conf` → /etc/default/prometheus).
+#
+#  Sans --oui : affiche le diff et ce qui SERAIT fait, sans rien écrire.
+#  Avec  --oui : écrit (atomique), root 0440, puis vérifie les mêmes
+#                critères que _conf_approuves() dans cassandra.py.
+# ============================================================
+set -euo pipefail
+
+APP_DIR=/opt/cassandra
+BROUILLONS="$APP_DIR/travail/conf"
+APPROUVES="$APP_DIR/conf_approuve"
+FAMILLES_CIBLES="nginx nginxd default"
+
+usage() {
+    echo "Usage : cassandra-approuver <famille> <nom.conf> [--oui]" >&2
+    echo "  familles : $FAMILLES_CIBLES" >&2
+    exit 2
+}
+
+[ "$(id -u)" -eq 0 ] || { echo "cassandra-approuver : à lancer en root (sudo)." >&2; exit 1; }
+[ $# -ge 2 ] && [ $# -le 3 ] || usage
+
+famille="$1"
+nom="$2"
+oui=0
+if [ $# -eq 3 ]; then
+    [ "$3" = "--oui" ] || usage
+    oui=1
+fi
+
+case " $FAMILLES_CIBLES " in
+    *" $famille "*) ;;
+    *) echo "cassandra-approuver : famille inconnue « $famille » (admises : $FAMILLES_CIBLES)" >&2; exit 2 ;;
+esac
+
+if ! [[ "$nom" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.conf$ ]]; then
+    echo "cassandra-approuver : nom « $nom » invalide (attendu : <nom>.conf)" >&2
+    exit 2
+fi
+
+src="$BROUILLONS/$famille/$nom"
+dst="$APPROUVES/$famille/$nom"
+
+if [ ! -f "$src" ] || [ -L "$src" ]; then
+    echo "cassandra-approuver : brouillon introuvable — $src" >&2
+    echo "  Dépose d'abord le brouillon dans $BROUILLONS/$famille/." >&2
+    exit 1
+fi
+
+echo "=== cassandra-approuver : $famille/$nom ==="
+echo
+echo "Brouillon : $src"
+echo "Cible approuvée : $dst"
+echo
+
+if [ -f "$dst" ]; then
+    echo "--- diff (approuvé actuel -> brouillon) ---"
+    if diff -u "$dst" "$src"; then
+        echo "(aucune différence : contenu déjà approuvé)"
+    fi
+else
+    echo "--- nouveau fichier (pas encore de version approuvée) ---"
+    sed 's/^/+/' "$src"
+fi
+echo
+
+if [ "$oui" -ne 1 ]; then
+    echo "RIEN écrit. Pour approuver, relance : cassandra-approuver $famille $nom --oui" >&2
+    exit 0
+fi
+
+mkdir -p "$APPROUVES/$famille"
+tmp="$dst.cassandra.tmp"
+rm -f "$tmp"
+cat "$src" > "$tmp"
+chown root:root "$tmp"
+chmod 0440 "$tmp"
+mv -f "$tmp" "$dst"
+chown root:root "$dst"
+chmod 0440 "$dst"
+
+# Vérification finale : mêmes critères que _conf_approuves() dans cassandra.py.
+# Régulier, pas un lien, à root, ni groupe ni autres en écriture.
+if [ -L "$dst" ] || [ ! -f "$dst" ] \
+   || [ "$(stat -c %u "$dst")" != "0" ] \
+   || [ "$(stat -c %a "$dst")" != "440" ]; then
+    echo "cassandra-approuver : échec de la vérification finale sur $dst." >&2
+    exit 1
+fi
+
+echo "✓ approuvé : $famille/$nom (root 0440)."
+echo "  Le catalogue \`conf\` peut maintenant le poser : conf(op=poser, fichier=$famille/$nom)"

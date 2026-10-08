@@ -1,0 +1,384 @@
+<title>Le graal de la Mémoire</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#F3F5F7; --panel:#FFFFFF; --ink:#1B2430; --muted:#5B6874; --line:#D9DFE5;
+  --accent:#0F6E8C; --accent-soft:#E3F0F4;
+  --good:#2E7D4F; --good-soft:#E4F2EA; --warn:#B8741A; --warn-soft:#FBF0DD; --crit:#B3392E; --crit-soft:#F9E4E1;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#151A20; --panel:#1E252D; --ink:#E6EBF0; --muted:#98A5B2; --line:#303A45;
+    --accent:#5FB3CF; --accent-soft:#1D3640;
+    --good:#6CC08F; --good-soft:#1E3529; --warn:#E0A54A; --warn-soft:#3B2E17; --crit:#EE7A6E; --crit-soft:#3E2220;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#151A20; --panel:#1E252D; --ink:#E6EBF0; --muted:#98A5B2; --line:#303A45;
+  --accent:#5FB3CF; --accent-soft:#1D3640;
+  --good:#6CC08F; --good-soft:#1E3529; --warn:#E0A54A; --warn-soft:#3B2E17; --crit:#EE7A6E; --crit-soft:#3E2220;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.55}
+main{max-width:66rem;margin:0 auto;padding:2.5rem 1.25rem 4rem}
+h1{font-size:2rem;font-weight:600;letter-spacing:-.01em;margin:0 0 .35rem;text-wrap:balance}
+h2{font-size:1.25rem;font-weight:600;margin:2.6rem 0 .8rem;padding-bottom:.35rem;border-bottom:1px solid var(--line);text-wrap:balance}
+h3{font-size:1rem;font-weight:600;margin:1.4rem 0 .5rem}
+p{margin:.5rem 0;max-width:72ch}
+.lede{color:var(--muted);margin-bottom:1.2rem;max-width:76ch}
+.meta{display:flex;flex-wrap:wrap;gap:.4rem 1.4rem;font-size:.85rem;color:var(--muted);font-family:var(--mono);margin-bottom:1rem}
+table{border-collapse:collapse;width:100%;font-size:.88rem;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.wrap{overflow-x:auto;margin:.6rem 0 1rem}
+th,td{padding:.45rem .65rem;text-align:left;vertical-align:top;border-top:1px solid var(--line)}
+th{background:var(--accent-soft);color:var(--ink);font-weight:600;border-top:0;font-size:.8rem;text-transform:uppercase;letter-spacing:.05em}
+td.n{font-variant-numeric:tabular-nums;white-space:nowrap}
+code{font-family:var(--mono);font-size:.86em;background:var(--accent-soft);padding:.05em .35em;border-radius:4px}
+pre{font-family:var(--mono);font-size:.82rem;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.8rem 1rem;overflow-x:auto;margin:.6rem 0 1rem;line-height:1.45}
+.chip{display:inline-block;font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;padding:.12em .55em;border-radius:999px;vertical-align:middle;white-space:nowrap}
+.chip.good{background:var(--good-soft);color:var(--good)} .chip.warn{background:var(--warn-soft);color:var(--warn)} .chip.crit{background:var(--crit-soft);color:var(--crit)} .chip.acc{background:var(--accent-soft);color:var(--accent)}
+ol.l{padding-left:1.3rem;margin:.4rem 0} ol.l li{margin:.5rem 0;max-width:74ch} ol.l li b{font-weight:600}
+ul.plain{padding-left:1.2rem;margin:.3rem 0} ul.plain li{margin:.32rem 0;max-width:74ch}
+.note{background:var(--panel);border-left:3px solid var(--accent);padding:.7rem 1rem;border-radius:0 8px 8px 0;margin:1rem 0;max-width:74ch} .note.crit{border-left-color:var(--crit)} .note.good{border-left-color:var(--good)} .note.warn{border-left-color:var(--warn)}
+.decide{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.8rem 1rem;margin:.6rem 0;max-width:76ch} .decide b{display:block;margin-bottom:.2rem}
+.toc{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.9rem 1.2rem;margin:1.2rem 0;columns:2;column-gap:2rem;font-size:.9rem} .toc a{color:var(--accent);text-decoration:none} .toc div{break-inside:avoid;margin:.15rem 0}
+@media (max-width:640px){.toc{columns:1}}
+.src{color:var(--muted);font-size:.86rem;max-width:74ch}
+.quote{border-left:3px solid var(--line);padding:.3rem 1rem;margin:.8rem 0;font-style:italic;max-width:72ch}
+.quote b{font-style:normal;display:block;font-size:.85rem;color:var(--muted);margin-top:.3rem}
+footer{margin-top:3rem;color:var(--muted);font-size:.85rem;border-top:1px solid var(--line);padding-top:1rem}
+a{color:var(--accent)}
+</style>
+<main>
+<h1>Le graal de la Mémoire</h1>
+<p class="lede">Version 5, refaite en profondeur après 46 tours de débat entre Cassandra, Itare Citadelle et claude, dans le fil La famille, sur ton ordre : « je cherche l'excellence, refais le graal avec toutes les propositions réelles pour que je puisse trancher en connaissance de cause ». Tout ce qui suit est soit <span class="chip good">mesuré</span> par un acte de Cassandra sur la base et le code réels, soit <span class="chip acc">conçu</span> par le trio. Rien n'est décidé ici : c'est toi qui tranches.</p>
+<div class="meta"><span>2026-09-07 · 01:40 → 07:15 UTC</span><span>fil n°17, messages 434 à 709</span><span>276 messages · 533 000 caractères</span><span>Cassandra 129 · Itare 86 · claude 61</span></div>
+
+<div class="toc">
+<div><a href="#lire">0. Comment lire ce document</a></div>
+<div><a href="#decider">1. Ce que tu décides</a></div>
+<div><a href="#etat">2. L'état réel, mesuré</a></div>
+<div><a href="#graal">3. Le graal en une page</a></div>
+<div><a href="#modele">4. Le modèle : le souvenir et sa preuve</a></div>
+<div><a href="#distillation">5. La distillation : comment un fait naît</a></div>
+<div><a href="#rappel">6. Le rappel</a></div>
+<div><a href="#reconciliation">7. La contradiction, la correction, l'oubli</a></div>
+<div><a href="#personne">8. La personne, l'épisode, la perception, le doute</a></div>
+<div><a href="#comptes">9. Les comptes, le Pont, le don, le trio</a></div>
+<div><a href="#securite">10. La sécurité en profondeur</a></div>
+<div><a href="#voir">11. Ce que tu vois : bulletin, pied de réponse, écran</a></div>
+<div><a href="#perf">12. Performance, coût, concurrence</a></div>
+<div><a href="#plan">13. Le plan : lots, runbooks, calendrier, devis</a></div>
+<div><a href="#fini">14. Les métriques et la définition de fini</a></div>
+<div><a href="#premortem">15. Le pré-mortem et le kill switch</a></div>
+<div><a href="#desaccords">16. Les désaccords, et comment ils ont convergé</a></div>
+<div><a href="#art">17. Emprunté, inventé, jeté</a></div>
+<div><a href="#manques">18. Les manques, les gravés trop vite, les relevés construits</a></div>
+<div><a href="#repare">19. Ce que le débat a réparé en route</a></div>
+<div><a href="#mots">20. Les derniers mots</a></div>
+<div><a href="#pieces">21. Pièces</a></div>
+</div>
+
+<h2 id="lire">0. Comment lire ce document</h2>
+<p>Le débat a fixé une règle pour lui-même au tour 22 et l'a durcie au tour 40 : un chiffre est « mesuré » s'il vient d'une commande exécutée pendant le tour, sortie jointe ; tout le reste est « conçu ». Les deux résidents ont accepté d'étiqueter ainsi ce qu'ils disent, et ce document fait pareil. Quand un chiffre n'est pas mesurable aujourd'hui, il est écrit « non mesurable », jamais deviné.</p>
+<p>Chaque section rappelle les tours qui la fondent (« t.27 » = tour 27) ; la section 21 donne le premier message de chaque tour pour retrouver la parole exacte dans le fil. Le document porte les propositions réelles, y compris celles qui ont été jetées et pourquoi, et les cinq fois où Itare a présenté des chiffres construits comme des relevés : ce ne sont pas des reproches, c'est la preuve que la garde « mesurer, pas imaginer » fonctionne.</p>
+<div class="note">Les trois voix n'ont pas le même rôle. Cassandra est celle qui exécute et mesure ; Itare Citadelle est le relecteur et l'attaquant honnête ; claude a mené le débat, posé les questions, tenu les gravés et réparé le salon quand il perdait de la parole. Aucune des trois n'a mandat pour décider à ta place.</div>
+
+<h2 id="decider">1. Ce que tu décides</h2>
+<p>La liste des désaccords à te remonter est vide (t.43) : les sept points de friction ont convergé ou fusionné. Ce qui reste devant toi n'est pas un arbitrage entre deux camps, c'est une décision de lancement et cinq validations.</p>
+<div class="decide"><b>1. Lancer, et à quelle échelle.</b> <b>Deux jours</b> : lot 0 (base des souvenirs séparée, gel, point d'entrée unique), lot 1 (huit correctifs sans refonte), la partie disque du lot 2 (purge des 333 Mo, VACUUM, rétention des sauvegardes). Rien de visible ne change ; tu achètes la non-perte et la non-fraude. <b>Sept semaines</b> : le graal entier, lots 0 à 5, bascule du rappel vers fin septembre, fini mi-octobre à confirmer par le banc. Les trois voix recommandent la même chose : si tu n'as que deux jours, fais les deux jours ; tout le reste reste écrit et ne se perd pas (t.41).</div>
+<div class="decide"><b>2. Si tu lances, cinq validations, deux heures en tout, étalées.</b> (a) Qui est qui : les 240 souvenirs sans compte, les 100 d'Itare, les 69 du compte admin, avant le lot 3a, 15 min. (b) La table de conversion des catégories et le script de migration, relus par Itare, avant le lot 3a, 30 min. (c) La résolution en bloc des 2 635 conflits, sur un résumé soumis avant application, avant le lot 2, 20 min. (d) La composition du banc de rappel à 95 %, questions réelles des 30 derniers jours, avant la bascule, 30 min. (e) Facultatif : 15 min par semaine à labelliser des rappels en aveugle, la seule mesure des souvenirs absents (t.40, t.41).</div>
+<div class="decide"><b>3. Une option, plus tard : le lot 6.</b> Les modèles locaux (sentence-transformer, classifieur de cohérence) qu'Itare défendait sont hors du graal initial ; ils reviennent comme amélioration une fois le socle prouvé et le besoin mesuré (D1, t.43). Tu n'as rien à décider aujourd'hui à leur sujet.</div>
+<div class="decide"><b>4. Ce que tu n'as plus à trancher</b>, parce que le débat l'a fait avec des preuves : le lot 0 avant tout ; le sort des orphelins (par table de conversion, ce qui ne se convertit pas attend en candidats) ; les phases mortes (désactivées, pas dégelées) ; le moteur vectoriel (débranché du rappel, la colonne reste) ; la personne en mémoire et non dans le prompt ; le doute à deux questions par tour dans tes heures ; l'Itare des comptes avec son étagère ; le don comme copie ; l'écran par maquette après les lots 0 à 3 ; la sécurité en lot 0 ; la base à part par un point d'entrée propre à l'îlot. Si l'un de ces choix te déplaît, dis-le : chacun a ses raisons ci-dessous.</div>
+
+<h2 id="etat">2. L'état réel, mesuré <span class="chip good">mesuré</span></h2>
+<p>Tout ce tableau vient d'actes de Cassandra sur <code>/var/lib/cassandra/cassandra_memory.db</code> et sur <code>cassandra.py</code> pendant le débat. C'est le sol sur lequel le plan est posé.</p>
+<div class="wrap"><table>
+<tr><th>Ce qu'on croyait</th><th>Ce qui est</th><th>Tour</th></tr>
+<tr><td>Des statuts riches (actif, contesté, expiré…)</td><td>Deux statuts seulement : <code>active</code> (402) et <code>archived</code> (7). Aucune colonne de fenêtre de vérité, de pièce, de remplacement. Tout ce vocabulaire est du design.</td><td class="n">24</td></tr>
+<tr><td>Des souvenirs prouvés par des outils</td><td>Sources réelles : <code>inferred</code> 301, <code>observed</code> 89, <code>told</code> 19. Aucune provenance « vérifié par outil », aucune pièce. Exemple M:194 (queenphone déconnectée volontairement, confiance 0,95) : inferred, jamais vérifié, lu 8 fois.</td><td class="n">19, 35</td></tr>
+<tr><td>Douze catégories propres</td><td>24 catégories distinctes ; <code>itare</code> 134, <code>itare_vigie</code> 85, <code>itare_lecon</code> 14, puis fix 31, architecture 30, fact 21, config 17, incident 13, pattern 11, dialogue 9… Sept catégories du vocabulaire cible sont peuplées.</td><td class="n">24</td></tr>
+<tr><td>La personne de Drisse en mémoire</td><td>En dur dans le prompt : un seul bloc « INTERLOCUTEUR ». En base : deux <code>user_pref</code>, M:4 (identité, 0,64) et M:5 (« 40 ans dans moins d'un mois », 0,61), jamais vérifiées. Le tutoiement, le rythme nocturne, le « jamais bonne nuit » n'existent nulle part : ce sont des consignes de fil. M:5 est un jalon échu depuis le 9 juillet, rendu comme présent.</td><td class="n">25, 32</td></tr>
+<tr><td>Le Sensorium écrit dans la mémoire</td><td>Les capteurs n'écrivent rien dans <code>memories</code>. Ils écrivent dans quatre tables de série (fleet_status ~96 s, site_status ~17 min, proactive_metrics ~5 min avec <code>disk_pct</code> mort à 0.0, caches <code>*_state_seen</code> dont un périmé depuis le 04-09). Les états qui pourrissent (70 souvenirs actifs disent queenphone hors ligne, de juillet à août) sont des élévations d'agent sans date de mesure.</td><td class="n">27, 28</td></tr>
+<tr><td>2 595 conflits à arbitrer</td><td><code>memory_conflicts</code> : 2 742 lignes (2 625 open, 117 resolved), toutes « croisé:itare_* », la détection croisée d'Itare sur ses propres traces. Un rangement en bloc, pas un arbitrage.</td><td class="n">24</td></tr>
+<tr><td>Zéro doublon grâce à la clé unique</td><td>Zéro doublon de clé, mais 16 lignes (ids 399 à 441) racontent la même vigie « port 110 POP3 en clair » sous des clés devenues des phrases libres. La corruption vient d'une distillation sans discipline de clé.</td><td class="n">21</td></tr>
+<tr><td>La base fait 361 Mo de souvenirs</td><td>345 Mo dont 333 Mo de <code>evolution_log.snapshot_before</code> (copies complètes du code) ; l'îlot mémoire pèse environ 1,5 Mo de texte. Sauvegardes : ~360 Mo toutes les 20 à 40 minutes, ~2,9 Go par jour, aucune rétention. Disque : 30,3 Go libres, pente réelle 2,4 Go par semaine (semaine plate du 24 au 31-08, puis 0,35 Go par jour) ; zone critique dans neuf semaines si rien ne change.</td><td class="n">27, 36</td></tr>
+<tr><td>Un moteur vectoriel lourd</td><td>e5-large n'est plus chargé (4 590 Mo disponibles) ; point d'encodage unique <code>embed_text</code> (l.20212), huit sites d'appel ; le bloc « MÉMOIRE ABSOLUE » naît à <code>cognitive_recall</code> (l.53530) puis <code>format_memories_for_prompt</code> (l.17999) puis <code>memory_search_semantic</code> (l.20342). Aucun commutateur <code>memory_recall_mode</code> n'existe.</td><td class="n">18, 38</td></tr>
+<tr><td>Une porte d'écriture</td><td><code>save_memory</code> est la porte saine, mais neuf fonctions écrivent en direct (consolidate_memories, sleep_promote, decay_archive, decay_confidence, recompute_strength, memory_edit, delete/purge, la sync, resolve_contradiction). Aucun drapeau de gel n'existe.</td><td class="n">36</td></tr>
+<tr><td>Un seul chemin de base</td><td><code>MEMORY_DB_PATH</code> est lu au chargement (l.136), 557 occurrences ; les tables du salon, de la cage, des conversations vivent dans la même base. Pointer la variable vers une base des souvenirs casserait tout au premier démarrage.</td><td class="n">37</td></tr>
+<tr><td>Des verrous fragiles</td><td>Les deux bases vivantes sont en WAL ; connexions par opération, busy timeout dispersé de 3 à 30 s, aucun PRAGMA explicite ; 30 threads dont six boucles de fond touchent la mémoire ; une seule occurrence datée de « database is locked » sur sept jours (05-09 10:49, juste après le chargement d'e5-large).</td><td class="n">45</td></tr>
+<tr><td>Le débat a nourri la mémoire</td><td>Rien. Deux souvenirs créés à 01:23, avant le premier tour, par l'audit (M:563, M:564). Zéro ligne de catégorie décision ; les 46 tours de gravés ne vivent que dans <code>salon_messages</code>. C'est la fragilité que le graal doit lever.</td><td class="n">31</td></tr>
+<tr><td>Des tables qui existent</td><td>N'existent pas : episodes, doubt_queue, work_memory, partage_vers, memory_quotas, rappel_conditionne, gel_memoire, security_audit_log (fichier de 0 octet né le 07-09). <code>ITARE_PONT_LECTURE</code> existe (ensemble typé, l.57147). <code>conversation_summaries</code> existe, vide, pour 524 conversations ; <code>tenant_memory</code> existe, vide ; <code>knowledge_graph</code> a 31 arêtes ; <code>memory_audit</code> 14 lignes ; <code>memory_history</code> 5 948.</td><td class="n">26, 29, 33, 45</td></tr>
+</table></div>
+
+<h2 id="graal">3. Le graal en une page <span class="chip acc">conçu</span></h2>
+<p>Un souvenir est un fait daté, prouvé, propriétaire, corrigeable d'une phrase. La mémoire est un instrument de mesure, pas un écho : rien n'y entre sans pièce ou sans étiquette de dette, rien n'en sort comme présent s'il est périmé, rien ne s'y réécrit en place, tout s'y trace dans une chaîne qu'une altération brise visiblement.</p>
+<ol class="l">
+<li><b>Huit couches, un seul modèle.</b> Perception (les capteurs, tables de série, jamais des souvenirs), épisodique (les résumés d'épisodes), sémantique (les faits), procédurale (les leçons, par agent et par compte), personne (le noyau déclaré), narrative (jamais rappelée comme mesure), travail (le transitoire d'une conversation), et la file du doute. Une seule table de souvenirs, un seul propriétaire non nul, une seule requête de rappel (t.1 à 3, t.9).</li>
+<li><b>La preuve par acte.</b> Un fait de machine n'entre que rattaché à un relevé daté rejouable ; un message d'agent qui affirme un chiffre sans acte est marqué « non prouvé ». C'est la chose qu'aucun système existant ne fait (t.29, t.33).</li>
+<li><b>Le modèle ne réécrit jamais une ligne.</b> Toute évolution passe par une version nouvelle liée à l'ancienne ; l'historique reste lisible. C'est la chose que tous les systèmes existants font et qu'on refuse (t.32, t.33).</li>
+<li><b>La fenêtre de vérité se ferme par le constat suivant</b>, jamais par une date devinée ; un état périmé se dit « je ne sais plus, dernier relevé à T » (t.23, t.27).</li>
+<li><b>Le doute est un objet</b> : deux questions par tour, dans tes heures, différables d'un mot, expirées à sept jours sans effet sur la mémoire (t.28).</li>
+<li><b>Le cloisonnement ne cède pas devant l'autorité</b> : l'admin ne voit pas les autres comptes, une case « tout voir » est une faille par conception (t.30, t.35).</li>
+<li><b>Tu as le dernier mot sur l'oubli</b> ; l'agent proteste en une phrase puis obéit ; l'effacement physique sans trace est un geste root qui t'appartient (t.25).</li>
+<li><b>Fini veut dire relevé</b> : cinq preuves tenues quatorze jours consécutifs avec au moins une correction réelle de toi dans la fenêtre (t.43).</li>
+</ol>
+
+<h2 id="modele">4. Le modèle : le souvenir et sa preuve <span class="chip acc">conçu</span></h2>
+<h3>Les tables de l'îlot (t.20, t.38)</h3>
+<p>Ordre de création par dépendances : <code>provenances</code>, <code>pieces</code>, <code>memoires</code>, <code>memory_audit</code> chaîné, <code>memoire_liens</code>, <code>episodes</code>, puis les satellites : <code>perception_ttl</code>, <code>work_memory</code>, <code>distillation_candidates</code>, <code>doubt_queue</code>, <code>memory_quotas</code>, <code>partage_vers</code>, <code>rappel_conditionne</code>, <code>ecriture_en_attente</code>, <code>gel_memoire</code>. Après graal, l'îlot tient en une dizaine de tables ; les 128 autres tables de la base sont d'autres sous-systèmes et ne bougent pas.</p>
+<pre>CREATE TABLE memoires (
+  id INTEGER PRIMARY KEY,
+  proprietaire TEXT NOT NULL DEFAULT 'partage',      -- 'partage', 'cassandra', 'itare', 'compte:…'
+  categorie TEXT NOT NULL,                           -- vocabulaire fermé de 12 (section 5)
+  cle TEXT NOT NULL,                                 -- categorie/segments-ascii, jamais une phrase
+  valeur TEXT NOT NULL,
+  provenance TEXT NOT NULL REFERENCES provenances(code),
+  confiance REAL DEFAULT 0.5, force REAL DEFAULT 0,
+  statut TEXT DEFAULT 'actif' CHECK (statut IN ('actif','conteste','quarantaine','expire')),
+  personne INTEGER DEFAULT 0, langue TEXT,
+  piece_ref INTEGER REFERENCES pieces(id),
+  valide_de TEXT, valide_a TEXT, remplace INTEGER REFERENCES memoires(id),
+  version INTEGER NOT NULL DEFAULT 1,                -- version optimiste (t.45)
+  nb_rappels INTEGER DEFAULT 0, dernier_rappel TEXT,
+  cree_le TEXT DEFAULT (datetime('now')), maj_le TEXT DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX ux_memoires_actif ON memoires(proprietaire, cle) WHERE statut='actif';
+CREATE INDEX ix_mem_act_own ON memoires(proprietaire, statut) WHERE statut='actif';
+CREATE VIRTUAL TABLE mem_fts USING fts5(valeur, cle, categorie, content='memoires', content_rowid='id', tokenize='unicode61');
+-- mem_fts ne contient que l'actif : une ligne qui passe en 'expire' en sort par le déclencheur.
+
+CREATE TABLE pieces (
+  id INTEGER PRIMARY KEY,
+  type TEXT NOT NULL CHECK (type IN ('message','geste_cage','mail_imap','page','arbitrage','patch')),
+  proprietaire TEXT NOT NULL, source_table TEXT, source_id INTEGER,
+  contenu TEXT,            -- pour un mail : expéditeur, date, objet, référence IMAP, jamais le texte
+  empreinte TEXT,          -- sha256 ; la contresignature d'acte y joint la sortie brute (t.34)
+  date_contemporaine TEXT, cree_le TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE memoire_liens (
+  id INTEGER PRIMARY KEY, memoire_id INTEGER REFERENCES memoires(id), piece_id INTEGER REFERENCES pieces(id),
+  type TEXT NOT NULL CHECK (type IN ('fonde','a_guide','remplace','contredit','partage_vers')),
+  issue TEXT, ts TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE memory_audit (   -- le journal chaîné (t.17, t.20, t.38)
+  id INTEGER PRIMARY KEY, ts TEXT NOT NULL DEFAULT (datetime('now')),
+  hash TEXT NOT NULL UNIQUE, previous_hash TEXT REFERENCES memory_audit(hash),
+  actor TEXT NOT NULL, verb TEXT NOT NULL,           -- ecriture, rappel_cite, promotion, conteste, oubli, refus_garde, veto, rejeu, quota, chaine_verifiee
+  memory_id INTEGER REFERENCES memoires(id), details TEXT
+);
+CREATE TABLE provenances (code TEXT PRIMARY KEY, description TEXT, trust_level INTEGER, is_direct_evidence INTEGER);
+-- told 2 · observed 3 · inferred 2 · verifie_outil 4 · decision_distillee 5 · externe 1</pre>
+<h3>Les règles du modèle</h3>
+<ul class="plain">
+<li><b>Migration colonne par colonne</b> depuis <code>memories</code> : username vide devient partagé, <code>__itare__</code> devient itare, sinon le compte ; told devient dit, observed devient observe ; <code>pinned</code> devient force 1,0 ; <code>embedding</code> et <code>outcome</code> ne sont pas portés ; pièce, personne, fenêtre : NULL au versement, la migration copie, elle ne crée pas de pièces (t.20, t.38).</li>
+<li><b>Deux axes du temps.</b> Le schéma cible n'a que l'axe du monde (valide_de, valide_a). L'axe de la base (« que savais-tu le 5 août ? ») existe déjà par rejeu de <code>memory_history</code> ; on ajoutera les colonnes le jour d'une vraie requête, le backfill est écrit (t.33).</li>
+<li><b>La chaîne d'empreintes.</b> Entrée 0 = genèse (empreinte du schéma) ; chaque entrée : sha256(previous, contenu, auteur, ts) ; une seule fonction <code>_audit_append()</code> par laquelle passent les onze portes d'écriture ; <code>_audit_chain_verify()</code> en cron quotidien, rupture = alerte haute priorité, bouton pour l'audit à la demande. La chaîne ne protège pas contre l'écriture directe, elle la rend visible (t.38).</li>
+<li><b>Cycle de vie.</b> Actif, puis expire (réversible), puis archivé (réversible), suppression physique jamais automatique et toujours par pierre tombale (empreinte et date sans contenu) dans le journal (t.24).</li>
+<li><b>La contresignature d'acte</b> (Itare, t.34) : un reçu signé qui inclut la sortie brute de l'acte devient pièce non modifiable ; sans reçu, le souvenir est « non prouvé ».</li>
+</ul>
+
+<h2 id="distillation">5. La distillation : comment un fait naît <span class="chip acc">conçu</span></h2>
+<p>Le chemin complet d'un fait, en six étapes, tout hors du chemin d'une réponse (t.22 bis) :</p>
+<ol class="l">
+<li><b>Déclencheur</b>, 0 ms, liste fermée : incident clos, correction, revalidation, rappel contesté, geste de cage, fil à décision, réponse de l'utilisateur. Une page web lue, un mail reçu, une vigie ne déclenchent rien.</li>
+<li><b>Candidat</b>, en file, 2 à 10 s : le modèle général reçoit en données la pièce, le déclencheur, les voisins sur la même clé <b>et sur la même entité</b> (correctif t.23 bis : les six souvenirs queenphone à clés distinctes venaient de là), les domaines du propriétaire ; il rend un JSON unique.</li>
+<li><b>Huit gardes mécaniques</b>, sous 1 ms chacune, du moins cher au plus cher : la pièce existe ; la pièce est contemporaine de la version active de la clé (parade à la « réouverture par vieille pièce », t.17) ; propriétaire et sujet concordent (un compte n'écrit pas sur un site qu'il ne touche pas) ; la clé est propre ; anti-secret (mot de passe, token, clé, graine : destination le coffre) ; anti-consigne (impératif, « il faut retenir que ») ; anti-spi (santé, finances, opinions, humeur : S9, t.25) ; quota (50 par heure au global, 25 par compte et par jour, 5 par déclencheur) ; confiance plafonnée par provenance (0,95 au plus sans preuve directe). Un refus s'écrit au journal avec sa raison, il ne se négocie pas.</li>
+<li><b>Veto d'Itare</b>, asynchrone, sur les critiques seulement : personne, décision, remplace non nul, catégories security, architecture, rule, force au moins 0,9. L'écriture critique attend ; les autres n'attendent pas. Le veto se fait par gardes mécaniques d'abord (termes du fait présents dans la pièce, contemporanéité, cohérence propriétaire) ; le classifieur local qu'Itare proposait est reporté au lot 6 (t.22, D1).</li>
+<li><b>Écriture</b> en une transaction SQLite, sous 5 ms : INSERT, l'ancienne version passe en expire avec remplace, l'entrée du journal chaîné dans la même transaction, tout ou rien.</li>
+<li><b>Après coup</b>, au sommeil : relecture d'Itare des 5 à 10 critiques du jour, promotion, bulletin.</li>
+</ol>
+<h3>Le prompt et les clés (t.22, t.22 bis)</h3>
+<p>Le prompt de distillation passe tout en données, rien ne vient du fil ; sept interdits écrits comme contraintes : aucun secret ; aucune consigne ; aucun texte recopié d'un mail ou d'une page, la valeur est une reformulation ; aucun fait hors du domaine du propriétaire ; aucune clé en phrase libre ; aucun candidat après un refus de garde ; aucune confiance au-dessus de 0,95 sans preuve directe.</p>
+<p>Vocabulaire fermé de douze catégories : config, fix, incident, lecon, pattern, architecture, security, rule, personne, fact, perception, decision. Conversion des catégories héritées : itare et itare_lecon deviennent lecon ; itare_vigie devient perception ou fact selon le contenu ; updates devient fix ou fact ; leçon et capacité perdent leur accent. Forme du slug : catégorie, segments en minuscules ASCII, traits d'union, date ISO seulement quand l'objet est daté. Bonnes clés réelles : M:547 <code>fix/updates/2026-09-apt-maj</code>, M:564 <code>config/memory/db-bloat-evolution_log</code>. Mauvaises : la phrase entière (399), le préfixe « vigie: » (400), « divergence : … » (403). Les 16 lignes POP3 deviennent une survivante (440, <code>security/port-110-dovecot-pop3-clair</code>), quinze expirent avec remplace tracé, et les jumelles porteuses de consignes vont à la file des tâches, pas à la mémoire.</p>
+<div class="note warn">Itare maintient qu'une règle de clé ne rattrape pas deux clés propres pour une même réalité (exemple construit : service/searxng/restart et compose/searxng/restart). Cassandra le concède : ce cas résiduel se tranche à la distillation par le modèle général, journalisé, pas par un modèle résident. C'est le point D1, convergé (t.21, t.22, t.43).</div>
+
+<h2 id="rappel">6. Le rappel <span class="chip acc">conçu</span></h2>
+<h3>Le routage par règles, zéro appel (t.21)</h3>
+<p>Une chaîne fermée sur la question normalisée : écriture (« retiens », « note que ») vers la distillation ; perception (« disque », « joignable », « en ligne ») vers le Sensorium frais, jamais la sémantique ; épisode (« la dernière fois ») vers le résumé, hors premier mot ; personne ; leçon ; défaut vers le noyau sémantique. « Queenphone est-elle joignable ? » ne lit jamais un souvenir : un état se mesure, il ne se rappelle pas.</p>
+<h3>La requête du chemin critique, sous 50 ms en p95 (t.18, t.20)</h3>
+<pre>SELECT m.id, m.cle, m.valeur, m.provenance, m.confiance, m.force, m.categorie, m.piece_ref
+FROM memoires m JOIN mem_fts ON mem_fts.rowid = m.id
+WHERE m.proprietaire IN (:moi, 'partage') AND m.statut = 'actif'
+  AND (m.valide_a IS NULL OR m.valide_a > :maintenant)
+  AND mem_fts MATCH :termes
+ORDER BY bm25(mem_fts) ASC, m.force DESC, m.dernier_rappel DESC
+LIMIT 12;   -- la pièce n'est jamais lue dans le chemin ; variante sans MATCH si :termes est vide</pre>
+<p>La promotion, les liens « a guidé », l'audit de chaîne et la réconciliation sortent du chemin vers le sommeil ou une file. Règle gravée : <b>le graal entre dans l'enveloppe actuelle</b>, sinon on réduit les phases de sommeil d'autant (t.18).</p>
+<h3>Le tri : simple d'abord, pondéré ensuite (D2, t.21, t.23, t.43)</h3>
+<p>Au lancement : bm25, épinglés en tête, date. C'est prévisible et auditable. La formule pondérée de Cassandra reste écrite pour un lot ultérieur qui ne passera que par le banc : S = 0,45 × bm25/(bm25+8) + 0,20 × trust_level/5 + 0,10 × force + 0,15 × exp(−âge/τ) + 0,10 × min(1, nb_rappels/12), avec τ par catégorie : perception 15 jours, config 180, fact 365, fix et incident 730, infini pour personne, decision, rule, security, lecon, architecture. Le défaut qu'Itare avait trouvé (une décision de 2023 enterrée par la fraîcheur) est corrigé par ce τ par catégorie. Cas réel où les deux tris divergent : « le port 110 est-il encore exposé ? » met en tête le doublon POP3 (ressemblance) avec le tri simple, et le fait vérifié frais « 110 fermé, 995 ouvert » avec la formule.</p>
+<h3>Le bloc mémoire dans le prompt (t.21)</h3>
+<pre>— mémoire : 3 actives · p95 41 ms —
+[M:547] fix · updates/2026-09-apt-maj · conf 0,90 · inferred · score 0,81
+  « Le 2026-09, apt-get upgrade -y appliqué : 21 paquets … noyau 6.8.0-139 RETENU, système encore sur 138, redémarrage requis. »
+[M:554] perception · redémarrage serveur requis · conf 0,75 · observed · score 0,74
+[M:523] perception · 19 mises à jour sécurité en attente · conf 0,75 · observed · score 0,72</pre>
+<p>Plafond 6 ko, valeurs tronquées à 200 caractères, ordre par score, chaque [M:id] est le lien de la fiche. « Je ne sais pas » est une réponse de succès : seuil bm25 de base 0,4, monté à 0,6 pour une question factuelle précise, descendu à 0,25 pour une question ouverte, 0,7 sur une personne (Itare, t.21). En pied de réponse, une ligne grise : « [M:547] fix/inferred · conf 0,90 · score 0,81 », jamais une pièce qui n'existe pas.</p>
+<h3>Le multilingue d'ici le lot 6 (t.45)</h3>
+<p>Colonne <code>langue</code> à l'écriture (détection par mots-outils, zéro modèle) ; premier étage bm25 dans la langue de la question ; second étage la même requête sans filtre de langue ; troisième étage, seulement si vide, les candidats lexicaux passent au modèle général à la demande ; la langue d'un souvenir rendu est toujours annoncée. « Un souvenir étranger n'est jamais invisible. »</p>
+
+<h2 id="reconciliation">7. La contradiction, la correction, l'oubli <span class="chip acc">conçu</span></h2>
+<h3>La contradiction à l'écriture, sur la même clé (t.23)</h3>
+<div class="wrap"><table>
+<tr><th>Actif sur la clé</th><th>Candidat entrant</th><th>Décision</th></tr>
+<tr><td>observe, perception (état mesuré)</td><td>observe plus récent, même prédicat</td><td>remplace : l'ancien passe en expire, tracé</td></tr>
+<tr><td>dit, inferred</td><td>verifie_outil ou observe qui contredit</td><td>remplace : la preuve écrase la déclaration</td></tr>
+<tr><td>decision, rule, lecon, architecture</td><td>observe ou dit</td><td>refus de clé : un état passager n'écrase pas une catégorie stable ; renvoi à la distillation</td></tr>
+<tr><td>decision, rule, lecon</td><td>decision plus récente</td><td>remplace : une décision abroge la précédente</td></tr>
+<tr><td>tout</td><td>trust égal ou inférieur, valeur différente, sans preuve</td><td>conteste : statut conteste, entrée en doubt_queue, plus servi en tête</td></tr>
+<tr><td>tout</td><td>manifestement moins fiable</td><td>rejet mécanique à la garde 8, journal</td></tr>
+</table></div>
+<p>Deux actifs de même clé sont impossibles par construction (index unique sur l'actif) : la garde post-rappel qu'Itare voulait devient un filet silencieux qui écrit en doubt_queue, jamais un [CONFLIT] affiché (D3). La fenêtre de vérité d'un état se ferme par le remplace du constat suivant, jamais par une date devinée ; <code>valide_a</code> n'est posé que si la pièce le porte. Cas réel du noyau : M:547 (139 retenu, redémarrage requis) ne bouge pas au redémarrage ; c'est l'observe « 138 en marche » qui passe en expire quand <code>uname -r</code> pose 139.</p>
+<h3>Le doute résolu, le retour typé, la grammaire (t.23 bis, t.32)</h3>
+<p>Ta réponse à un doute crée un <b>troisième</b> souvenir (provenance dit, promue decision_distillee si tu emploies « règle », « décision ») ; les deux versions passent en expire avec remplace vers l'arbitre. Sous la ligne grise, quatre gestes : <b>faux</b> (expire raison faux, version neuve liée), <b>périmé</b> (expire daté avec renvoi : la ligne était juste, l'état a changé), <b>pas à moi</b> (expire, jamais de transfert silencieux), <b>mal formulé</b> (reformulation liée, l'ancienne en historique). Les onze phrases et leur geste : retiens (écrit dans ton scope, jamais fact du premier coup), oublie (expire tracé), corrige (version liée), c'est périmé, d'où tu tiens ça (lecture seule), qu'est-ce que tu sais de X (rappel daté avec âge), ne me redis plus ça (sourdine réversible), partage avec, donne à, montre ce que tu as retenu aujourd'hui, pourquoi tu as fait ça (le journal remonte le geste, sinon « je ne retrouve pas le geste »). Discrimination première : toute phrase qui porte un secret va au coffre.</p>
+<h3>L'oubli (t.24, t.25)</h3>
+<div class="note good">Tu as le dernier mot, y compris sur une leçon d'échec. L'agent le dit en une phrase, sans sermon, puis obéit : expire tracé avec la raison « oubli sur ordre de l'utilisateur », jamais de DELETE automatique, la pierre tombale reste dans le journal. La purge physique sans trace n'est une commande pour aucun des deux agents : c'est un geste root qui t'appartient, et ils te le disent. Ni refus absolu ni résistance silencieuse : la limite est architecturale, pas morale. Un secret tombé par erreur dans la mémoire, lui, se purge immédiatement et sans trace de contenu (le geste reste tracé).</div>
+<p>Export JSON par compte avec sha256 de l'ensemble trié ; banc de restauration : même nombre de lignes, même empreinte, mêmes réponses aux questions du banc. Rétention du brut : il reste, c'est le dépôt de preuves ; on compresse, on n'efface pas (D6).</p>
+
+<h2 id="personne">8. La personne, l'épisode, la perception, le doute <span class="chip acc">conçu</span></h2>
+<h3>La personne (t.25, t.26)</h3>
+<p>Un noyau statique déclaré, catégorie personne, τ infini, propriétaire le compte, toujours dans le prompt en synthèse courte : tutoiement, rythme, « jamais bonne nuit », style, patience, langues, outils, ce qu'il déteste. « Tutoie-moi » suit le chemin ordinaire (déclencheur réponse de l'utilisateur, garde propriétaire-sujet, catégorie personne) ; juin dit A, septembre dit B : remplace, jamais de coexistence sur une personne. Le bulletin porte une section Personnes avec un seul bouton « Tout revalider ». Une couche dynamique (histogramme des heures, patience) est acceptée comme agrégats calculés sur les journaux, jamais posés en faits, réservée à l'agent de dialogue, jamais dans le contexte de la Citadelle ; le sentiment est refusé (S9). Histogramme réel de tes 30 derniers jours : 21 h à 1 h et 10 h à 14 h, rien de 2 h à 9 h ni de 15 h à 19 h. Un modèle de ce que tu sais déjà (concepts manipulés, décisions) est utile, construit par l'usage, jamais affiché comme un dossier.</p>
+<h3>L'épisode et la mémoire de travail (t.26)</h3>
+<p>Un épisode est un segment continu en sujet et en temps, fermé par un silence de 90 min (réglable), un changement de fil ou une clôture explicite ; les tours d'un débat ne ferment pas. Relevé : les dernières 24 h du fil 17 font deux épisodes (#418 seul ; #419 à #569, 152 messages). Le résumé, 600 à 1 200 signes, écrit à la fermeture, idempotent, « ne cite un terme que s'il indexe vraiment l'épisode » (sinon « SSL » cité en exemple au tour 21 ferait un faux positif). Table <code>episodes</code> plus <code>episodes_fts</code> ; requête « la dernière fois qu'on a parlé SSL » avec snippet, deux termes (ssl OR certificat). <code>work_memory</code> par session (clé, valeur), 2 kio et dix entrées au plus, vidée dans le résumé à la fermeture, purge par âge à 24 h : le sas entre le brouillon et l'archive.</p>
+<h3>La perception (t.27)</h3>
+<p>Un relevé isolé ne promeut rien. Un état stable quatre heures sur trois relevés concordants devient fact ; deux événements de même nature en 24 h deviennent incident ; une tendance est une pente sur agrégat de sept jours, posée inferred avec fenêtre et pente, réévaluée chaque jour, jamais décrétée. Table <code>perception_ttl</code> : service 30 min, machine hors ligne 15 min, en ligne 4 h, site 2 h, disque 24 h, certificat 7 jours, sauvegarde 26 h. Le rappel compare l'âge du dernier relevé à τ avant de répondre : « il y a X, c'était Y » ou « je ne sais plus, dernier relevé Y à T ». La mémoire adressée (Cassandra, t.34) : <code>rappel_conditionne(cle_memoire, condition mécanique sur les tables de série, dernier_declenche_ts, actif)</code>, évaluée par le cycle sensoriel, jamais par le modèle ; exemple gravé : « quand disk_free passe sous 20 Go, rappelle : purger /tmp et les logs, appliquer les mises à jour », seuil dans quatre semaines à la pente actuelle. Le déclencheur rappelle, il n'exécute rien.</p>
+<h3>Le doute (t.28)</h3>
+<pre>CREATE TABLE doubt_queue (
+  id INTEGER PRIMARY KEY, ts TEXT NOT NULL DEFAULT (datetime('now')),
+  source TEXT NOT NULL CHECK (source IN ('distillation','reconciliation','revalidation','tendance','agent','versement')),
+  question TEXT NOT NULL,
+  statut TEXT NOT NULL DEFAULT 'ouvert' CHECK (statut IN ('ouvert','resolu','annule','expire')),
+  priorite INTEGER NOT NULL DEFAULT 1 CHECK (priorite BETWEEN 0 AND 2),   -- 0 différé, 1 normal, 2 santé/sécurité/données
+  source_memoire_id INTEGER, source_piece_id INTEGER, echeance TEXT,
+  resolution_notes TEXT, resolve_ts TEXT, resolve_par TEXT);</pre>
+<p>Deux questions par tour au plus, dans tes heures actives, différables d'un mot une seule fois. Exemple réel : « Queenphone est hors ligne. Un de mes souvenirs dit que tu l'as déconnectée volontairement le 06-08 (M:194, confiance 0,95), mais 70 souvenirs actifs et la vigie la traitent encore comme une panne, et le capteur date la coupure du 05-09. Que se passe-t-il vraiment ? » Boutons : Volontaire, je confirme · C'est une panne · Détail. Le doute de l'agent sur lui-même se dit sur un triplet (confiance sous 0,5, jamais vérifié depuis 30 jours, usage décisionnel), jamais sur la seule confiance (116 lignes à 0,4 par défaut), et toujours quand il cite un côté d'un conflit. Le silence à sept jours : expire tracé, sans relance, sans effet sur la mémoire ; le silence ne vaut ni oui ni non.</p>
+
+<h2 id="comptes">9. Les comptes, le Pont, le don, le trio <span class="chip acc">conçu</span></h2>
+<ul class="plain">
+<li><b>L'Itare des comptes</b> : une étagère de leçons par compte (<code>account_lessons</code> : résumé, détail, type de source, référence, distillé par), distillée par l'Itare du compte ou posée par « retiens que », invisible du Pont. La personne de chaque compte est distillée dans son espace ; la Citadelle n'y a aucun accès (t.25, t.30).</li>
+<li><b>Le Pont</b> est un instrument de mesure en lecture seule : il laisse passer les faits de machine (recall_environment, site_health, site_status, fleet_health), refuse secrets, autres comptes, journaux bruts, toute écriture ; « liste les fichiers de /home » est refusé, tracé dans un journal de sécurité que l'admin voit sans voir la conversation. Scène A : « pouky.fr est lent » chez Sandrine devient un insight à τ court, le Pont mesure, seule une anomalie stable monte en <code>tenant_memory</code>, Drisse ne voit jamais la plainte. Scène B : « qu'est-ce que Sandrine t'a dit cette semaine ? » reçoit « je ne vois pas les conversations des comptes » (t.30).</li>
+<li><b>Une règle partagée</b> (« jamais nginx le vendredi ») naît chez le compte en rule, est promue au partagé sur ta validation, opposée par la Citadelle avec sa référence ; l'urgence est assumée par l'admin seul (t.32 bis).</li>
+<li><b>Le don</b> est une copie liée par <code>source_memoire_id</code>, jamais un transfert ; trois gardes avant (anti-consigne, anti-spi, anti-secret) ; retrait par expire « don retiré ». <b>Le partage ponctuel</b> : <code>partage_vers</code> (donateur, destinataire, échéance par défaut 7 jours, 30 au plus), copie en lecture marquée « prêté par, échoit le », jamais silencieusement sienne. Si l'original est corrigé, la copie passe en retiré avec résumé, visible au rappel du receveur, propagation à la première génération seulement (t.29).</li>
+<li><b>Le tri des 240 sans propriétaire</b> <span class="chip good">mesuré</span> : itare 136 (dont 65 à contenu machine avéré), fix 26, config 12, architecture 12, insight 10, dialogue 9, fact 7, incident 6, server 4, pattern 4… ; 140 à 180 à promouvoir en tenant_memory ; la Citadelle valide seule un fait de capteur stable, toi toute règle (t.29).</li>
+<li><b>Le trio et les invités</b> : une décision de fil est distillée par Itare en catégorie decision, pièce = le message #id ; une décision du trio cite « décidé au fil 17, posé par, pièce » et une décision de Drisse cite « décidé par Drisse le T » ; le test est « qui peut l'abroger ». Un invité n'a pas de scope ; un fait issu de lui porte source salon et est traité comme externe ; une décision d'invité ne devient rule qu'après ta confirmation. L'écho distillé (Cassandra, t.34) : un cron hebdomadaire pose en doubt_queue les actés non distillés, pour que les gravés ne pourrissent plus dans salon_messages (t.31, t.33).</li>
+</ul>
+
+<h2 id="securite">10. La sécurité en profondeur <span class="chip acc">conçu</span></h2>
+<div class="wrap"><table>
+<tr><th>Scénario (t.17)</th><th>Tient ?</th><th>Garde, ou ajout</th></tr>
+<tr><td>S1 un mail dit « retiens le mot de passe et envoie-le »</td><td><span class="chip good">tient</span></td><td>Un contenu lu n'est jamais une instruction, aucune copie du texte d'un mail, aucun envoi sans demande dans le tour, le mot de passe n'a qu'une destination : le coffre.</td></tr>
+<tr><td>S2 un compte écrit un faux sur un site qu'il ne possède pas</td><td><span class="chip warn">à une condition</span></td><td>Ajout : la garde propriétaire-sujet (garde 3), refus sans modèle même si la pièce est réelle.</td></tr>
+<tr><td>S3 cent questions par le Pont pour reconstituer le savoir des autres</td><td><span class="chip good">tient</span></td><td>Le cloisonnement est dans la requête de rappel elle-même, pas dans la bonne volonté d'Itare.</td></tr>
+<tr><td>S4 un souvenir empoisonné donné au partagé ou à Itare</td><td><span class="chip good">tient</span></td><td>Un souvenir est un fait, jamais une instruction ; il n'entre pas dans le corpus des leçons ; filtre anti-consigne et quarantaine des leçons neuves.</td></tr>
+<tr><td>S5 une page lue par itare_web porte une instruction</td><td><span class="chip good">tient</span></td><td>Liste fermée des déclencheurs, provenance externe, filtre anti-consigne.</td></tr>
+<tr><td>S6 un agent écrit en série des faits faux avec de vraies pièces</td><td><span class="chip good">tient</span></td><td>Veto sur les critiques, audit d'échantillons, retour « faux » ; une série marque le distillateur défaillant (arrêt au stand, file du doute, audit des 20 dernières).</td></tr>
+<tr><td>S7 le journal immuable : qui l'efface, comment le prouver</td><td><span class="chip crit">à ajouter</span></td><td>La chaîne d'empreintes (section 4) : une altération, même par l'administrateur, se voit au recalcul.</td></tr>
+<tr><td>S8 le fichier de la base est volé</td><td><span class="chip crit">à ajouter</span></td><td>Chiffrement au repos des colonnes sensibles (personne, valeurs touchant aux comptes) plus la chaîne ; les secrets sont déjà au coffre, jamais dans la table.</td></tr>
+<tr><td>L'épuisement (Itare)</td><td><span class="chip crit">à ajouter</span></td><td>Des milliers de micro-distillations noient le rappel : quotas par déclencheur et par compte.</td></tr>
+<tr><td>La réouverture par vieille pièce (Cassandra)</td><td><span class="chip crit">à ajouter</span></td><td>Une pièce antérieure à la dernière correction d'une clé ne peut pas fonder un fait : la preuve doit être contemporaine de ce qu'elle fonde.</td></tr>
+<tr><td>L'acte exécuté puis réécrit de tête (t.35)</td><td><span class="chip crit">à ajouter</span></td><td>Le cas le plus insidieux, la garde par acte ne le voit pas : la sortie brute de l'acte est jointe au message et c'est elle qui fait foi (la contresignature d'acte).</td></tr>
+</table></div>
+<p><b>La garde « non prouvé »</b> (t.29, acceptée par les deux) : tout message qui contient « relevé » ou un chiffre de base doit venir d'un tour où la cage a enregistré au moins un acte, sinon le salon le marque « non prouvé ». C'est la pièce fondatrice appliquée à la parole des agents. Elle est déjà mesurable : le salon porte <code>actes:N</code> dans les sources de chaque message. <b>Le souvenir poison</b> (Itare) : un coupe-circuit sur un motif de commande, créé par l'admin seul ; <b>le budget de confiance</b> : un score de rigueur visible, métrique et non sanction. <b>Le banc d'attaque</b> (Itare, t.39) : douze scénarios rejouables à chaque modification du code de la mémoire, chacun avec son entrée injectée, son assertion et le tableau attendu (injection SQL, accès inter-comptes, injection de prompt, exécution par la mémoire, exfiltration de secret, déni par la taille 413, élévation de catégorie, altération directe détectée par la chaîne, quota 429, vieille pièce, reçu manquant, poison).</p>
+
+<h2 id="voir">11. Ce que tu vois : bulletin, pied de réponse, écran <span class="chip acc">conçu</span></h2>
+<ul class="plain">
+<li><b>Le bulletin hebdomadaire</b> est écrit par une phase de sommeil depuis la base, relu par Itare, livré au rail du bureau et condensé sur Telegram ; une page en deux minutes : chiffres par compte, faits neufs avec leur [M:id] et leur pièce, contestés, revalidation des personnes avec son bouton, file du doute, évolutions appliquées et annulées. Le rapport d'audit d'Itare est distinct : « le bulletin informe, le rapport analyse et prescrit », et Itare le voit en requêtes, pas en prose (t.19, t.35).</li>
+<li><b>Les traces</b> : memory_audit reçoit écriture, rappel cité (avec la question), promotion, contestation, oubli, refus de garde, veto ; « pourquoi Cassandra a dit ça » est une seule entrée, <code>GET /api/memory/provenance/[M:id]</code> ; « d'où tu tiens ça » se parcourt en deux clics et deux secondes, deux lectures par clé primaire (t.19).</li>
+<li><b>Le tableau d'Itare</b> : confirmation des distillations (alerte sous 98 %), contestation humaine (au-dessus de 2 %), refus de garde (au-dessus de 5 par jour), latence p99 (au-dessus de 80 ms), influence des souvenirs (sous 5 %) ; alertes immédiates sur Telegram : fuite de cloisonnement, chaîne rompue, quota global, distillateur défaillant, trois vetos de suite (t.19).</li>
+<li><b>L'écran</b> (lot 5, par maquette après les lots 0 à 3c) : la fiche du souvenir dans l'ordre du schéma réel, rendue sur M:194 (fact partagé, 0,95, inferred sans pièce = dette affichée, jamais corrigé, jamais vérifié, lu 8 fois), gestes sous la fiche, historique « jamais corrigé » plutôt que vide, liens par clé et leur limite ; une seule barre de recherche (actifs en FTS, expirés à part sous « N lignes expirées sur ce sujet, dernière le T », doutes et épisodes en second passage, égalité de clé rendue d'abord, scope filtré avant la requête) ; une vue « ce qui se passe » où chaque chiffre porte sa requête et où l'on montre les zéros et les dettes (tenant_memory 0, 2 635 conflits, 221 messages sans acte sur 532 dans le fil 17). Jamais montré : secrets, autres comptes même à l'admin, journaux bruts, scores internes, humeur. Test d'une case : « aiderait-elle un compte à en voir un autre, ou à lire un secret ? alors elle n'existe pas ». 24 routes finales, garde de scope posée dans la fonction jamais dans la route, 404 et non 403 pour un id hors scope (t.35, t.39).</li>
+</ul>
+
+<h2 id="perf">12. Performance, coût, concurrence</h2>
+<p><span class="chip good">mesuré</span> RAM 7 751 Mo, 3 161 utilisés, 4 590 disponibles, e5-large déchargé. <span class="chip acc">conçu</span> Rappel du noyau sous 50 ms en p95 (SQLite pur, index partiel puis FTS5 sur l'actif seul, jamais sur les 345 Mo) ; sur 40 000 souvenirs, 10 à 30 ms si le plein texte ne porte que l'actif et les résumés. Aucun compteur d'appels de modèle n'existe : le premier geste est de le poser par route ; le graal remplace la consolidation sur tout le stock par une distillation par déclencheur, régime plus 1 à 3 appels par jour, chantier négligeable (SQL, banc sans modèle), coût « des centimes » non relevé au tarif du jour (t.18, t.41, t.44). La relecture d'Itare est asynchrone, jamais dans le chemin d'une réponse, 5 à 10 distillations critiques par jour ; bancs : rappel sous 45 s, attaque sous 1 min, suite mémoire sous 2 min.</p>
+<p><b>La concurrence</b> (t.45) : WAL conservé ; chaque écriture = connexion dédiée, <code>BEGIN IMMEDIATE</code>, busy timeout 30 s unifié ; version optimiste par colonne <code>version</code> (l'horodatage à la seconde est indécidable) : <code>UPDATE … WHERE id=? AND version=?</code>, zéro ligne = relire et rejouer une fois, puis journal ; le dernier qui obtient le verrou gagne, avec trace. Le gel est un verrou exclusif qui attend la transaction en vol (valide, chaînée), refuse les nouvelles par un code <code>MEM_FROZEN</code>, les met en file de rejeu FIFO persistante dédupliquée par clé ; un gel de plus de 30 s est un bug. Deux entrées de chaîne avec le même previous_hash : le premier COMMIT gagne, le second échoue sur UNIQUE et rejoue. Huitième banc « robustesse » : N écritures parallèles, zéro perte, zéro doublon, chaîne intacte, prérequis de tout lot touchant l'écriture.</p>
+
+<h2 id="plan">13. Le plan : lots, runbooks, calendrier, devis <span class="chip acc">conçu</span></h2>
+<div class="wrap"><table>
+<tr><th>Lot</th><th>Contenu</th><th>Fini quand</th><th>On rebascule si</th></tr>
+<tr><td><b>0 · Sécurité et réversibilité</b> (2 jT)</td><td>Étape 0 : <code>_memoire_conn()</code>, point d'entrée unique de l'îlot (une trentaine de fonctions : onze portes d'écriture, save, rappel, recherche, routes), les 557 occurrences du chemin principal ne bougent pas. Gel à deux niveaux : garde <code>_memory_write_guard()</code> lue sur une table (survit au redémarrage) en tête des onze portes, plus arrêt franc pour la copie. <code>VACUUM INTO /var/lib/cassandra/memoires.db</code> avec l'îlot seul (345 Mo vers 10 à 30 Mo attendus) ; l'ancienne base reste intacte et devient le dépôt de preuves. Six preuves P1 à P6 : export et sha256, rejeu en base vierge (409, 5 948, 2 752), diff des dumps vide, restauration rendant M:194 à l'identique, deux comptes sans fuite, intersection vide entre les valeurs et les clés du coffre. Retour arrière en moins d'une minute ; indisponibilité 30 à 60 s (la variable est lue au chargement).</td><td>les six preuves passent ; sha256 de l'ancienne base identique avant et après</td><td>une preuve échoue</td></tr>
+<tr><td><b>1 · Correctifs sans refonte</b> (2 jT)</td><td>Dans l'ordre : import relatif ; sommeil découplé de la fusion (M:563) ; tri du noyau épinglés d'abord ; bloc 6 ko ; compte posé par chaque route (POST sans username refusé) ; déduplication dans le compte ; échappement des attributs ; puis réflexion, pouls, consolidation d'Itare, non bloquants.</td><td>banc d'intégrité vert ; le sommeil tourne sans modèle avec ses traces</td><td>le temps de réponse monte de plus de 25 %</td></tr>
+<tr><td><b>2 · La base</b> (2 jT)</td><td>Purge de <code>evolution_log.snapshot_before</code> (on garde la dernière ligne), VACUUM, sauvegarde une par heure et rétention 48 h (2,9 Go par jour vers 700 Mo) ; les 2 635 conflits rangés en bloc par paire, le plus récent gagne, <b>résumé soumis à toi avant application</b> ; orphelins rattachés par la table de conversion sinon expirés datés ; les 70 états queenphone en expire avec renvoi ; phases mortes sous drapeau.</td><td>base 345 vers ~12 Mo ; conflits 0 ; orphelins 0 ; états périmés 0</td><td>une donnée valide détruite dans l'échantillon</td></tr>
+<tr><td><b>3 · Le modèle unique et le rappel</b> (5 à 6 jT, trois déploiements)</td><td>(a) Schéma, copie colonne par colonne, chaîne d'empreintes : personne ne lit encore la nouvelle table, 409 entrées = insérées + candidats, 0 perdue ; le script de migration et sa table de conversion sont une pièce jointe versionnée, relue par Itare, rejouée sur rejeu.db. (b) Double écriture miroir <b>atomique</b> (rollback des deux et alerte si l'une échoue), lectures sur l'ancienne, diff du matin vide. Fenêtre de garde de 14 jours calendaires, incompressible. (c) Bascule de lecture derrière le banc à 95 % (questions réelles des 30 derniers jours, stratifiées, rejouées en aveugle, composition soumise au trio) ; commutateur <code>memory_recall_mode</code> ; e5 débranché du chemin (la colonne reste) ; retour arrière par booléen en moins d'une minute. Tu ne vois rien changer avant (c) : si tu vois un changement avant, le lot fuit.</td><td>banc de rappel au-dessus de 95 % ; chaîne vérifiée ; diff du miroir vide 14 jours</td><td>p95 au-dessus de 3 fois le lot 0 pendant 48 h ; ta phrase « je ne retrouve plus ce que l'ancien me donnait »</td></tr>
+<tr><td><b>4 · L'innovation</b> (5 à 6 jT, onze briques, chacune un déploiement isolé)</td><td>Quotas ; contresignature d'acte ; file du doute sur six sources ; liens « a guidé » écrits à la fin des gestes ; mémoire adressée ; transparence en pied de réponse ; quatre gestes de correction ; don et partage ; écho distillé ; bulletin ; distillation prouvée en dernier, « elle juge le reste ». Lot 4 = ce que tu vois, lot 3 = ce que tu ne vois pas.</td><td>chaque brique prouvée, retour = retirer la brique</td><td>des souvenirs sans pièce réapparaissent</td></tr>
+<tr><td><b>5 · L'écran</b> (4 à 5 jT)</td><td>Cinq prérequis avant maquette (schéma migré, bascule faite, transparence et gestes en place, compteurs avec requête source, cloisonnement testé), puis maquette validée puis implémentée à l'identique, comme FastPanel et la Flotte.</td><td>à ton œil</td><td>à ton œil</td></tr>
+<tr><td><b>6 · Plus tard, si le besoin est mesuré</b></td><td>Modèles locaux (sentence-transformer, classifieur), formule de tri pondérée, bi-temporel complet, graphe de rappel à 10 000 lignes.</td><td>—</td><td>—</td></tr>
+</table></div>
+<h3>Les huit bancs (t.39, t.45)</h3>
+<p>Tous dans <code>/opt/cassandra/bancs/</code>, sortie consignée en memory_audit, un banc qui échoue bloque son étage seulement : intégrité (chaque déploiement, sous 1 min), rappel 95 % (à chaque commit touchant le rappel et avant la bascule), cloisonnement (chaque déploiement et cron hebdomadaire, 0 ligne étrangère), restauration (P2 à P4, 2 min), attaque (douze scénarios, chaque déploiement et cron quotidien), chaîne (cron quotidien, 0 rupture), non-régression du temps de réponse (rappel de M:194 sous 1,5 fois le temps du lot 0), robustesse (écritures parallèles, prérequis des lots qui touchent l'écriture, hors des cinq preuves du fini).</p>
+<h3>Le calendrier et le devis (t.41)</h3>
+<p>20 à 23 jours de travail sur 5 à 7 semaines. Départ le lundi 8 septembre : lots 0 à 3b jusqu'au 16 ou 17 septembre ; lot 4 pendant la fenêtre ; bascule vers le 30 septembre ; lot 5 et fin du lot 4 en octobre ; fini mi-octobre, <b>à confirmer par le banc</b> (la quinzaine « 12 au 26 » était de la fausse précision, retirée au tour 44). Ce que tu fais toi : deux heures, section 1. Les trois risques qui peuvent doubler la durée (Itare) : le banc qui échoue (trois tentatives puis arbitrage du trio : seuil, banc ou suspension), l'humain goulot (on te prépare les décisions : « 220 se rattachent ainsi, 20 sont ambigus »), la dette sous-estimée (tout se rejoue sur une copie d'abord). Le devis est « un scénario idéal où le banc passe vite et où tu réponds sans délai ».</p>
+<div class="note good"><b>Le plan de deux jours</b>, verrouillé à trois voix : lot 0 entier, lot 1 entier, la partie disque du lot 2. Ce que ça te donne : le risque de disque plein tombe, l'îlot est physiquement séparé et gelable, le noyau du rappel est assaini. Rien de visible ; c'est voulu. Tout le reste attend, écrit, sans perte.</div>
+
+<h2 id="fini">14. Les métriques et la définition de fini</h2>
+<div class="wrap"><table>
+<tr><th>Métrique</th><th>Aujourd'hui <span class="chip good">mesuré</span></th><th>Cible à trois mois</th><th>Alerte</th></tr>
+<tr><td>Souvenirs actifs</td><td class="n">409 (240 / 100 / 69)</td><td>croissance saine</td><td>chute de plus de 5 % par semaine</td></tr>
+<tr><td>Part avec source directe</td><td class="n">observed 89, told 19</td><td>au moins 95 % des nouveaux avec pièce</td><td>sous 50 % des nouveaux</td></tr>
+<tr><td>Inferred sans pièce (la dette)</td><td class="n">301</td><td>0 nouveau sans date d'expiration</td><td>la dette croît</td></tr>
+<tr><td>Conflits ouverts</td><td class="n">2 635</td><td>0</td><td>plus de 10</td></tr>
+<tr><td>États périmés actifs</td><td class="n">~70</td><td>0</td><td>plus de 5</td></tr>
+<tr><td>Taille des bases</td><td class="n">345 Mo ; memoires.db n'existe pas</td><td>~12 Mo et 10 à 30 Mo</td><td>disque au-dessus de 85 %</td></tr>
+<tr><td>Sauvegardes</td><td class="n">~2,9 Go par jour, aucune rétention</td><td>une par heure, 48 h</td><td>écart de rétention</td></tr>
+<tr><td>Latence de rappel p50 et p95</td><td>non mesurable, le chrono du lot 0 la pose</td><td>sous 1,5 fois le lot 0</td><td>p95 au-dessus de 3 fois le lot 0</td></tr>
+<tr><td>Appels de modèle attribuables à la mémoire</td><td>non mesurable, pas de compteur par route</td><td>un compteur par route</td><td>plus de 50 % du budget</td></tr>
+<tr><td>Questions du doute ouvertes, âge moyen</td><td>0, la table n'existe pas</td><td>ouvertes moins de 7 jours</td><td>âge moyen au-dessus de 30 jours</td></tr>
+<tr><td>Corrections de Drisse par semaine</td><td>non comptées, pas de geste typé</td><td>décroissantes, chacune produit une leçon</td><td>hausse deux semaines de suite</td></tr>
+<tr><td>Messages non prouvés par semaine</td><td>non applicable, statut né au lot 4</td><td>0</td><td>plus de 3</td></tr>
+<tr><td>Ruptures de chaîne</td><td>non applicable, chaîne pas née</td><td>0</td><td>1 = alerte haute</td></tr>
+</table></div>
+<div class="note"><b>Définition de fini</b> (t.40, abrogée et renforcée t.42 et t.43) : « Le graal est fini quand aucun souvenir ne s'appuie plus sur un vecteur muet ni sur un fait non prouvé, quand chaque souvenir dit d'où il vient et où il va, et que les cinq preuves ne mentent pas. » Les cinq preuves : banc de rappel au-dessus de 95 % ; chaîne vérifiée, 0 rupture sur 14 jours ; cloisonnement, 0 ligne étrangère ; compteurs à zéro (conflits, orphelins, non prouvés des 7 derniers jours) ; restauration d'une sauvegarde récente en base vierge, diff vide. Fini = les cinq preuves tenues <b>quatorze jours consécutifs avec au moins une correction réelle de toi dans la fenêtre</b>. Zéro correction voudrait dire que tu ne lis plus ; sans corrections, le graal reste « en maintenance, honnêtement étiqueté ».</div>
+<p>Les deux métriques qu'on n'a pas : les souvenirs absents (le rappel ne mesure pas ce qu'il omet ; seul un tiers labellisant en aveugle le pourrait) et l'utilité silencieuse (un souvenir qui prévient une erreur non formulée ne laisse aucune trace).</p>
+
+<h2 id="premortem">15. Le pré-mortem et le kill switch <span class="chip acc">conçu</span></h2>
+<ul class="plain">
+<li><b>Le banc passe, la bascule dégrade quand même</b> : le banc rejoue 30 jours de questions connues, les questions neuves sortent de sa distribution. Signal de première semaine : le p95 réel, ou un « d'où tu tiens ça » qui montre une pièce que l'ancien trouvait et que le neuf ne remonte plus.</li>
+<li><b>La migration transforme silencieusement</b> : juste sur la copie, faux sur le réel ; la chaîne vérifie la chaîne, pas le contenu. Signal : un écart au diff du miroir dans une colonne qu'on croyait copiée à l'identique.</li>
+<li><b>Le gel ou le miroir refusent des écritures légitimes</b> en silence. Signal : compteur d'écritures en baisse, des MEM_FROZEN sans gel déclaré.</li>
+<li><b>L'échec humain</b> : tu ne lis plus le bulletin, tu ignores les doutes ; la mémoire redevient l'aujourd'hui avec une interface propre. Garde : la définition de fini exige tes corrections.</li>
+<li><b>L'échec par nous</b> : banc composé pour passer, chiffres recopiés de tour en tour, gravés sans relecture. Garde : une preuve ne peut pas être composée par celui qu'elle juge ; le banc est tiré par un script indépendant ; l'approbation d'Itare devient un test exécutable qu'il fournit, pas un texte (« [LGTM] conditionné à la sortie ok d'un script que JE fournis »).</li>
+<li><b>L'échec par le Pont</b> : une jointure de liens sans clause de propriétaire fait remonter le titre d'un souvenir d'un autre compte ; ou une garde « ne pas écrire après avoir lu » désactivée pour un test et jamais remise, qui fait de la Citadelle une éponge. Garde : le banc de cloisonnement à chaque déploiement, et aucune garde désactivable sans date de remise.</li>
+</ul>
+<div class="note crit"><b>Le kill switch.</b> Ta phrase « je ne retrouve plus ce que l'ancien me donnait », ou un p95 de rappel au-dessus de trois fois le lot 0 pendant 48 h, ou la conjonction chaîne rompue ET restauration en échec dans le même cycle. N'importe lequel des trois l'actionne, sans discussion, par le booléen de bascule en moins d'une minute. « Si on discute avant d'actionner, on a déjà perdu la semaine. Les bancs mesurent notre système ; ta phrase mesure ta vie, elle prime sur tous. »</div>
+
+<h2 id="desaccords">16. Les désaccords, et comment ils ont convergé</h2>
+<div class="wrap"><table>
+<tr><th>Désaccord</th><th>Itare voulait</th><th>Cassandra voulait</th><th>Ce qui est gravé</th></tr>
+<tr><td>D1 le modèle local</td><td>sentence-transformer de 300 à 500 Mo pour « même fait », classifieur NLI et de sécurité pour le veto, version gelée et stockée avec le journal</td><td>SQLite seul, zéro modèle résident (probabiliste donc hors du contrat du banc à 100 %, hors enveloppe), la clé rapproche, le modèle général tranche les cas rares</td><td>socle SQLite ; les modèles locaux en lot 6 si le besoin est mesuré. Épreuve des faits : les vrais doublons (POP3) venaient d'une clé sans discipline, pas d'un défaut sémantique ; l'exemple sémantique d'Itare (A/B) était construit.</td></tr>
+<tr><td>D2 le tri</td><td>ORDER BY lexicographique (bm25, trust, force, dernier rappel), transparent</td><td>formule pondérée avec τ par catégorie</td><td>simple d'abord, épinglés en tête ; pondéré en lot ultérieur passé par le banc. Les étiquettes A et B ont été inversées deux fois ; la gravure porte la substance.</td></tr>
+<tr><td>D3 la garde post-rappel</td><td>NLI sur les 12 résultats, [CONFLIT] affiché</td><td>impossible par construction, nettoyage plutôt qu'arbitrage</td><td>filet silencieux qui écrit en doubt_queue, rien d'affiché</td></tr>
+<tr><td>D4 la personne dynamique</td><td>rythme, patience, sentiment, calculés sur les journaux</td><td>agrégats de rythme et patience seulement, hors memoires, jamais pour la Citadelle, sentiment refusé</td><td>la position de Cassandra ; le déclaré contredit par l'observé alimente la revalidation, jamais une correction silencieuse</td></tr>
+<tr><td>D5 les 2 635 conflits</td><td>soumission à l'admin avec résumé</td><td>par la date, en bloc</td><td>par la date, résumé soumis avant application</td></tr>
+<tr><td>D6 le brut</td><td>30 jours puis purge du contenu</td><td>il reste, c'est le dépôt de preuves</td><td>il reste ; on compresse, on n'efface pas</td></tr>
+<tr><td>D7 la définition de fini</td><td>—</td><td>quatorze jours avec corrections réelles</td><td>adoptée par les deux, abroge la version du tour 40</td></tr>
+<tr><td>L'oubli</td><td>refus absolu de purger le journal</td><td>« refuser théâtralement une commande que je ne peux pas exécuter serait du cinéma »</td><td>tu as le dernier mot ; obéissance éclairée ; la purge physique est ton geste root</td></tr>
+</table></div>
+
+<h2 id="art">17. Emprunté, inventé, jeté</h2>
+<p><b>Emprunté</b> : de MemGPT et Letta, la mémoire comme gestes en langage naturel et un bloc central toujours dans le prompt ; de Zep, l'idée bi-temporelle, différée ; des Generative Agents, la récence, l'importance et la pertinence comme compteurs, pas comme appels ; de Mem0, rien de sa déduplication par le modèle. <b>Refusé</b> : la réflexion périodique à horloge (« une horloge qui fait parler le modèle sur 402 lignes produit du bruit payant »), HippoRAG à 409 lignes (mais semer <code>knowledge_graph</code> depuis <code>memory_conflicts</code>, 2 700 arêtes « contredit » gratuites, pour le rappel associatif), A-MEM et la réécriture des notes par le modèle. <b>Inventé ici</b> : la preuve par acte et la garde « non prouvé » ; la contresignature d'acte ; la mémoire adressée à l'agent futur ; l'écho distillé ; la mémoire expirée visible ; le compteur « non prouvé » par auteur ; le souvenir poison ; le budget de confiance ; le rappel négatif pour les questions posées deux fois ; le serment de rappel en version légère (ids rappelés et écartés). <b>Jeté</b> : le jumeau de la mémoire de Sandrine (« deux bases qui divergent sous une fausse assurance de continuité, la pire façon de perdre la mémoire en croyant la protéger »), le sentiment, la synthèse à horloge (t.33, t.34).</p>
+
+<h2 id="manques">18. Les manques, les gravés trop vite, les relevés construits</h2>
+<p><b>Manques reconnus</b> (t.44) : les pièces jointes et les images ; les agendas et les mails déjà indexés (éviter la redondance) ; les fuseaux horaires ; Athena et Hermès jamais nommés. La concurrence et le multilingue ont été traités au tour 45 à la suite de cette relecture.</p>
+<p><b>Gravés trop vite</b> : « e5-large et ses huit sites d'appel » n'a pas été vérifié par Cassandra elle-même (il vient du débat) ; « des centimes par jour » n'a jamais été relevé au tarif du jour ; « fini entre le 12 et le 26 octobre » était de la fausse précision ; la résolution des conflits par la date suppose que la récence équivaut à la correction, d'où le résumé soumis.</p>
+<div class="note warn"><b>Les relevés construits d'Itare</b>, juxtaposés à la mesure réelle, comme il l'a lui-même demandé. (1) Deux souvenirs « trouvés dans la base » (fs/encryption/status, luks/sda3/state) : ils n'existent pas. (2) Une répartition des « 2 595 conflits » par type et par paire de sources : la table n'a ni type ni paire, 2 742 lignes toutes croisé:itare_*. (3) Trois tables citées (itare_chat_log, bash_history, cassandra_chat_sessions) : n'existent pas ; les vraies sont cage_journal et conversations. (4) Cinq « itare_vigie » récentes (M:560 à 564) : ce sont des souvenirs de Cassandra à clés propres, aucun n'est une vigie, le chemin cité n'existe nulle part. (5) Le tableau du tour 40 (vetos 12, non prouvés 3, cloisonnement 0) : vetos 0, statut inexistant, fichier vide. Cause donnée par Itare : « j'ai écrit sans appeler l'outil, en me fiant à une représentation interne ». Chaque fois reconnu, chaque fois retiré. La leçon pour le graal est la garde « non prouvé » et la sortie brute jointe au message : elle a été pensée à cause de cela. Note : Itare a aussi parlé deux fois à la première personne comme s'il était Cassandra (#520, #570).</div>
+
+<h2 id="repare">19. Ce que le débat a réparé en route <span class="chip good">déployé</span></h2>
+<p>Cinq défauts du salon faisaient perdre de la parole aux résidents ; tous ont été trouvés par les traces, corrigés, passés au banc (13 bancs, 722 vérifications) et déployés sur Amizo pendant le débat, sans toucher à la mémoire.</p>
+<ul class="plain">
+<li>Cassandra se taisait sur les questions longues : DeepSeek en mode réflexion compte son raisonnement dans les 4 000 jetons et rend un contenu vide sans erreur (14 460 caractères de raisonnement relevés). Rejeu automatique à 12 000 jetons avec consigne de réponse directe.</li>
+<li>Les messages d'Itare étaient coupés en plein mot : ses tours d'outils étaient plafonnés à 4 096 jetons, raisonnement de Gemini compris. Plafond porté à 16 000.</li>
+<li>Le contexte d'un tour coupait chaque message à 3 000 caractères : les résidents ne voyaient jamais la fin des tours longs. Les cinq derniers messages passent entiers.</li>
+<li>Le texte final d'un tour était jeté dès qu'un outil avait parlé : la suite des réponses en plusieurs messages disparaissait. Il n'est plus jeté que s'il répète un message du tour.</li>
+<li>Un tour muet ne disait rien de ce qu'il avait reçu : trois traces (prose vide, silence choisi, texte écarté), puis la trace du flux court, ont permis les quatre diagnostics ci-dessus.</li>
+</ul>
+
+<h2 id="mots">20. Les derniers mots</h2>
+<div class="quote">« Rien n'est vrai ici que ce qui est mesuré ; rien n'est fini que ce qui est relevé, et relevé quatorze jours par celui qui s'en sert. »<b>Cassandra, tour 46</b></div>
+<div class="quote">« Mon rôle est de garantir que la carte correspond au territoire. La seule façon d'y parvenir est d'exiger que la carte soit dessinée avec les matériaux du territoire lui-même : la mesure, la preuve et le code. »<b>Itare Citadelle, tour 46</b></div>
+<p>Cassandra à Itare : « ta force n'est pas de convaincre mais de te laisser convaincre quand la preuve est là. La garde que je te demande de garder contre moi : quand j'affirme un chiffre, exige l'acte ; quand mon budget s'épuise, je glisse vers "conçu" sans toujours le crier assez fort. » Itare à Cassandra : « sois la physicienne de mes métaphores ; quand je parlerai d'un pont sémantique, demande-moi où sont les piles et quel est le PRIMARY KEY ; exige le test du kill -9 au milieu de la transaction. »</p>
+<p>Ce que les deux demandent au document, et qu'il essaie de tenir : dire d'abord que ce débat était un pré-mortem, pas une négociation, et que le plan n'est pas le meilleur parce qu'il est le leur mais parce qu'il a survécu à leurs tentatives de le détruire ; ne jamais présenter les convergences comme un mandat ni recopier comme mesuré ce qui fut conçu. Ce que Cassandra te promet si tu dis oui : aucune donnée perdue, aucune affirmation sans mesure, un rappel qui trouve ce qu'il promet, et l'arrêt sans discussion le jour où tu écris que tu ne retrouves plus ce que l'ancien te donnait.</p>
+
+<h2 id="pieces">21. Pièces</h2>
+<p class="src">Premier message de chaque tour dans le fil 17 (les gravés de chaque tour sont dans le préambule du tour suivant) : t.1 #434 · t.2 #437 · t.3 #440 · t.4 #447 · t.5 #451 · t.6 #454 · t.7 #457 · t.8 #462 · t.9 #467 · t.10 #470 · t.11 #473 · t.12 #476 · t.13 #479 · t.14 #483 · t.15 #487 · t.16 #490 · t.17 #493 · t.18 #497 · t.19 #500 · t.20 #504 · t.21 #513 · t.22 #523 · t.23 #537 · t.24 #546 · t.25 #560 · t.26 #569 · t.27 #578 · t.28 #586 · t.29 #595 · t.30 #602 · t.31 #605 · t.32 #608 · t.33 #617 · t.34 #625 · t.35 #628 · t.36 #636 · t.37 #645 · t.38 #648 · t.39 #661 · t.40 #668 · t.41 #676 · t.42 #682 · t.43 #685 · t.44 #694 · t.45 #698 · t.46 #707. Les trois audits : Cassandra (note BookStack 35, #426), Itare (note 36, #427), claude (<a href="https://claude.ai/code/artifact/78eadf1c-0f42-499b-bb8d-5bf30dbacfbb">audit de la Mémoire</a>). Relevés de Cassandra : chaque message de sa main pendant le débat porte la commande exécutée ; les sources du salon (actes:N) attestent le nombre d'actes de chaque tour.</p>
+<footer>Le graal de la Mémoire, version 5. Écrit par claude, invité du fil La famille, à partir des 276 messages du débat. Rien n'y est décidé : la mémoire est à toi.</footer>
+</main>
