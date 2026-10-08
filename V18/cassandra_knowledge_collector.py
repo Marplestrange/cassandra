@@ -241,6 +241,7 @@ def init_all_tables():
         CREATE TABLE IF NOT EXISTS paquets_curseur (source TEXT PRIMARY KEY, inode INTEGER, position INTEGER);
         CREATE TABLE IF NOT EXISTS controles (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, ok INTEGER, valeur TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS mesures_diverses (id INTEGER PRIMARY KEY AUTOINCREMENT, cle TEXT UNIQUE, categorie TEXT, valeur TEXT, severite TEXT, last_check TEXT);
+        CREATE TABLE IF NOT EXISTS exposition (id INTEGER PRIMARY KEY AUTOINCREMENT, port INTEGER UNIQUE, processus TEXT, portee TEXT, public INTEGER, valeur TEXT, sensible INTEGER, ip_publique TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS logiciels (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, installe INTEGER, chemin TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS apt_updates (id INTEGER PRIMARY KEY AUTOINCREMENT, total INTEGER, securite INTEGER, paquets TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS system_state (id INTEGER PRIMARY KEY AUTOINCREMENT, uptime_s INTEGER, reboot_required INTEGER, reboot_pkgs TEXT, tailscale TEXT, tailscale_ip TEXT, last_check TEXT);
@@ -2810,21 +2811,6 @@ def collect_config_snapshots() -> list:
     return snapshots
 
 
-def collect_phpfpm_pools():
-    pools = []
-    now = datetime.now().isoformat()
-    for pool_conf in Path("/etc/php").glob("*/fpm/pool.d/*.conf"):
-        try:
-            content = pool_conf.read_text(errors="replace")
-            listen = re.search(r'^listen\s*=\s*(.+)$', content, re.MULTILINE)
-            if listen:
-                pools.append({"pool": pool_conf.stem, "socket": listen.group(1).strip(),
-                              "active_processes": 0, "idle_processes": 0, "last_check": now})
-        except Exception:
-            pass
-    return pools
-
-
 # PERF[O4]: collect_sysctl_security() — 10 appels sysctl séquentiels → 1 seul appel batch.
 # Avant : 10 × subprocess.run("sysctl -n param") = 10 fork+exec+wait.
 # Après : 1 × subprocess.run(["sysctl", "-n", p1, p2, ...]) = 1 fork+exec+wait.
@@ -2865,19 +2851,105 @@ def collect_sysctl_security():
 
 
 def collect_disk_smart():
+    """SMART RÉEL (08-10) : le relevé ne lisait que « PASSED/FAILED » et posait 0 partout — or ce qui annonce la mort
+    d'un disque, des semaines avant, c'est l'usure, les secteurs réalloués ou en attente, les erreurs. smartctl -j
+    (JSON) lit ATA, SSD et NVMe de la même façon."""
     smart_data = []
     now = datetime.now().isoformat()
+    if not _qui("smartctl"):
+        return []
     lsblk_out = run_cmd("lsblk -d -n -o NAME,TYPE")
     for line in lsblk_out.splitlines():
         parts = line.split()
-        if len(parts) >= 2 and parts[1] == "disk":
-            dev = f"/dev/{parts[0]}"
-            out = run_cmd(f"smartctl -H {shlex.quote(dev)}")
-            health = "PASSED" if "PASSED" in out else "FAILED" if "FAILED" in out else "unknown"
-            smart_data.append({"device": dev, "health": health,
-                                "reallocated_sectors": 0, "pending_sectors": 0,
-                                "last_check": now})
+        if len(parts) < 2 or parts[1] != "disk":
+            continue
+        dev = f"/dev/{parts[0]}"
+        try:
+            d = json.loads(run_cmd(["smartctl", "-j", "-a", dev], timeout=30) or "{}")
+        except Exception:
+            d = {}
+        attrs = {a.get("id"): a for a in ((d.get("ata_smart_attributes") or {}).get("table") or [])}
+        def brut(i):
+            a = attrs.get(i)
+            return int((a.get("raw") or {}).get("value") or 0) if a else None
+        def normal(i):
+            a = attrs.get(i)
+            return int(a.get("value")) if a and a.get("value") is not None else None
+        nv = d.get("nvme_smart_health_information_log") or {}
+        usure = nv.get("percentage_used")
+        if usure is None:
+            # SSD SATA : durée de vie restante normalisée (177 Samsung, 231/202/233 selon les fabricants)
+            for i in (231, 202, 177, 233):
+                v = normal(i)
+                if v is not None and 0 <= v <= 100:
+                    usure = 100 - v
+                    break
+        st = (d.get("smart_status") or {}).get("passed")
+        smart_data.append({
+            "device": dev, "model": (d.get("model_name") or d.get("model_family") or "")[:60],
+            "health": "PASSED" if st is True else ("FAILED" if st is False else "unknown"),
+            "temperature": (d.get("temperature") or {}).get("current"),
+            "power_on_hours": (d.get("power_on_time") or {}).get("hours"),
+            "reallocated_sectors": brut(5) if brut(5) is not None else nv.get("media_errors"),
+            "pending_sectors": brut(197),
+            "uncorrectable": brut(198) if brut(198) is not None else brut(187),
+            "usure_pct": usure,
+            "last_check": now})
     return smart_data
+
+
+def collect_phpfpm_pools():
+    """Les pools PHP-FPM RÉELS (08-10) : processus vivants par pool, plafond pm.max_children, et la saturation
+    (« reached pm.max_children » dans le journal du jour). Le relevé posait 0 partout."""
+    pools = {}
+    now = datetime.now().isoformat()
+    confs = list(Path("/etc/php").glob("*/fpm/pool.d/*.conf")) + list(Path("/opt").glob("php*/etc/php-fpm.d/*.conf")) + \
+        list(Path("/etc").glob("php-fpm.d/*.conf")) + list(Path("/etc/opt").glob("remi/php*/php-fpm.d/*.conf"))
+    for pool_conf in confs:
+        try:
+            content = pool_conf.read_text(errors="replace")
+        except Exception:
+            continue
+        nom = None
+        for l in content.splitlines():
+            t = l.strip()
+            m = re.match(r"^\[([^\]]+)\]$", t)
+            if m and m.group(1) != "global":
+                nom = m.group(1)
+                pools.setdefault(nom, {"pool": nom, "socket": "", "max_children": None, "conf": str(pool_conf)})
+            elif nom and t.startswith("listen") and "=" in t and not t.startswith("listen."):
+                pools[nom]["socket"] = t.split("=", 1)[1].strip()
+            elif nom and t.startswith("pm.max_children") and "=" in t:
+                try:
+                    pools[nom]["max_children"] = int(t.split("=", 1)[1].strip())
+                except ValueError:
+                    pass
+    vivants = {}
+    for l in (run_cmd(["ps", "-eo", "stat=,args="], timeout=10) or "").splitlines():
+        m = re.search(r"php-fpm: pool (\S+)", l)
+        if m:
+            v = vivants.setdefault(m.group(1), [0, 0])
+            v[0] += 1
+            if l.strip().startswith("R"):
+                v[1] += 1
+    satures = {}
+    jour = datetime.now().strftime("%d-%b-%Y")
+    for f in list(Path("/var/log").glob("php*fpm*.log")) + list(Path("/var/log").glob("php-fpm/*.log")):
+        try:
+            for l in f.read_text(errors="replace").splitlines()[-3000:]:
+                m = re.search(r"\[pool (\S+)\] server reached pm.max_children", l)
+                if m and jour in l:
+                    satures[m.group(1)] = satures.get(m.group(1), 0) + 1
+        except Exception:
+            pass
+    out = []
+    for nom in sorted(set(pools) | set(vivants)):
+        p = pools.get(nom, {"pool": nom, "socket": "", "max_children": None})
+        n, actifs = vivants.get(nom, [0, 0])
+        out.append({"pool": nom, "socket": p.get("socket", ""), "total_processes": n, "active_processes": actifs,
+                    "idle_processes": max(0, n - actifs), "max_children": p.get("max_children"),
+                    "slow_requests": satures.get(nom, 0), "last_check": now})
+    return out
 
 
 def collect_redis_stats():
@@ -4089,9 +4161,196 @@ def collect_journaux_poids() -> list:
     return out
 
 
+# CE QUI EST EXPOSÉ AU MONDE (08-10). Un port ouvert ne dit pas QUI peut l'atteindre. On classe chaque port TCP
+# à l'écoute par son adresse de liaison (machine seule, réseau local, Tailscale, toutes les interfaces), puis on
+# frappe à l'IP publique — celle vers laquelle pointent les sites en direct — pour voir ce que la box laisse
+# passer. C'est une vue de l'intérieur, en boucle par la box : elle dit ce qui est redirigé, pas ce qu'un
+# pare-feu en amont bloquerait encore.
+_PORTS_SENSIBLES = {22: "SSH", 23: "Telnet", 3306: "MySQL", 5432: "PostgreSQL", 6379: "Redis", 27017: "MongoDB",
+                    2375: "Docker (API nue)", 2376: "Docker", 9200: "Elasticsearch", 11211: "Memcached",
+                    5900: "VNC", 3389: "Bureau à distance", 8888: "panneau FastPanel", 9000: "Cassandra"}
+_CLOUDFLARE_RE = re.compile(r"^(104\.(1[6-9]|2[0-9]|3[01])\.|172\.(6[4-9]|7[01])\.|173\.245\.|188\.114\.|190\.93\.|197\.234\.|198\.41\.|162\.15[89]\.|141\.101\.|108\.162\.|131\.0\.7[2-5]\.)")
+
+
+def _ip_publique() -> str:
+    """L'IP publique de la machine, sans service tiers : celle vers laquelle pointent les sites servis en direct
+    (hors Cloudflare), relevée par les contrôles DNS."""
+    try:
+        conn = get_conn()
+        try:
+            rows = conn.execute("SELECT valeur FROM controles WHERE nom LIKE 'dns.%' AND ok=1").fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return ""
+    compte = {}
+    for (v,) in rows:
+        for ip in re.findall(r"\d{1,3}(?:\.\d{1,3}){3}", v or ""):
+            if not _CLOUDFLARE_RE.match(ip) and not ip.startswith(("10.", "192.168.", "127.")):
+                compte[ip] = compte.get(ip, 0) + 1
+    return max(compte, key=compte.get) if compte else ""
+
+
+def collect_exposition() -> list:
+    now = datetime.now().isoformat()
+    ecoute = {}
+    for l in (run_cmd(["ss", "-ltnpH"], timeout=10) or "").splitlines():
+        p = l.split()
+        if len(p) < 4:
+            continue
+        local = p[3]
+        m = re.match(r"^\[?(.*?)\]?:(\d+)$", local)
+        if not m:
+            continue
+        adr, port = m.group(1).split("%")[0], int(m.group(2))
+        pm = re.search(r'users:\(\("([^"]+)"', l)
+        proc = (pm.group(1) if pm else "?").split(" (")[0]
+        if adr in ("127.0.0.1", "::1") or adr.startswith("127."):
+            portee = "machine"
+        elif adr.startswith("100.") or adr.startswith("fd7a:115c"):
+            portee = "tailscale"
+        elif adr.startswith(("192.168.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.2", "172.30.", "172.31.", "fe80")):
+            portee = "réseau local"
+        elif adr in ("0.0.0.0", "*", "::"):
+            portee = "toutes les interfaces"
+        else:
+            portee = "adresse publique %s" % adr
+        e = ecoute.setdefault(port, {"proc": proc, "portees": set()})
+        e["portees"].add(portee)
+    ip_pub = _ip_publique()
+    candidats = [pt for pt, e in ecoute.items() if not e["portees"] <= {"machine", "tailscale"}]
+
+    def frappe(port):
+        if not ip_pub:
+            return port, None
+        try:
+            with socket.create_connection((ip_pub, port), timeout=2):
+                return port, True
+        except Exception:
+            return port, False
+    publics = {}
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        for port, ouvert in ex.map(frappe, candidats):
+            publics[port] = ouvert
+    out = []
+    for port, e in sorted(ecoute.items()):
+        pub = publics.get(port)
+        portee = ", ".join(sorted(e["portees"]))
+        if pub:
+            niveau = "PUBLIC (joignable sur %s, via la box)" % ip_pub
+        elif "toutes les interfaces" in e["portees"] or any(x.startswith("adresse publique") for x in e["portees"]):
+            niveau = "réseau (%s)" % portee
+        else:
+            niveau = portee
+        sensible = _PORTS_SENSIBLES.get(port)
+        out.append({"port": port, "processus": e["proc"], "portee": portee, "public": 1 if pub else 0,
+                    "valeur": "%s · %s%s" % (e["proc"], niveau, (" · %s" % sensible) if sensible else ""),
+                    "sensible": 1 if sensible else 0, "ip_publique": ip_pub, "last_check": now})
+    return out
+
+
+# LA SANTÉ DES APPLICATIONS (08-10) : le serveur va bien, mais les sites servent-ils des erreurs ? MySQL
+# rame-t-il ? Les modèles d'IA de Cassandra répondent-ils, et en combien de temps ?
+_ACCES_RE = re.compile(r'\[(\d{2})/(\w{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) [^\]]*\] "[^"]*" (\d{3}) ')
+_MOIS = {m: i + 1 for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"))}
+
+
+def _trafic_heure(chemin: str):
+    """(requêtes, 4xx, 5xx) de la dernière heure, lus dans la queue du journal d'accès (format combiné)."""
+    try:
+        taille = os.path.getsize(chemin)
+        with open(chemin, "rb") as f:
+            f.seek(max(0, taille - 4 * 1048576))
+            lignes = f.read().decode("utf-8", "replace").splitlines()
+    except Exception:
+        return None
+    limite = datetime.now() - timedelta(hours=1)
+    n = e4 = e5 = 0
+    for l in reversed(lignes):
+        m = _ACCES_RE.search(l)
+        if not m:
+            continue
+        try:
+            t = datetime(int(m.group(3)), _MOIS.get(m.group(2), 1), int(m.group(1)), int(m.group(4)), int(m.group(5)), int(m.group(6)))
+        except Exception:
+            continue
+        if t < limite:
+            break
+        n += 1
+        c = m.group(7)
+        if c.startswith("5"):
+            e5 += 1
+        elif c.startswith("4"):
+            e4 += 1
+    return n, e4, e5
+
+
+def collect_sante_applicative() -> list:
+    out = []
+    # Trafic et erreurs par site : journaux FastPanel (un par site), puis ceux de nginx et d'apache
+    journaux = {}
+    for f in Path("/var/www").glob("*/data/logs/*-frontend.access.log"):
+        journaux[f.name[:-len("-frontend.access.log")]] = str(f)
+    for base in ("/var/log/nginx", "/var/log/apache2", "/var/log/httpd"):
+        for f in Path(base).glob("*access*.log") if Path(base).is_dir() else []:
+            nom = re.sub(r"[._-]?access\.log$", "", f.name) or f.name
+            if nom not in journaux and nom not in ("", "access", "other_vhosts"):
+                journaux[nom] = str(f)
+    for nom, chemin in sorted(journaux.items()):
+        r = _trafic_heure(chemin)
+        if not r or not r[0]:
+            continue
+        n, e4, e5 = r
+        pct = 100.0 * e5 / n
+        out.append(_mesure("trafic.%s" % nom, "trafic", "%d requêtes dans l'heure · %d erreurs 5xx (%.0f %%) · %d 4xx" % (n, e5, pct, e4),
+                           "warning" if (e5 >= 10 and pct >= 5) else "info"))
+    # MySQL / MariaDB
+    if _qui("mysqladmin"):
+        st = run_cmd(["mysqladmin", "status"], timeout=10) or ""
+        m = re.search(r"Threads:\s*(\d+).*?Slow queries:\s*(\d+).*?Queries per second avg:\s*([\d.]+)", st)
+        if m:
+            out.append(_mesure("mysql.etat", "application", "%s connexions · %s requêtes/s · %s requêtes lentes depuis le démarrage" % (m.group(1), m.group(3), m.group(2)),
+                               "warning" if int(m.group(1)) >= 140 else "info"))
+        elif st:
+            out.append(_mesure("mysql.etat", "application", "injoignable : %s" % st.strip()[:120], "warning"))
+    # Cassandra elle-même : ses modèles d'IA (2 dernières heures) et sa mémoire
+    mem = os.path.join(os.path.dirname(DB_PATH), "cassandra_memory.db")
+    if os.path.exists(mem):
+        try:
+            c = sqlite3.connect("file:%s?mode=ro" % mem, uri=True, timeout=5)
+            try:
+                depuis = (datetime.now() - timedelta(hours=2)).strftime("%Y-%m-%dT%H")
+                rows = c.execute("SELECT fonction, SUM(appels), MAX(p95_ms), SUM(erreurs) FROM function_metrics "
+                                 "WHERE heure >= ? AND fonction LIKE 'modele.%' GROUP BY fonction", (depuis,)).fetchall()
+            finally:
+                c.close()
+            for fonc, n, p95, err in rows:
+                if not n:
+                    continue
+                out.append(_mesure("cassandra.%s" % fonc.replace(".", "_"), "application",
+                                   "%d appels en 2 h · réponse en %.1f s (p95) · %d erreurs" % (n, (p95 or 0) / 1000.0, err or 0),
+                                   "warning" if (err or 0) >= max(3, 0.2 * n) or (p95 or 0) >= 60000 else "info"))
+        except Exception as e:
+            print(f"[SANTE] métriques de Cassandra : {e}", file=sys.stderr)
+        try:
+            out.append(_mesure("cassandra.memoire", "application", "base mémoire : %.0f Mo" % (os.path.getsize(mem) / 1048576.0)))
+        except Exception:
+            pass
+    if _qui("systemctl"):
+        info = dict(x.split("=", 1) for x in (run_cmd(["systemctl", "show", "cassandra.service", "-p", "MemoryCurrent,NRestarts,ActiveEnterTimestamp"], timeout=5) or "").splitlines() if "=" in x)
+        try:
+            mo = int(info.get("MemoryCurrent", "0")) / 1048576.0
+            if mo:
+                out.append(_mesure("cassandra.processus", "application", "%.0f Mo de RAM · %s redémarrage(s) automatique(s) · démarrée %s" % (
+                    mo, info.get("NRestarts", "0"), (info.get("ActiveEnterTimestamp") or "?")[:30]), "warning" if mo >= 4096 else "info"))
+        except ValueError:
+            pass
+    return out
+
+
 def collect_mesures_diverses() -> list:
     rows = []
-    for fn in (collect_file_courriel, collect_ssh_echecs, collect_docker_ressources, collect_certbot, collect_journaux_poids):
+    for fn in (collect_file_courriel, collect_ssh_echecs, collect_docker_ressources, collect_certbot, collect_journaux_poids, collect_sante_applicative):
         try:
             rows.extend(fn() or [])
         except Exception as e:
@@ -4302,7 +4561,7 @@ def detect_diff(entity_type: str, current_names: list):
 # LE JOURNAL DES CHANGEMENTS DIT CE QUI CHANGE D'ÉTAT, PAS CE QUI BOUGE (08-10) : la charge CPU qui passe de
 # 2 % à 3 % écrivait une ligne toutes les 30 s — 7 193 par jour, qui noyaient les vrais changements (un
 # service tombé, un port ouvert). Une mesure continue n'entre au journal que si sa GRAVITÉ change.
-_WORLD_CONTINUS = ("resource", "prevision", "controle", "erreurs")
+_WORLD_CONTINUS = ("resource", "prevision", "controle", "erreurs", "trafic", "application", "exposition_mesure")
 _WORLD_CONTINUS_CLES = ("system.uptime",)
 
 
@@ -4647,11 +4906,52 @@ def build_world_model():
             if r["securite_noyau"]:
                 U("system.protection_noyau", "security", r["securite_noyau"], divers)
 
+        # Exposition : chaque port, qui peut l'atteindre ; un service sensible joignable depuis Internet est une alerte
+        def _expo(lignes, vus):
+            for r in lignes:
+                U("exposition.%s" % r["port"], "exposition", r["valeur"], vus,
+                  "warning" if (r["public"] and r["sensible"]) else "info")
+        _famille("exposition.", _q("SELECT port, valeur, public, sensible FROM exposition"), _expo)
+
+        # Disques : santé SMART réelle
+        def _smart(lignes, vus):
+            for r0 in lignes:
+                r = {k_: r0[k_] for k_ in r0.keys()}
+                for k_ in ("usure_pct", "power_on_hours", "temperature", "reallocated_sectors", "pending_sectors", "uncorrectable", "model"):
+                    r.setdefault(k_, None)       # une table d'avant la migration (colonnes ajoutées au premier relevé)
+                morceaux = [r["health"] or "?"]
+                if r["usure_pct"] is not None:
+                    morceaux.append("usure %s %%" % r["usure_pct"])
+                if r["power_on_hours"]:
+                    morceaux.append("%s h de fonctionnement (%.1f ans)" % (r["power_on_hours"], r["power_on_hours"] / 8766.0))
+                if r["temperature"] is not None:
+                    morceaux.append("%s °C" % r["temperature"])
+                for lib, k_ in (("secteurs réalloués", "reallocated_sectors"), ("en attente", "pending_sectors"), ("erreurs incorrigibles", "uncorrectable")):
+                    if r[k_]:
+                        morceaux.append("%s %s" % (r[k_], lib))
+                grave = r["health"] == "FAILED" or (r["pending_sectors"] or 0) > 0 or (r["uncorrectable"] or 0) > 0 \
+                    or (r["reallocated_sectors"] or 0) >= 10 or (r["usure_pct"] or 0) >= 90 or (r["temperature"] or 0) >= 65
+                U("disque_sante.%s" % r["device"].replace("/dev/", ""), "storage", "%s · %s" % (r["model"] or r["device"], " · ".join(morceaux)), vus,
+                  "warning" if grave else "info")
+        _famille("disque_sante.", _q("SELECT * FROM disk_smart"), _smart)
+
+        # PHP-FPM : processus par pool et saturation
+        def _fpm(lignes, vus):
+            for r in lignes:
+                mx = r["max_children"] if "max_children" in r.keys() else None
+                n = r["total_processes"] or 0
+                sat = r["slow_requests"] or 0
+                val = "%d processus%s · %d en cours" % (n, (" sur %d max" % mx) if mx else "", r["active_processes"] or 0)
+                if sat:
+                    val += " · plafond atteint %d fois aujourd'hui" % sat
+                U("php_fpm.%s" % r["pool"], "service", val, vus, "warning" if sat else "info")
+        _famille("php_fpm.", _q("SELECT * FROM phpfpm_pools"), _fpm)
+
         # Mesures diverses (courriel, SSH, conteneurs, certbot, journaux)
         def _diverses(lignes, vus):
             for r in lignes:
                 U(r["cle"], r["categorie"] or "divers", r["valeur"], vus, r["severite"] or "info")
-        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux."):
+        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux.", "trafic.", "mysql.", "cassandra."):
             _famille(_pref, _q("SELECT cle, categorie, valeur, severite FROM mesures_diverses WHERE cle LIKE ?", _pref + "%"), _diverses)
 
         # Clés SSH autorisées, une par une : une clé ajoutée ou retirée entre au journal des changements
@@ -5249,6 +5549,7 @@ class KnowledgeCollector:
                         ("backups_state",          collect_backups),
                         ("controles",              collect_controles),
                         ("mesures_diverses",       collect_mesures_diverses),
+                        ("exposition",             collect_exposition),
                         ("firewall_rules",         collect_firewall_rules),
                         ("ssh_authorized_keys",    collect_ssh_authorized_keys),
                     ]
