@@ -4956,8 +4956,37 @@ def build_world_model():
 
         # Clés SSH autorisées, une par une : une clé ajoutée ou retirée entre au journal des changements
         def _cles(lignes, vus):
+            # Une clé APPARUE il y a moins de 24 h est une alerte (sécurité : notifiée sans délai) — si c'est vous,
+            # « Accepter » la fait taire.
+            recentes = set()
+            try:
+                lim = (datetime.now() - timedelta(hours=24)).isoformat()
+                # La PREMIÈRE prise de connaissance (toutes les clés vues d'un coup quand le capteur est né) n'est pas
+                # un ajout : on écarte les « apparitions » de la minute du tout premier relevé.
+                conn.execute("CREATE TABLE IF NOT EXISTS world_meta (cle TEXT PRIMARY KEY, valeur TEXT)")
+                m_ = conn.execute("SELECT valeur FROM world_meta WHERE cle='cle_ssh_connues_depuis'").fetchone()
+                if not m_:
+                    # Premier passage de ce code : les clés présentes MAINTENANT sont la référence. Ce qui apparaîtra
+                    # après ce repère est un ajout ; ce qui est apparu avant (la naissance du capteur) n'en est pas un.
+                    conn.execute("INSERT INTO world_meta (cle, valeur) VALUES ('cle_ssh_connues_depuis', ?)", (datetime.now().isoformat(),))
+                    seuil = datetime.now().isoformat()
+                else:
+                    seuil = m_[0]
+                recentes = {x[0] for x in conn.execute("SELECT entity_name FROM changelog WHERE entity_name LIKE 'cle_ssh.%' "
+                                                        "AND change_type='added' AND ts >= ? AND ts > ?", (lim, seuil)).fetchall()}
+            except Exception:
+                pass
+            premiere = not conn.execute("SELECT 1 FROM world_model WHERE wkey LIKE 'cle_ssh.%' LIMIT 1").fetchone()
+            if premiere:
+                try:
+                    conn.execute("INSERT OR REPLACE INTO world_meta (cle, valeur) VALUES ('cle_ssh_connues_depuis', ?)", (datetime.now().isoformat(),))
+                except Exception:
+                    pass
             for r in lignes:
-                U("cle_ssh.%s.%s" % (r["user"], r["key_hash"][:8]), "security", "%s %s" % (r["key_type"], r["comment"] or "(sans commentaire)"), vus)
+                wk = "cle_ssh.%s.%s" % (r["user"], r["key_hash"][:8])
+                nouvelle = (wk in recentes) or (not premiere and not conn.execute("SELECT 1 FROM world_model WHERE wkey=?", (wk,)).fetchone())
+                U(wk, "security", "%s %s%s" % (r["key_type"], r["comment"] or "(sans commentaire)", " · NOUVELLE (moins de 24 h)" if nouvelle else ""),
+                  vus, "warning" if nouvelle else "info")
         _famille("cle_ssh.", _q("SELECT user, key_type, key_hash, comment FROM ssh_authorized_keys"), _cles)
 
         # Pare-feu : le nombre de règles par outil, et ce qu'elles bloquent
@@ -5234,6 +5263,18 @@ class SharedMemorySocket:
                     client.sendall(json.dumps([dict(r) for r in rows]).encode())
                 except Exception:
                     client.sendall(b"[]")
+            elif data.startswith("GET_HISTORY:"):
+                # L'histoire d'UNE mesure (08-10) : ses changements sur 30 jours, du plus récent au plus ancien
+                wk = data.split(":", 1)[1].strip()[:200]
+                try:
+                    conn = get_conn()
+                    depuis = (datetime.now() - timedelta(days=30)).isoformat()
+                    rows = conn.execute("SELECT ts, change_type, old_value, new_value, severity FROM changelog "
+                                        "WHERE entity_name = ? AND ts >= ? ORDER BY id DESC LIMIT 300", (wk, depuis)).fetchall()
+                    conn.close()
+                    client.sendall(json.dumps([dict(r) for r in rows]).encode())
+                except Exception:
+                    client.sendall(b"[]")
             elif data == "GET_CHANGES" or data.startswith("GET_CHANGES:"):
                 since = data.split(":", 1)[1].strip() if ":" in data else ""
                 try:
@@ -5351,6 +5392,76 @@ class KnowledgeCollector:
         if errors:
             print(f"[COLLECTOR] Erreurs parallèles: {'; '.join(errors)}", file=sys.stderr)
         return results
+
+    # ── LA VIGIE INSTANTANÉE (08-10) ─────────────────────────────────────────────────────────
+    # Une clé SSH ajoutée, un sudoers modifié, un service qui tombe : vus en secondes, plus en minutes. Les
+    # fichiers sensibles sont regardés toutes les 5 s (un stat, rien de plus) ; le journal système est lu en
+    # continu, et une unité en échec déclenche aussitôt un relevé des services et le modèle du monde.
+    _FICHIERS_SENSIBLES = ("/etc/sudoers", "/etc/passwd", "/etc/group", "/etc/ssh/sshd_config", "/root/.ssh/authorized_keys")
+
+    def _sensibles(self) -> list:
+        fichiers = list(self._FICHIERS_SENSIBLES)
+        try:
+            fichiers += [str(f) for f in Path("/etc/sudoers.d").iterdir()]
+        except Exception:
+            pass
+        try:
+            for l in Path("/etc/passwd").read_text().splitlines():
+                p = l.split(":")
+                if len(p) >= 6 and (p[2] == "0" or (p[2].isdigit() and int(p[2]) >= 1000)):
+                    fichiers.append(os.path.join(p[5], ".ssh", "authorized_keys"))
+        except Exception:
+            pass
+        return sorted(set(fichiers))
+
+    def _vigie_fichiers(self):
+        vus = {}
+        while self.running:
+            try:
+                change = []
+                for f in self._sensibles():
+                    try:
+                        st = os.stat(f)
+                        sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+                    except OSError:
+                        sig = None
+                    if f in vus and vus[f] != sig:
+                        change.append(f)
+                    vus[f] = sig
+                if change:
+                    print(f"[VIGIE] changement immédiat : {', '.join(change)}")
+                    releve("ssh_authorized_keys", collect_ssh_authorized_keys, 900)
+                    try:
+                        collect_config_snapshots()
+                    except Exception as e:
+                        print(f"[VIGIE] dérive : {e}", file=sys.stderr)
+                    build_world_model()
+            except Exception as e:
+                print(f"[VIGIE] fichiers : {e}", file=sys.stderr)
+            time.sleep(5)
+
+    def _vigie_journal(self):
+        if not _qui("journalctl"):
+            return
+        motif = re.compile(r"Failed with result|entered failed state|Main process exited, code=(?:killed|dumped)|Failed to start")
+        while self.running:
+            try:
+                p = subprocess.Popen(["journalctl", "-f", "-n", "0", "-o", "cat", "-p", "warning"], stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, text=True)
+                dernier = 0.0
+                for ligne in p.stdout:
+                    if not self.running:
+                        break
+                    if motif.search(ligne) and time.time() - dernier > 10:
+                        dernier = time.time()
+                        time.sleep(2)            # laisser systemd poser l'état
+                        for table, fn in (("system_services", collect_system_services), ("failed_units", collect_failed_units)):
+                            releve(table, fn, 30)
+                        build_world_model()
+                p.kill()
+            except Exception as e:
+                print(f"[VIGIE] journal : {e}", file=sys.stderr)
+            time.sleep(10)
 
     def _relire_lents(self):
         try:
@@ -5484,6 +5595,8 @@ class KnowledgeCollector:
 
         elapsed = round(time.time() - t0, 1)
         print(f"[COLLECTOR] ✅ PRÊT en {elapsed}s — Socket: {SOCKET_PATH}")
+        threading.Thread(target=self._vigie_fichiers, daemon=True, name="vigie-fichiers").start()
+        threading.Thread(target=self._vigie_journal, daemon=True, name="vigie-journal").start()
 
         try:
             while self.running:

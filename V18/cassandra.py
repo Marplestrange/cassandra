@@ -78700,6 +78700,8 @@ def _flotte_sensorium_boucle() -> None:
 # tait jusqu'à son échéance — ou jusqu'à ce que son chiffre empire. Un collecteur muet ne ferme rien : le
 # silence n'est pas une guérison.
 SENSORIUM_NOTIF_APRES_S = 600
+# La sécurité n'attend pas dix minutes : une clé SSH apparue se dit tout de suite.
+_SENSORIUM_IMMEDIAT = ("cle_ssh.",)
 SENSORIUM_FERMER_APRES_S = 120
 _SENSORIUM_CRITIQUES = ("stockage.", "montage.", "web.", "controle.tls.", "systemd.failed_units")
 
@@ -78820,11 +78822,14 @@ def _sensorium_alertes_passe() -> dict:
             if not e:
                 conn.execute("INSERT INTO sensorium_alertes (wkey, depuis, ok_depuis, nid, valeur) VALUES (?,?,NULL,0,?)",
                              (wk, now.strftime(fmt), val))
-                continue
+                if not wk.startswith(_SENSORIUM_IMMEDIAT):
+                    continue
+                e = {"depuis": now.strftime(fmt), "nid": 0, "valeur": None}
             if e.get("ok_depuis"):
                 conn.execute("UPDATE sensorium_alertes SET ok_depuis = NULL WHERE wkey = ?", (wk,))
             age = (now - datetime.strptime(e["depuis"], fmt)).total_seconds()
-            if age >= SENSORIUM_NOTIF_APRES_S and (not e.get("nid") or e.get("valeur") != val):
+            delai = 0 if wk.startswith(_SENSORIUM_IMMEDIAT) else SENSORIUM_NOTIF_APRES_S
+            if age >= delai and (not e.get("nid") or e.get("valeur") != val):
                 niveau = "critique" if wk.startswith(_SENSORIUM_CRITIQUES) else "avoir"
                 causes = []
                 try:
@@ -78909,6 +78914,35 @@ def sensorium_reparer(wkey: str, geste: str, acteur: str = "") -> dict:
         pass
     res = catalogue_executer(g["nom"], g["params"])
     return {"ok": bool(res.get("ok")), "geste": g["libelle"], "resultat": {k: (str(v)[:1500] if isinstance(v, str) else v) for k, v in (res or {}).items()}}
+
+
+def sensorium_historique(wkey: str) -> dict:
+    """L'histoire d'une mesure sur 30 jours, et sa disponibilité (part du temps hors alerte), calculée sur ses
+    passages en alerte et ses retours."""
+    wkey = str(wkey or "")[:200]
+    hist = _socket_request("GET_HISTORY:%s\n" % wkey) or []
+    actuelle = next((r for r in (world_model_from_socket() or []) if isinstance(r, dict) and str(r.get("wkey")) == wkey), None)
+    dispo = None
+    try:
+        fin = datetime.now()
+        debut = fin - timedelta(days=30)
+        ev = sorted([(datetime.fromisoformat(str(h["ts"])[:19]), h.get("severity")) for h in hist if h.get("ts")], key=lambda x: x[0])
+        if ev or actuelle:
+            # état avant le premier changement : l'inverse du premier état connu si c'est une alerte, sinon normal
+            etat = "info"
+            t = debut
+            en_alerte = 0.0
+            for quand, sev in ev:
+                quand = max(quand, debut)
+                if etat == "warning":
+                    en_alerte += (quand - t).total_seconds()
+                etat, t = (sev or "info"), quand
+            if (actuelle or {}).get("severity") == "warning" or etat == "warning":
+                en_alerte += (fin - t).total_seconds()
+            dispo = round(100.0 * (1 - en_alerte / (fin - debut).total_seconds()), 2)
+    except Exception as e:
+        logging.info("[SENSORIUM] disponibilité %s : %s", wkey, e)
+    return {"ok": True, "wkey": wkey, "actuelle": actuelle, "historique": hist[:300], "disponibilite_30j": dispo}
 
 
 def sensorium_etat() -> dict:
@@ -95398,6 +95432,8 @@ class CassandraHandler(BaseHTTPRequestHandler):
                     if not data.get("confirme"):
                         self.send_json({"ok": False, "erreur": "confirmation requise"}); return
                     self.send_json(sensorium_reparer(str(data.get("wkey") or ""), str(data.get("geste") or ""), get_session_user(_ssid))); return
+                if path == "/api/sensorium/historique":
+                    self.send_json(sensorium_historique(str(data.get("wkey") or ""))); return
                 if path == "/api/sensorium/flotte":
                     threading.Thread(target=flotte_sensorium_passe, daemon=True, name="flotte-sensorium-demande").start()
                     self.send_json({"ok": True, "lance": True}); return
@@ -115269,10 +115305,20 @@ function _snLigne(r, avecFam){
   const acc = w ? `<button class="mx-btn" onclick='snAccepter(${JSON.stringify(wk)})' title="Je sais, c'est normal : se taire jusqu'à l'échéance (revient si ça empire)">Accepter…</button>`
            : (a ? `<button class="mx-btn" onclick='snRetirerAcquit(${JSON.stringify(wk)})'>Ne plus accepter</button>` : '');
   return `<div class="mx-row"><span class="mx-dot ${w?'warn':(a?'':'ok')}"></span>
-    <div class="mx-rt"><b>${_snE(_snNom(wk))}${avecFam?` <span class="mx-pill">${_snE(wk.split('.')[0])}</span>`:''}${a?` <span class="mx-pill">acceptée</span>`:''}</b><span>${_snE(r.value)}</span>
+    <div class="mx-rt"><b style="cursor:pointer" title="Son histoire sur 30 jours" onclick='snHisto(${JSON.stringify(wk)})'>${_snE(_snNom(wk))}${avecFam?` <span class="mx-pill">${_snE(wk.split('.')[0])}</span>`:''}${a?` <span class="mx-pill">acceptée</span>`:''}</b><span>${_snE(r.value)}</span>
     ${a?`<span>acceptée : ${_snE(a.raison||'sans raison')}${a.jusqua?' · jusqu\'au '+_snE(String(a.jusqua).slice(0,10)):''}</span>`:''}
     ${causes.length?`<span style="color:var(--warn)">cause probable : ${_snE(causes[0])}${causes.length>1?` <span class="mx-st">(+${causes.length-1})</span>`:''}</span>`:''}</div>
     <div class="mx-gest"><span class="mx-st" title="${_snE(r.observed_at||'')}">il y a ${_snAge(r.observed_at)}</span>${gestes}${acc}</div></div>`;
+}
+async function snHisto(wk){
+  const page = document.getElementById('sn-page'); if(!page) return;
+  let r; try{ r = await apiPost('/api/sensorium/historique', {wkey:wk}); }catch(e){ r = {ok:false}; }
+  if(!r || !r.ok){ return; }
+  const h = r.historique||[], a = r.actuelle||{};
+  page.innerHTML = `<section class="mx-sec"><div class="mx-eyebrow"><a style="cursor:pointer" onclick="snRendre()">← retour</a> · ${_snE(wk)}</div>
+    <div class="mx-verdict"><span class="mx-vmark ${a.severity==='warning'?'':'stable'}"></span><div><p class="mx-vtitle">${_snE(a.value||'—')}</p>
+    <p class="mx-vsub">${r.disponibilite_30j!=null?'Disponibilité sur 30 jours : <b>'+_snE(r.disponibilite_30j)+' %</b> · ':''}${h.length} changement${h.length>1?'s':''} en 30 jours</p></div></div></section>
+    <section class="mx-sec"><div class="mx-eyebrow">Son histoire</div><div class="mx-rows">${h.map(c=>`<div class="mx-row"><span class="mx-dot ${c.severity==='warning'?'warn':'ok'}"></span><div class="mx-rt"><b>${_snE({added:'apparue',removed:'disparue',modified:'a changé'}[c.change_type]||c.change_type)}</b><span>${_snE(c.new_value||c.old_value||'')}</span>${c.old_value&&c.new_value?`<span class="mx-st">avant : ${_snE(c.old_value)}</span>`:''}</div><span class="mx-st">${_snE(String(c.ts||'').slice(0,16).replace('T',' '))}</span></div>`).join('') || '<div class="mx-vsub">Rien n\'a changé en 30 jours.</div>'}</div></section>`;
 }
 async function snAccepter(wk){
   const raison = prompt("Pourquoi cette alerte est-elle normale ?\n(elle se taira, et reviendra si son chiffre empire)", "");
