@@ -1771,7 +1771,15 @@ def collect_web_sites():
     # LE SITE RÉPOND-IL ? Le statut était « active » par principe, jamais mesuré. Sondé ici, en parallèle.
     if sites:
         with ThreadPoolExecutor(max_workers=8) as ex:
-            for site, code in zip(sites, ex.map(lambda s: _sonde_http(s["domain"], s.get("listen_ip") or ""), sites)):
+            def _sonde_confirmee(st):
+                # Un 502/503 ou un silence peut être l'instant d'un redémarrage (un déploiement redémarre
+                # l'application ET le collecteur) : revérifié 3 s plus tard avant d'être une alerte (08-10).
+                c = _sonde_http(st["domain"], st.get("listen_ip") or "")
+                if c in ("000", "502", "503", "504"):
+                    time.sleep(3)
+                    c = _sonde_http(st["domain"], st.get("listen_ip") or "")
+                return c
+            for site, code in zip(sites, ex.map(_sonde_confirmee, sites)):
                 site["http_code"] = code
                 # `status` reste « active » (le site est déclaré) : l'écran Sites et le tableau de bord le lisent
                 # ainsi. La MESURE va dans sa propre colonne.
@@ -3944,6 +3952,10 @@ def collect_controles() -> list:
     if url:
         corps = run_cmd(["curl", "-skL", "--max-time", "8", url + "/"], timeout=12) or ""
         ok = "login-username" in corps or 'id="login' in corps
+        if not ok:
+            time.sleep(3)      # même prudence qu'en sondant les sites : l'instant d'un redémarrage n'est pas une panne
+            corps = run_cmd(["curl", "-skL", "--max-time", "8", url + "/"], timeout=12) or ""
+            ok = "login-username" in corps or 'id="login' in corps
         out.append({"nom": "cassandra.connexion", "ok": 1 if ok else 0,
                     "valeur": ("la page de connexion s'affiche (%s)" % url) if ok else ("page de connexion introuvable sur %s" % url),
                     "last_check": now})

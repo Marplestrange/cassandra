@@ -78423,8 +78423,8 @@ def _flotte_sonde_pass(live: dict, etats: dict) -> list:
 # ses anciens relevés restent avec leur âge (la perception dira « je ne sais plus »).
 FLOTTE_SENSORIUM_PERIODE = 900
 _FLOTTE_SONDE_LINUX = r"""
-df -P -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null | awk 'NR>1 && $6 !~ /^\/(snap|run|boot\/efi)/ {print "DISK " $6 " " $5 " " int($4/1048576)}'
-awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{if(t) printf "RAM %.0f\n", (t-a)/t*100}' /proc/meminfo 2>/dev/null
+df -P -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null | awk 'NR>1 && $6 !~ /^\/(snap|run|tmp|dev|boot\/efi)/ {print "DISK " $6 " " $5 " " int($4/1048576)}'
+awk '/^MemTotal/{t=$2} /^MemAvailable/{a=$2} /^MemFree/{f=$2} /^Buffers/{b=$2} /^Cached/{c=$2} END{if(!a) a=f+b+c; if(t) printf "RAM %.0f\n", (t-a)/t*100}' /proc/meminfo 2>/dev/null
 echo "UP $(cut -d. -f1 /proc/uptime 2>/dev/null)"
 echo "LOAD $(cut -d' ' -f1 /proc/loadavg 2>/dev/null) $(nproc 2>/dev/null)"
 [ -f /var/run/reboot-required ] && echo "REBOOT oui" || echo "REBOOT non"
@@ -78444,7 +78444,7 @@ $os=Get-CimInstance Win32_OperatingSystem
 $r = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
 'REBOOT {0}' -f $(if($r){'oui'}else{'non'})
 $s = Get-CimInstance Win32_Service -Filter "StartMode='Auto' AND State<>'Running'" | Where-Object { $_.Name -notmatch 'gupdate|edgeupdate|sppsvc|RemoteRegistry|MapsBroker|TrustedInstaller|GoogleUpdater|BITS|wuauserv|CDPSvc|tiledatamodelsvc|ShellHWDetection|WbioSrvc|dmwappushservice|sedsvc|uhssvc|DoSvc|AppXSvc|gpsvc|ClipSVC|InstallService|UsoSvc|WaaSMedicSvc' }
-'FAILED {0}' -f (($s | Select-Object -First 8 -ExpandProperty Name) -join ' ')
+'FAILED {0}' -f (($s | Select-Object -First 8 -ExpandProperty Name) -join '|')
 $m = Get-MpComputerStatus
 if($m){ 'DEFENDER {0} {1}' -f $m.RealTimeProtectionEnabled, $m.AntivirusSignatureAge }
 $av = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | Where-Object { $_.displayName -notmatch 'Windows Defender|Microsoft Defender' } | Select-Object -ExpandProperty displayName
@@ -78486,8 +78486,10 @@ def _flotte_sonde_lire_sortie(nom: str, sortie: str) -> list:
             elif k == "REBOOT" and len(p) >= 2:
                 out.append(("redemarrage_requis", p[1], "warning" if p[1] == "oui" else "info"))
             elif k == "FAILED":
-                noms = p[1:]
-                out.append(("services_en_echec", ("%d : %s" % (len(noms), " ".join(noms))) if noms else "0", "warning" if noms else "info"))
+                reste = l.strip()[6:].strip()
+                # Windows sépare par « | » (des noms de service contiennent des espaces), Linux par des espaces
+                noms = [x.strip() for x in (reste.split("|") if "|" in reste else reste.split()) if x.strip()]
+                out.append(("services_en_echec", ("%d : %s" % (len(noms), ", ".join(noms))) if noms else "0", "warning" if noms else "info"))
             elif k == "OS" and len(p) >= 2:
                 out.append(("os", " ".join(p[1:])[:80], "info"))
             elif k == "RAID" and len(p) >= 2:
