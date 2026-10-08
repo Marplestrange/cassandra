@@ -96054,16 +96054,19 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   --dgr-08:rgba(165,21,57,.075);
 }
 
-/* Thème sombre conservé : la refonte doit pouvoir se défaire. */
+/* Thème sombre conservé : la refonte doit pouvoir se défaire.
+   GRIS DOUX (07-10, « l'anthracite est trop agressif, il faut uniformiser ») : le noir bleuté et le vert néon
+   cèdent à un gris ardoise (#1c2128 au fond, #2d333b pour les cartes) et à des textes gris clair — moins de
+   contraste brut, la même hiérarchie. Les zones de lecture prennent la couleur des cartes : plus d'îlot. */
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #07080d; --bg-grad-1:#0a0b12; --bg-grad-2:#0d0a14; --bg-grad-3:#080f0e;
-  --surface: rgba(18,20,30,.72); --surface-2: rgba(255,255,255,.035);
-  --surface-solid:#12141e;
-  --line: rgba(0,200,140,.10); --line-strong: rgba(0,200,140,.20);
-  --txt-strong:#e8e8f0; --txt:#dde0ea; --txt-soft:#b9b9c8; --txt-muted:#8a8a9a;
-  --txt-faint:#6d6d81; --txt-ghost:#616175; --on-accent:#07080d;
-  --accent:#00ffcc; --accent-soft:#5affc8; --accent-deep:#00c896; --accent2:#7c5cfc;
+  --bg: #1c2128; --bg-grad-1:#1c2128; --bg-grad-2:#1f232b; --bg-grad-3:#1b2026;
+  --surface: rgba(45,51,59,.86); --surface-2: rgba(255,255,255,.04);
+  --surface-solid:#2d333b;
+  --line: rgba(173,186,199,.12); --line-strong: rgba(173,186,199,.22);
+  --txt-strong:#dfe6ee; --txt:#c9d1d9; --txt-soft:#adbac7; --txt-muted:#8b949e;
+  --txt-faint:#768390; --txt-ghost:#636e7b; --on-accent:#1c2128;
+  --accent:#3ddbb0; --accent-soft:#7ee8cb; --accent-deep:#22b892; --accent2:#8b7cf6;
   --ok:#27c168; --warn:#e8c660; --danger:#ff4757; --danger-soft:#ff6b5e;
   --info:#8be9fd; --violet:#a78bfa; --rose:#ff79c6;
   --ov-02: rgba(255,255,255,.02); --ov-03: rgba(255,255,255,.03);
@@ -96071,13 +96074,13 @@ HTML_TEMPLATE = r'''<!DOCTYPE html>
   --ov-06: rgba(255,255,255,.06); --ov-07: rgba(255,255,255,.07);
   --ov-08: rgba(255,255,255,.08); --ov-10: rgba(255,255,255,.10);
   --ov-12: rgba(255,255,255,.12);
-  --acc-10: rgba(0,255,170,.10); --acc-15: rgba(0,255,170,.15);
-  --acc-20: rgba(0,255,170,.20); --acc-25: rgba(0,255,170,.25);
-  --acc-30: rgba(0,255,170,.30); --acc-40: rgba(0,255,170,.40);
-  --danger-ring: rgba(255,71,87,.3); --shadow: rgba(0,0,0,.3);
-  --voile: rgba(0,0,0,.62);
-  --shadow-glass: 0 8px 32px rgba(0,0,0,.45);
-  --shadow-lift: 0 12px 40px rgba(0,0,0,.55);
+  --acc-10: rgba(61,219,176,.10); --acc-15: rgba(61,219,176,.15);
+  --acc-20: rgba(61,219,176,.20); --acc-25: rgba(61,219,176,.25);
+  --acc-30: rgba(61,219,176,.30); --acc-40: rgba(61,219,176,.40);
+  --danger-ring: rgba(255,71,87,.3); --shadow: rgba(0,0,0,.25);
+  --voile: rgba(10,12,16,.55);
+  --shadow-glass: 0 6px 24px rgba(0,0,0,.28);
+  --shadow-lift: 0 10px 32px rgba(0,0,0,.36);
 }
 
 /* ── Verre dépoli : la surface de base de toute l'interface ────────────── */
@@ -97243,7 +97246,7 @@ body{font-family:'Inter',sans-serif;color:var(--txt);height:100vh;overflow:hidde
    lire. Conservée pour le thème sombre, où elle a un sens. */
 #particles-canvas{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;
   z-index:0;opacity:0;display:none}
-:root[data-theme="dark"] #particles-canvas{display:block;opacity:.18}
+:root[data-theme="dark"] #particles-canvas{display:block;opacity:.08}
 /* Server info block inside health card */
 .sinfo-grid{display:grid;grid-template-columns:1fr 1fr;gap:2px 8px;margin-top:8px;padding-top:8px;border-top:1px solid var(--ov-05)}
 .sinfo-row{display:flex;flex-direction:column;gap:1px;padding:3px 0}
@@ -99553,12 +99556,14 @@ select.cv-mod{font-size:11px!important;color:var(--txt-soft)!important;
 /* LE CONFORT DE LECTURE EN SOMBRE (07-10) : là où l'on LIT — le courriel ouvert, le document de l'Atelier, la note —
    un anthracite plein (#1e1f24) et un blanc cassé (#e4e4e7), au lieu du noir et du blanc purs qui fatiguent l'œil
    sur la durée. Plein, pas de verre : la pluie du fond ne défile plus derrière le texte. */
-:root[data-theme="dark"]{--lecture-fond:#1e1f24;--lecture-txt:#e4e4e7}
+:root[data-theme="dark"]{--lecture-fond:var(--surface-solid);--lecture-txt:var(--txt)}
 :root[data-theme="dark"] #bu-mail-lecture,:root[data-theme="dark"] .card:has(#at-ed),:root[data-theme="dark"] .card:has(.nx-papier){
   background:var(--lecture-fond)!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
 :root[data-theme="dark"] .at-ed{background:var(--lecture-fond)}
 :root[data-theme="dark"] #mail-reader,:root[data-theme="dark"] .at-ed .ink-mde,:root[data-theme="dark"] .nx-papier{color:var(--lecture-txt)}
 :root[data-theme="dark"] #mail-html{background:var(--lecture-fond)!important}
+/* ink-mde a son propre noir (#121212) pour la barre d'outils et les blocs : il jurait sur le gris des cartes. */
+:root[data-theme="dark"] .ink-mde{--ink-block-background-color:rgba(255,255,255,.06);--ink-block-background-color-on-hover:rgba(255,255,255,.10)}
 /* 2 : la ligne de lecture se tient sous ~78 signes (le document de l'Atelier l'était déjà). */
 .nx-ink .cm-content{max-width:78ch}
 .rg-tete{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px 16px;margin-bottom:14px}
@@ -101446,7 +101451,7 @@ button.logo:focus-visible{outline:2px solid var(--accent);outline-offset:3px;
 /* En sombre, le panneau lui-même doit laisser passer la pluie : à 72 %
    d'opacité il la masquait avant même les bulles. On l'allège et on laisse le
    flou faire le travail. */
-:root[data-theme="dark"] .panel-center{background:rgba(18,20,30,.34);
+:root[data-theme="dark"] .panel-center{background:rgba(45,51,59,.34);
   border-color:rgba(255,255,255,.07)}
 /* Les bulles s'ajustent à leur contenu : une réponse de trois mots n'a pas à
    occuper toute la ligne. */
@@ -101735,13 +101740,13 @@ button.logo:focus-visible{outline:2px solid var(--accent);outline-offset:3px;
    on rend donc les deux bulles translucides, avec le flou qui dissout la pluie
    en halo sans gêner la lecture du texte. */
 :root[data-theme="dark"] .message.user .message-bubble{
-  background:linear-gradient(135deg,rgba(0,255,204,.30),rgba(0,200,150,.16));
-  border-color:rgba(0,255,204,.42);color:var(--txt-strong);
+  background:linear-gradient(135deg,rgba(61,219,176,.26),rgba(34,184,146,.14));
+  border-color:rgba(61,219,176,.38);color:var(--txt-strong);
   backdrop-filter:blur(14px) saturate(150%);-webkit-backdrop-filter:blur(14px) saturate(150%)}
 :root[data-theme="dark"] .message.user .message-bubble code{
   background:rgba(0,0,0,.28);border-color:rgba(0,255,204,.3);color:var(--accent)}
 :root[data-theme="dark"] .message.bot .message-bubble{
-  background:rgba(20,24,34,.52);border-color:rgba(255,255,255,.11)}
+  background:rgba(45,51,59,.62);border-color:rgba(255,255,255,.10)}
 :root[data-theme="dark"] .lab-body{backdrop-filter:blur(14px) saturate(150%);
   -webkit-backdrop-filter:blur(14px) saturate(150%)}
 .message.user .message-bubble code{background:rgba(255,255,255,.18);border-color:rgba(255,255,255,.3);
@@ -116061,9 +116066,9 @@ function mailWrapHtml(h){
     return '<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer">'+
         '<style>html{background:#fff}body{font:13px/1.6 system-ui,sans-serif;color:#111;background:#fff;margin:12px auto;padding:0 10px;max-width:78ch}'+
         'img{max-width:100%;height:auto}table{max-width:100%}a{color:#0a58ca}'+
-        // contrast(.765) : le blanc tombe sur #1e1e1e (l'anthracite du volet), le noir sur #e1e1e1 (blanc cassé).
-        (sombre?'html{filter:invert(1) contrast(.765) hue-rotate(180deg)}'+
-                'img,picture,video,svg,canvas,[style*="background-image"],[background]{filter:contrast(1.307) invert(1) hue-rotate(180deg)}':'')+
+        // contrast(.64) : le blanc tombe sur #2e2e2e (le gris des cartes), le noir sur #d1d1d1 ; images : l'inverse exact.
+        (sombre?'html{filter:invert(1) contrast(.64) hue-rotate(180deg)}'+
+                'img,picture,video,svg,canvas,[style*="background-image"],[background]{filter:contrast(1.5625) invert(1) hue-rotate(180deg)}':'')+
         '</style>'+(h||'');
 }
 function mailCouleursOrigine(){
