@@ -78537,6 +78537,7 @@ grep -h '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' | 
 [ -f /etc.defaults/VERSION ] && . /etc.defaults/VERSION 2>/dev/null && echo "OS DSM $productversion"
 grep -E '^md[0-9]+' -A1 /proc/mdstat 2>/dev/null | grep -o '\[[U_]*\]' | tr '\n' ' ' | sed 's/^/RAID /'; echo
 for f in /sys/class/thermal/thermal_zone*/temp; do [ -r "$f" ] && cat "$f"; done 2>/dev/null | sort -n | tail -1 | sed 's/^/TEMP /'
+[ -f "$HOME/.cassandra-temoin/battement" ] && echo "TEMOIN $(( $(date +%s) - $(cat $HOME/.cassandra-temoin/battement) )) $(cat $HOME/.cassandra-temoin/etat 2>/dev/null)"
 """
 _FLOTTE_SONDE_WINDOWS = r"""
 $ErrorActionPreference='SilentlyContinue'
@@ -78612,6 +78613,11 @@ def _flotte_sonde_lire_sortie(nom: str, sortie: str) -> list:
                 tiers = " ".join(p[1:])[:80]
                 out = [x for x in out if x[0] != "antivirus"]
                 out.append(("antivirus", "%s (Defender en retrait)" % tiers, "info"))
+            elif k == "TEMOIN" and len(p) >= 2 and p[1].lstrip("-").isdigit():
+                # le témoin extérieur : son dernier battement, et ce qu'il voit d'Orion
+                age = int(p[1]); vu = p[2] if len(p) > 2 else "?"
+                out.append(("temoin", ("actif, battement il y a %d s" % age if age < 300 else "MUET depuis %d min" % (age // 60))
+                            + (" · voit le serveur en panne" if vu == "alerte" else ""), "warning" if age >= 300 or vu == "alerte" else "info"))
             elif k == "WU" and len(p) >= 2 and p[1].lstrip("-").isdigit():
                 j = int(p[1])
                 out.append(("mises_a_jour", "dernière mise à jour il y a %d j" % j, "warning" if j > 45 else "info"))
@@ -78914,6 +78920,91 @@ def sensorium_reparer(wkey: str, geste: str, acteur: str = "") -> dict:
         pass
     res = catalogue_executer(g["nom"], g["params"])
     return {"ok": bool(res.get("ok")), "geste": g["libelle"], "resultat": {k: (str(v)[:1500] if isinstance(v, str) else v) for k, v in (res or {}).items()}}
+
+
+# ── LE TÉMOIN EXTÉRIEUR (08-10) ─────────────────────────────────────────────────────────────
+# Si Orion tombe, c'est Orion qui surveillait : personne ne sonne. Un témoin sur une autre machine de la flotte
+# (Linux ou NAS, sans sudo : un conteneur `curlimages/curl` redémarré tout seul) vérifie toutes les minutes
+# qu'Orion répond — par le réseau local ET comme le monde la voit. Dix minutes de silence des deux côtés :
+# il écrit lui-même sur Telegram ; Orion revenue, il RETIRE ce message. Dans l'autre sens, la sonde de flotte
+# relit son battement : un témoin qui se tait est une alerte.
+TEMOIN_IMAGE = "curlimages/curl:8.10.1"
+_TEMOIN_SCRIPT = r"""#!/bin/sh
+D=/temoin
+. "$D/config"
+etat=ok; depuis=0
+[ -f "$D/message" ] && etat=alerte
+while true; do
+  date +%s > "$D/battement"
+  if curl -sfk -o /dev/null --max-time 8 "$URL_LAN" || curl -sf -o /dev/null --max-time 12 "$URL_PUBLIC"; then ok=1; else ok=0; fi
+  maint=$(date +%s)
+  if [ "$ok" = 0 ]; then
+    [ "$depuis" = 0 ] && depuis=$maint
+    if [ "$etat" = ok ] && [ $((maint - depuis)) -ge 600 ]; then
+      mid=$(curl -s --max-time 15 "https://api.telegram.org/bot$TOKEN/sendMessage" -d chat_id="$CHAT" \
+            --data-urlencode text="🔴 $NOM ne répond plus depuis 10 minutes (vu par le témoin $TEMOIN). Ni $URL_LAN ni $URL_PUBLIC." \
+            | sed -n 's/.*"message_id":\([0-9]*\).*/\1/p')
+      [ -n "$mid" ] && echo "$mid" > "$D/message"
+      etat=alerte
+    fi
+  else
+    if [ "$etat" = alerte ] && [ -f "$D/message" ]; then
+      r=$(curl -s --max-time 15 "https://api.telegram.org/bot$TOKEN/deleteMessage" -d chat_id="$CHAT" -d message_id="$(cat "$D/message")")
+      echo "$r" | grep -q '"ok":true' || curl -s --max-time 15 "https://api.telegram.org/bot$TOKEN/editMessageText" -d chat_id="$CHAT" \
+           -d message_id="$(cat "$D/message")" --data-urlencode text="✅ $NOM répond de nouveau." >/dev/null
+      rm -f "$D/message"
+    fi
+    etat=ok; depuis=0
+  fi
+  echo "$etat $depuis" > "$D/etat"
+  sleep 60
+done
+"""
+
+
+def sensorium_temoin_installer(machine: str, compte: str) -> dict:
+    """Installe (ou réinstalle) le témoin sur une machine Linux de la flotte. Le jeton du robot Telegram passe du
+    coffre de CE compte à la machine témoin, dans un fichier lisible par son seul propriétaire."""
+    import base64 as _b64
+    srv = next((m for m in (_ms_load() or []) if str(m.get("name", "")).lower() == str(machine or "").lower()), None)
+    if not srv or srv.get("type") != "ssh":
+        return {"ok": False, "erreur": "machine inconnue de la flotte (ou sans accès SSH)"}
+    if str(srv.get("os", "")).lower() == "windows":
+        return {"ok": False, "erreur": "le témoin s'installe sur une machine Linux ou un NAS"}
+    jeton = _tg_jeton(compte)
+    chat = (tg_etat(compte) or {}).get("destinataire") or ""
+    if not jeton or not chat:
+        return {"ok": False, "erreur": "Telegram n'est pas configuré pour ce compte (robot et destinataire)"}
+    cfg = get_cassandra_config() or {}
+    url_pub = str(cfg.get("app_public_url") or cfg.get("base_url") or "").rstrip("/") + "/"
+    lan = ""
+    for r in (world_model_from_socket("interface.") or []):
+        if "route par défaut" in str(r.get("value") or ""):
+            m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", str(r.get("value")))
+            lan = m.group(1) if m else ""
+    url_lan = ("http://%s:%d/" % (lan, PORT)) if lan else url_pub
+    nom = (os.uname().nodename or "le serveur")
+    config = "TOKEN='%s'\nCHAT='%s'\nURL_PUBLIC='%s'\nURL_LAN='%s'\nNOM='%s'\nTEMOIN='%s'\n" % (
+        jeton.replace("'", ""), str(chat).replace("'", ""), url_pub.replace("'", ""), url_lan.replace("'", ""),
+        nom.replace("'", ""), str(srv.get("name")).replace("'", ""))
+    b_cfg = _b64.b64encode(config.encode()).decode()
+    b_scr = _b64.b64encode(_TEMOIN_SCRIPT.encode()).decode()
+    cmd = ("D=\"$HOME/.cassandra-temoin\"; mkdir -p \"$D\" && chmod 700 \"$D\" && "
+           "echo %s | base64 -d > \"$D/config\" && chmod 600 \"$D/config\" && "
+           "echo %s | base64 -d > \"$D/temoin.sh\" && chmod 700 \"$D/temoin.sh\" && "
+           "DK=$(command -v docker || echo /usr/local/bin/docker) && "
+           "($DK rm -f cassandra-temoin >/dev/null 2>&1; true) && "
+           "$DK run -d --name cassandra-temoin --restart unless-stopped --network host --user 0 "
+           "-v \"$D:/temoin\" --entrypoint sh %s /temoin/temoin.sh && echo TEMOIN_OK"
+           % (b_cfg, b_scr, TEMOIN_IMAGE))
+    out, err, rc = _ms_ssh_exec(srv, cmd, timeout=180)
+    ok = "TEMOIN_OK" in (out or "")
+    try:
+        log_admin_action("", "sensorium_temoin", "OK" if ok else "FAIL", "machine=%s par=%s" % (srv.get("name"), compte))
+    except Exception:
+        pass
+    return {"ok": ok, "machine": srv.get("name"), "url_lan": url_lan, "url_public": url_pub,
+            "detail": ((out or "") + (err or ""))[-400:] if not ok else "conteneur cassandra-temoin lancé"}
 
 
 def sensorium_historique(wkey: str) -> dict:
@@ -95432,6 +95523,8 @@ class CassandraHandler(BaseHTTPRequestHandler):
                     if not data.get("confirme"):
                         self.send_json({"ok": False, "erreur": "confirmation requise"}); return
                     self.send_json(sensorium_reparer(str(data.get("wkey") or ""), str(data.get("geste") or ""), get_session_user(_ssid))); return
+                if path == "/api/sensorium/temoin":
+                    self.send_json(sensorium_temoin_installer(str(data.get("machine") or "athena"), get_session_user(_ssid))); return
                 if path == "/api/sensorium/historique":
                     self.send_json(sensorium_historique(str(data.get("wkey") or ""))); return
                 if path == "/api/sensorium/flotte":
@@ -105877,6 +105970,7 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
         <button class="mx-scene" data-vue="changements" onclick="snVue('changements')">Ce qui a changé</button>
         <button class="mx-scene" data-vue="capteurs" onclick="snVue('capteurs')">Les capteurs</button>
         <button class="mx-scene" onclick="snRelever()">Relever la flotte</button>
+        <button class="mx-scene" onclick="snTemoin()" title="Une autre machine surveille ce serveur et vous écrit s'il tombe">Témoin extérieur</button>
       </nav>
     </header>
     <div class="mx-body">
@@ -115309,6 +115403,12 @@ function _snLigne(r, avecFam){
     ${a?`<span>acceptée : ${_snE(a.raison||'sans raison')}${a.jusqua?' · jusqu\'au '+_snE(String(a.jusqua).slice(0,10)):''}</span>`:''}
     ${causes.length?`<span style="color:var(--warn)">cause probable : ${_snE(causes[0])}${causes.length>1?` <span class="mx-st">(+${causes.length-1})</span>`:''}</span>`:''}</div>
     <div class="mx-gest"><span class="mx-st" title="${_snE(r.observed_at||'')}">il y a ${_snAge(r.observed_at)}</span>${gestes}${acc}</div></div>`;
+}
+async function snTemoin(){
+  const m = prompt("Sur quelle machine Linux de la flotte installer le témoin ?\n\nIl vérifie chaque minute que ce serveur répond, et vous écrit sur Telegram s'il se tait 10 minutes (puis retire le message à son retour). Le jeton du robot Telegram y sera copié, lisible par son seul propriétaire.", "athena");
+  if(!m) return;
+  const r = await apiPost('/api/sensorium/temoin', {machine:m});
+  alert(r && r.ok ? ('Témoin installé sur '+r.machine+'.\nIl surveille '+r.url_lan+' et '+r.url_public+'.') : ('Échec : '+((r&&(r.erreur||r.detail))||'?')));
 }
 async function snHisto(wk){
   const page = document.getElementById('sn-page'); if(!page) return;
