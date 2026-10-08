@@ -17064,7 +17064,7 @@ MEMOIRE_DOUTE_ECHEANCE_J = 7
 MEMOIRE_DOUTES_PAR_TOUR = 2
 _MEMOIRE_VETO_SYNC = [False]      # le banc examine le veto dans le fil appelant
 _MEMOIRE_DOUTE_REPONSE_RE = re.compile(
-    r"(?i)\bdoute\s*#?\s*(\d+)\s*(?::|=|-|→)?\s*(active|actuel|actuelle|nouvelle|faux|fausse|plus[ _]tard|vrai|p[ée]rim[ée]|annule|annul[ée]|ecrire|écrire)\b")
+    r"(?i)\bdoute\s*#?\s*(\d+)\s*(?::|=|-|→)?\s*(active|actuel|actuelle|nouvelle|faux|fausse|plus[ _]tard|vrai|p[ée]rim[ée]|annule|annul[ée]|ecrire|écrire|oui|non)\b")
 
 # Les gardes mécaniques, sous la milliseconde : elles ne se négocient pas.
 _MEMOIRE_SECRET_FORMATS_RE = re.compile(
@@ -17847,7 +17847,7 @@ def _memoire_domaine_etranger(compte: str, texte: str):
 def _memoire_piece_inserer(conn, piece: dict, proprietaire: str):
     if not piece:
         return None
-    contenu = str(piece.get("contenu") or "")[:1000]
+    contenu = str(piece.get("contenu") or "")[:2000]
     emp = piece.get("empreinte") or hashlib.sha256(contenu.encode("utf-8", "replace")).hexdigest()[:24]
     cur = conn.execute(
         "INSERT INTO memoire_pieces (type, proprietaire, source_table, source_id, contenu, empreinte, date_piece) "
@@ -17858,6 +17858,83 @@ def _memoire_piece_inserer(conn, piece: dict, proprietaire: str):
 
 
 MEMOIRE_NATURES = ("etat-courant", "constat")
+
+
+_MEMOIRE_ENTITES = {"&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#x27;": "'", "&#39;": "'"}
+
+
+def _memoire_desechapper(t: str) -> str:
+    """Défait exactement ce que html.escape produit — rien d'autre (un « &nbsp; » écrit exprès reste)."""
+    t = str(t or "")
+    if "&" not in t:
+        return t
+    return re.sub(r"&(?:amp|lt|gt|quot|#x27|#39);", lambda m: _MEMOIRE_ENTITES[m.group(0)], t)
+
+
+# Le conseil universel déguisé en leçon : il commence par un verbe d'examen et ne parle que de journaux ou d'état.
+_MEMOIRE_CREUX_RE = re.compile(
+    r"(?is)^\s*(examiner|surveiller|consulter|v[ée]rifier|analyser|regarder|inspecter)\b"
+    r"(?=.{0,200}\b(journaux|logs?|journalctl)\b)(?=.{0,240}\b(avant|identifier|comprendre|la cause)\b)")
+
+
+# LE MÊME FAIT SOUS UNE AUTRE CLÉ (08-10) : la porte ne dédoublonnait que par clé exacte, et chaque écrivain
+# invente sa clé — « ragnar-ssh-windows-sain » puis « ragnar-ssh-config-saine », dix fiches pour un seul
+# config.json vide. Deux valeurs de même catégorie, même propriétaire, qui partagent l'essentiel de leurs mots
+# (ou une bonne part ET un identifiant : chemin, IP, port, nom d'unité) parlent de la même chose : la nouvelle
+# devient une VERSION de l'ancienne (remplace / conteste, selon la provenance), jamais une fiche de plus.
+# Seuils calibrés sur la mémoire réelle d'Orion (110 fiches) : tous les doublons vus, aucun faux rapprochement.
+_MEMOIRE_PROCHE_SEUL = 0.65
+_MEMOIRE_PROCHE_AVEC_ID = 0.4
+_MEMOIRE_MOTS_VIDES = frozenset(("les des une est sur dans pour par pas que qui avec son ses aux ete cette sont plus "
+                                 "tout fait elle ils lui mais donc car comme sans entre depuis apres avant leur leurs "
+                                 "ont avoir etre fois").split())
+
+
+def _memoire_jetons(t: str) -> set:
+    t = unicodedata.normalize("NFKD", str(t or "").lower()).encode("ascii", "ignore").decode()
+    out = set()
+    for w in re.findall(r"[a-z0-9](?:[a-z0-9._/:-]*[a-z0-9])?", t):
+        if (len(w) < 4 and not w.isdigit()) or w in _MEMOIRE_MOTS_VIDES:
+            continue
+        out.add(w[:7] if w.isalpha() else w)
+    return out
+
+
+def _memoire_identifiant(t: str) -> bool:
+    """Un chemin, une IP, un port, un nom d'unité ou d'interface — pas un simple nombre."""
+    return bool(re.search(r"[./:_]", t)) or (bool(re.search(r"\d", t)) and bool(re.search(r"[a-z]", t)))
+
+
+def _memoire_nombres(t: str) -> tuple:
+    """Les nombres isolés, dans l'ordre : « port 110 » / « port 143 », « fil 0 tour 1 » / « fil 1 tour 0 »."""
+    return tuple(re.findall(r"(?<![\w.:/-])\d+(?![\w.:/-])", str(t or "")))
+
+
+def _memoire_proximite(a: set, b: set) -> float:
+    if min(len(a), len(b)) < 3:
+        return 0.0      # trop peu de mots pour dire que c'est le même fait
+    commun = a & b
+    j = len(commun) / min(len(a), len(b))
+    if j >= _MEMOIRE_PROCHE_SEUL or (j >= _MEMOIRE_PROCHE_AVEC_ID and any(_memoire_identifiant(t) for t in commun)):
+        return j
+    return 0.0
+
+
+def _memoire_proche(conn, prop: str, cat: str, cle: str, val: str):
+    """La clé active, même propriétaire et même catégorie, dont la valeur dit la même chose — ou None."""
+    moi = _memoire_jetons(cle.replace("-", " ") + " " + val)
+    mes_n = _memoire_nombres(cle.replace("-", " ") + " " + val)
+    meilleur, cle_m = 0.0, None
+    for r in conn.execute("SELECT cle, valeur FROM memoires WHERE proprietaire=? AND categorie=? AND statut='actif' "
+                          "AND cle<>? ORDER BY maj_le DESC LIMIT 500", (prop, cat, cle)).fetchall():
+        texte = str(r["cle"]).replace("-", " ") + " " + str(r["valeur"])
+        ses_n = _memoire_nombres(texte)
+        if mes_n and ses_n and mes_n != ses_n:
+            continue    # des nombres différents des deux côtés : deux faits, pas deux versions
+        s = _memoire_proximite(moi, _memoire_jetons(texte))
+        if s > meilleur:
+            meilleur, cle_m = s, r["cle"]
+    return cle_m
 
 
 def memoire_ecrire(categorie: str, cle: str, valeur: str, proprietaire: str = None, provenance: str = "infere",
@@ -17889,7 +17966,11 @@ def memoire_ecrire(categorie: str, cle: str, valeur: str, proprietaire: str = No
         cat = "lecon"
     prov = str(provenance or "infere").strip().lower()
     prov = prov if prov in MEMOIRE_PROVENANCES else MEMOIRE_PROVENANCE_ALIAS.get(prov, "infere")
-    val = " ".join(str(valeur or "").split()).strip()
+    # LES ENTITÉS HTML (07-10) : un écrivain qui lisait le corps nettoyé de la requête (html.escape) livrait
+    # « l&#x27;application » — et la mémoire le gardait tel quel. Défaites ici, à la porte unique, quel que
+    # soit le chemin d'arrivée.
+    val = _memoire_desechapper(" ".join(str(valeur or "").split()).strip())
+    cle = _memoire_desechapper(str(cle or ""))
     prop = str(proprietaire or memoire_proprietaire(cat))
     decl = str(declencheur or "")[:40]
 
@@ -17943,6 +18024,10 @@ def memoire_ecrire(categorie: str, cle: str, valeur: str, proprietaire: str = No
         return _refus("consigne")
     if _MEMOIRE_SPI_RE.search(val):
         return _refus("spi")
+    # UNE NOTE CREUSE (07-10) : « ... », ou le conseil qui vaut pour tout incident (« consulter les journaux du
+    # service avant d'intervenir ») — ni l'un ni l'autre n'apprend quoi que ce soit à qui le relit.
+    if len(re.sub(r"[\W_]+", "", val)) < 8 or _MEMOIRE_CREUX_RE.search(val):
+        return _refus("creux", val[:80])
     if prop.startswith("compte:"):
         etranger = _memoire_domaine_etranger(prop[7:], k + " " + val)
         if etranger:
@@ -17979,6 +18064,13 @@ def memoire_ecrire(categorie: str, cle: str, valeur: str, proprietaire: str = No
                 return _refus("quota", "déclencheur %s %d/h" % (decl, n_d))
         actif = conn.execute("SELECT id, valeur, provenance, categorie, version, cree_le, force FROM memoires "
                              "WHERE proprietaire=? AND cle=? AND statut='actif'", (prop, k)).fetchone()
+        rapproche = None
+        if not actif:
+            k_proche = _memoire_proche(conn, prop, cat, k, val)
+            if k_proche:
+                rapproche, k = k, k_proche
+                actif = conn.execute("SELECT id, valeur, provenance, categorie, version, cree_le, force FROM memoires "
+                                     "WHERE proprietaire=? AND cle=? AND statut='actif'", (prop, k)).fetchone()
         if actif and piece and piece.get("date") and str(piece["date"]) < str(actif["cree_le"]):
             conn.rollback()
             return _refus("piece_ancienne", "pièce %s antérieure à la version active %s" % (piece["date"], actif["cree_le"]))
@@ -18017,13 +18109,11 @@ def memoire_ecrire(categorie: str, cle: str, valeur: str, proprietaire: str = No
              art or None, art_emp or None))
         mid = cur.lastrowid
         _memoire_journal(action, mid, {"cle": k, "proprietaire": prop, "provenance": prov, "confiance": round(conf, 3),
-                                       "declencheur": decl, "remplace": remplace, "piece": piece_id}, acteur, conn)
+                                       "declencheur": decl, "remplace": remplace, "piece": piece_id,
+                                       **({"rapproche_de": rapproche} if rapproche else {})}, acteur, conn)
         if action == "conteste" and actif:
             # Le doute est un objet : la contradiction ne dort pas dans un statut, elle se pose.
-            memoire_douter("reconciliation",
-                           "« %s » : la version active (%s, conf %.2f) dit « %s » ; une nouvelle (%s, conf %.2f) dit « %s ». Laquelle est vraie ?"
-                           % (k, actif["provenance"], float(conn.execute("SELECT confiance FROM memoires WHERE id=?", (actif["id"],)).fetchone()[0] or 0),
-                              str(actif["valeur"])[:160], prov, conf, val[:160]),
+            memoire_douter("reconciliation", _memoire_question("reconciliation", val, ancienne=actif["valeur"]),
                            prop, memoire_id=mid, memoire_id_2=actif["id"], acteur=acteur, conn=conn)
         conn.commit()
         if action == "quarantaine":
@@ -18031,7 +18121,7 @@ def memoire_ecrire(categorie: str, cle: str, valeur: str, proprietaire: str = No
         if decl == "outil_remember":
             _memoire_tour_noter_ecrit(mid)   # la distillation du tour saura que l'outil a déjà écrit
         return {"ok": True, "id": mid, "action": action, "refus": None, "remplace": remplace, "conteste": statut == "conteste",
-                "quarantaine": statut == "quarantaine"}
+                "quarantaine": statut == "quarantaine", "cle": k, "rapproche_de": rapproche}
     except Exception as e:
         try:
             conn.rollback()
@@ -18283,6 +18373,26 @@ def _memoire_fraicheur(r) -> str:
     return "non daté"
 
 
+_MEMOIRE_ETAT_MACHINE_RE = re.compile(
+    r"(?i)(?:/(?:etc|opt|var|srv|usr)/|\.service\b|\b(?:127\.0\.0\.1|0\.0\.0\.0|localhost):\d+|\bport \d+|"
+    r"\b(?:tourne|écoute|ecoute|est vide|0 octet|n'est pas install\w*|n'existe (?:plus|pas)|est (?:actif|active|arrêté|arrete|stopped|failed)|"
+    r"hors ligne|en ligne)(?!\w))")
+MEMOIRE_ETAT_REVOIR_J = 15
+
+
+def _memoire_a_reverifier(r) -> bool:
+    """Un constat sur l'état d'une machine (fichier, service, port), vieux de quinze jours sans confirmation."""
+    try:
+        if ((r["nature"] if "nature" in r.keys() else "") or "") == "etat-courant":
+            return False
+        if r["categorie"] not in ("config", "architecture"):
+            return False
+        return bool(_MEMOIRE_ETAT_MACHINE_RE.search(str(r["valeur"] or ""))) and \
+            (_memoire_age(r["maj_le"]) or 0) > MEMOIRE_ETAT_REVOIR_J * 86400
+    except Exception:
+        return False
+
+
 def memoire_rappeler(question: str = "", portee: list = None, limite: int = 12, plafond: int = MEMOIRE_BLOC_MAX,
                      avec_doutes: bool = True) -> dict:
     """LE rappel, sous 50 ms visés : le noyau (épinglés, personne) d'abord, puis FTS5 sur
@@ -18370,11 +18480,14 @@ def memoire_rappeler(question: str = "", portee: list = None, limite: int = 12, 
         if out.get("episodes"):
             out["bloc"] = (out["episodes"] + ("\n" + out["bloc"] if out["bloc"] else "")).strip()
         # Le doute de l'agent sur lui-même, sur un triplet : inféré, sous 0,5, vieux de 30 jours, et cité.
+        # Et l'ÉTAT DE MACHINE noté une fois (08-10) : « config.json est vide » restait servi des semaines après la
+        # réparation, parce qu'un constat n'est jamais relu. Cité après quinze jours sans confirmation, on demande.
         for r in list(noyau) + [t[0] for t in trouves]:
             try:
-                if r["provenance"] == "infere" and float(r["confiance"] or 0) < 0.5 and (_memoire_age(r["cree_le"]) or 0) > 30 * 86400:
-                    memoire_douter("revalidation", "Je m'appuie sur [M:%d] « %s » (inféré, conf %.2f, jamais vérifié depuis %s) : « %s ». Toujours vrai ?"
-                                   % (r["id"], r["cle"], float(r["confiance"] or 0), _memoire_duree_txt(_memoire_age(r["cree_le"])), str(r["valeur"])[:160]),
+                if ((r["provenance"] == "infere" and float(r["confiance"] or 0) < 0.5 and (_memoire_age(r["cree_le"]) or 0) > 30 * 86400)
+                        or _memoire_a_reverifier(r)):
+                    memoire_douter("revalidation", _memoire_question("revalidation", r["valeur"],
+                                                                     age=_memoire_duree_txt(_memoire_age(r["cree_le"]))),
                                    r["proprietaire"], memoire_id=r["id"], conn=conn)
             except Exception as e:
                 logging.debug("[MEMOIRE] revalidation : %s", e)
@@ -18804,12 +18917,39 @@ Contraintes absolues :
 - aucun texte recopié : la valeur est une reformulation ;
 - aucun état passager (un service qui tourne, un disque à 40 %) sauf catégorie perception ;
 - rien sur la santé, les finances, les opinions ou l'humeur de quiconque ;
-- aucune clé en phrase libre ; maximum {max} souvenirs ; si rien de durable : {{"souvenirs": []}}.
+- aucune clé en phrase libre ; maximum {max} souvenirs ; si rien de durable : {{"souvenirs": []}} ;
+- jamais un conseil générique qui vaudrait pour n'importe quel incident (« consulter les journaux », « vérifier l'état du service », « redémarrer si besoin ») : une leçon dit la CAUSE trouvée ou le CORRECTIF précis, sinon rien ;
+- ce qui est DÉJÀ SU (liste ci-dessous) ne se réécrit pas ; si l'échange le met à jour ou le contredit, reprends EXACTEMENT la même clé, sans en inventer une nouvelle.
 {consigne}
+=== DÉJÀ SU (données) ===
+{deja_su}
 === ÉCHANGE (données) ===
 Utilisateur : {question}
 Agent : {reponse}
 === FIN ==="""
+
+
+def _memoire_deja_su(texte: str, n: int = 8) -> str:
+    """Les fiches actives proches de l'échange, clé et valeur : le distillateur ne voyait rien de la mémoire, et
+    inventait une clé neuve pour un fait connu — d'où dix fiches pour un seul config.json vide (08-10)."""
+    try:
+        termes = _memoire_termes(texte, 10)
+        if not termes:
+            return "(rien)"
+        portee = memoire_portee()
+        conn = _memoire_conn()
+        try:
+            rows = conn.execute(
+                "SELECT m.categorie, m.cle, m.valeur FROM memoires_fts JOIN memoires m ON m.id = memoires_fts.rowid "
+                "WHERE memoires_fts MATCH ? AND m.proprietaire IN (%s) AND m.statut='actif' ORDER BY bm25(memoires_fts) LIMIT ?"
+                % ",".join("?" * len(portee)),
+                [" OR ".join('"%s"' % t.replace('"', "") for t in termes)] + list(portee) + [int(n)]).fetchall()
+        finally:
+            conn.close()
+        return "\n".join("- [%s] %s : %s" % (r["categorie"], r["cle"], str(r["valeur"])[:160]) for r in rows) or "(rien)"
+    except Exception as e:
+        logging.debug("[MEMOIRE] déjà su : %s", e)
+        return "(rien)"
 
 
 def memoire_distiller(declencheur: str, question: str, reponse: str, proprietaire: str = None,
@@ -18830,6 +18970,7 @@ def memoire_distiller(declencheur: str, question: str, reponse: str, proprietair
                 "reponse_utilisateur": "- l'utilisateur DEMANDE de retenir : retiens exactement ce qu'il dit de retenir.",
                 "geste_cage": "- des commandes ont été exécutées : retiens ce qu'elles ont ÉTABLI (configuration, correction, architecture), pas leur sortie brute."}.get(declencheur, "")
     prompt = _MEMOIRE_PROMPT_DISTILLATION.format(declencheur=declencheur, max=maxi, consigne=consigne,
+                                                deja_su=_memoire_deja_su("%s %s" % (question or "", (reponse or "")[:1500])),
                                                 question=(question or "")[:1500], reponse=(reponse or "")[:3000])
     try:
         brut = _memoire_appel_modele(prompt)
@@ -18873,6 +19014,28 @@ def memoire_actes_depuis(ts_iso: str, acteur: str = None) -> int:
         return 0
 
 
+def memoire_piece_du_tour(question: str, depuis_ts: str = None, acteur: str = None, reponse: str = "") -> str:
+    """LA PIÈCE D'UN TOUR (08-10) : ce sur quoi un fait s'appuie, c'est la question ET ce qu'on a fait pour y
+    répondre. La pièce n'était que la question (« Redémarre sensorium »), et le veto mécanique, ne retrouvant
+    pas « cassandra-collector.service » dedans, doutait de faits que les commandes du tour venaient d'établir."""
+    morceaux = [str(question or "")[:600]]
+    if depuis_ts:
+        try:
+            conn = _memoire_conn()
+            try:
+                q = "SELECT commande FROM cage_journal WHERE ts >= ?" + (" AND acteur = ?" if acteur else "") + " ORDER BY id LIMIT 12"
+                cmds = [str(r[0] or "")[:160] for r in conn.execute(q, (depuis_ts, acteur) if acteur else (depuis_ts,)).fetchall()]
+            finally:
+                conn.close()
+            if cmds:
+                morceaux.append(("— commandes du tour : " + " ; ".join(cmds))[:900])
+        except Exception as e:
+            logging.debug("[MEMOIRE] pièce du tour : %s", e)
+    if reponse:
+        morceaux.append("— réponse : " + str(reponse)[:500])
+    return "\n".join(morceaux)
+
+
 def memoire_apres_echange(session_id: str, question: str, reponse: str, depuis_ts: str = None) -> None:
     """La fin d'un échange du chat : distiller SEULEMENT si un déclencheur a eu lieu. Le
     reste du temps, rien n'est extrait — c'est le remplacement de l'extraction à chaque
@@ -18897,7 +19060,7 @@ def memoire_apres_echange(session_id: str, question: str, reponse: str, depuis_t
             return
     piece = {"type": "message" if decl != "geste_cage" else "geste_cage",
              "source_table": "conversations" if decl != "geste_cage" else "cage_journal",
-             "contenu": (question or "")[:300], "date": _memoire_now()}
+             "contenu": memoire_piece_du_tour(question, depuis_ts, _owner or None, reponse), "date": _memoire_now()}
 
     def _do():
         try:
@@ -18910,13 +19073,80 @@ def memoire_apres_echange(session_id: str, question: str, reponse: str, depuis_t
 
 # ── Le doute comme objet ──────────────────────────────────────────────────────────
 _MEMOIRE_DOUTE_OPTIONS = {
-    "reconciliation": [("active", "garder la version active"), ("nouvelle", "prendre la nouvelle"),
-                       ("faux", "les deux sont fausses"), ("plus_tard", "plus tard")],
-    "revalidation": [("vrai", "toujours vrai"), ("perime", "c'est périmé"), ("faux", "c'est faux"), ("plus_tard", "plus tard")],
-    "veto": [("ecrire", "l'écrire quand même"), ("faux", "c'est faux"), ("plus_tard", "plus tard")],
-    "agent": [("vrai", "oui"), ("faux", "non"), ("plus_tard", "plus tard")],
-    "distillation": [("vrai", "oui"), ("faux", "non"), ("plus_tard", "plus tard")],
+    "reconciliation": [("active", "Garder l'ancienne"), ("nouvelle", "Prendre la nouvelle"),
+                       ("faux", "Les deux sont fausses"), ("plus_tard", "Plus tard")],
+    "revalidation": [("vrai", "Toujours vrai"), ("perime", "Plus d'actualité"), ("faux", "C'est faux"), ("plus_tard", "Plus tard")],
+    "veto": [("ecrire", "Oui, c'est juste"), ("faux", "Non, c'est faux"), ("plus_tard", "Plus tard")],
+    "agent": [("vrai", "Oui"), ("faux", "Non"), ("plus_tard", "Plus tard")],
+    "distillation": [("vrai", "Oui"), ("faux", "Non"), ("plus_tard", "Plus tard")],
 }
+
+
+# LES QUESTIONS EN FRANÇAIS (07-10, « le charabia qu'ils pondent ») : « Veto sur « nginx-configuration-fastpanel2 » :
+# « … » (aucun terme du fait n'est dans la pièce). L'écrire quand même ? » obligeait à savoir ce qu'est un veto, une
+# pièce, une clé. Une question se lit d'une traite : ce qu'elle voulait retenir, pourquoi elle hésite, ce qu'on attend.
+def _memoire_raison_humaine(raison: str) -> str:
+    r = str(raison or "").strip()
+    if r.startswith("aucun terme du fait"):
+        return "Mais je ne retrouve pas ça dans ce qui m'a amenée à le noter."
+    if r.startswith("veto d'Itare"):
+        motif = r.split(":", 1)[1].strip() if ":" in r else ""
+        return ("Mais Itare, en relisant, a un doute : %s" % motif.rstrip(".") + ".") if motif else "Mais Itare, en relisant, a un doute."
+    return ("Mais j'hésite : %s." % r.rstrip(".")) if r else "Mais je n'ai pas pu le confirmer."
+
+
+def _memoire_question(source: str, valeur: str, raison: str = "", ancienne: str = "", age: str = "") -> str:
+    v = " ".join(str(valeur or "").split())[:220]
+    if source == "veto":
+        return "Je voulais retenir : « %s ». %s Je le garde ?" % (v, _memoire_raison_humaine(raison))
+    if source == "reconciliation":
+        return ("J'ai deux versions de la même chose. Celle que je retiens : « %s ». Une nouvelle, moins sûre : « %s ». "
+                "Laquelle est vraie ?" % (" ".join(str(ancienne or "").split())[:200], v[:200]))
+    if source == "revalidation":
+        return "Je m'appuie sur ceci, que j'ai déduit%s sans jamais le vérifier : « %s ». C'est toujours vrai ?" % (
+            (" il y a " + age) if age else "", v[:200])
+    return v
+
+
+def memoire_doutes_reformuler() -> int:
+    """Une fois : les questions ouvertes écrites dans l'ancien jargon sont reformulées, avec les nouveaux boutons.
+    Rien d'autre ne change — ni le souvenir, ni l'échéance."""
+    if _MEMOIRE_DOUTES_REFORMULES[0]:
+        return 0
+    _MEMOIRE_DOUTES_REFORMULES[0] = True
+    n = 0
+    conn = None
+    try:
+        conn = _memoire_conn()
+        for d in conn.execute("SELECT * FROM memoire_doutes WHERE statut='ouvert'").fetchall():
+            q = str(d["question"] or "")
+            if not (q.startswith("Veto sur «") or q.startswith("Je m'appuie sur [M:") or (q.startswith("« ") and "la version active (" in q)):
+                continue
+            m1 = conn.execute("SELECT * FROM memoires WHERE id=?", (d["memoire_id"],)).fetchone() if d["memoire_id"] else None
+            m2 = conn.execute("SELECT * FROM memoires WHERE id=?", (d["memoire_id_2"],)).fetchone() if d["memoire_id_2"] else None
+            if not m1:
+                continue
+            raison = ""
+            if d["source"] == "veto":
+                mo = re.search(r"\) \((.*)\)\. L'écrire quand même \?$", q, re.S) or re.search(r"\(([^()]*)\)\. L'écrire", q)
+                raison = mo.group(1) if mo else ""
+            nq = _memoire_question(d["source"], m1["valeur"], raison=raison, ancienne=(m2["valeur"] if m2 else ""),
+                                   age=_memoire_duree_txt(_memoire_age(m1["cree_le"])) if d["source"] == "revalidation" else "")
+            opts = _MEMOIRE_DOUTE_OPTIONS.get(d["source"]) or _MEMOIRE_DOUTE_OPTIONS["agent"]
+            conn.execute("UPDATE memoire_doutes SET question=?, options=? WHERE id=?", (nq[:800], json.dumps(opts, ensure_ascii=False), d["id"]))
+            n += 1
+        conn.commit()
+    except Exception as e:
+        logging.info("[MEMOIRE] reformulation des questions : %s", e)
+    finally:
+        if conn is not None:
+            conn.close()
+    if n:
+        logging.info("[MEMOIRE] %d question(s) ouverte(s) reformulée(s) en clair", n)
+    return n
+
+
+_MEMOIRE_DOUTES_REFORMULES = [False]
 
 
 def memoire_douter(source: str, question: str, proprietaire: str, memoire_id=None, memoire_id_2=None,
@@ -18972,6 +19202,7 @@ def _memoire_doute_dict(r) -> dict:
 
 
 def memoire_doutes_lister(portee: list = None, statut: str = "ouvert", limite: int = 50) -> list:
+    memoire_doutes_reformuler()
     portee = portee or memoire_portee()
     conn = _memoire_conn()
     try:
@@ -18990,6 +19221,7 @@ def memoire_doutes_lister(portee: list = None, statut: str = "ouvert", limite: i
 
 
 def memoire_doutes_a_poser(portee: list = None, n: int = MEMOIRE_DOUTES_PAR_TOUR) -> list:
+    memoire_doutes_reformuler()
     """Les doutes à poser dans ce tour : au plus deux, jamais deux fois le même jour, jamais plus
     de trois fois ; le fait de les poser se note (dernier_pose, nb_poses)."""
     portee = portee or memoire_portee()
@@ -19054,6 +19286,9 @@ def memoire_doute_resoudre(did: int, choix: str, note: str = "", acteur: str = N
             conn.commit()
             return {"ok": True, "id": d["id"], "statut": "ouvert", "differe": True}
         opts = {o[0] for o in (json.loads(d["options"] or "[]") or [])}
+        # « oui » / « non » : la réponse naturelle, traduite selon la question posée.
+        if choix in ("oui", "non"):
+            choix = "faux" if choix == "non" else ("ecrire" if "ecrire" in opts else ("vrai" if "vrai" in opts else choix))
         if choix == "annule":
             pass
         elif choix not in opts:
@@ -19076,6 +19311,9 @@ def memoire_doute_resoudre(did: int, choix: str, note: str = "", acteur: str = N
                 _memoire_journal("revalide", m2["id"], {"doute": d["id"], "note": note[:200]}, acteur, conn)
         elif choix == "vrai":
             if m1:
+                # « Toujours vrai » rafraîchit la date et la confiance : sans cela, la même question revenait au
+                # rappel suivant, puisque rien n'avait changé dans ce qui l'avait fait poser (08-10).
+                conn.execute("UPDATE memoires SET maj_le=?, confiance=MAX(COALESCE(confiance,0), 0.6) WHERE id=?", (now, m1["id"]))
                 _memoire_journal("revalide", m1["id"], {"doute": d["id"], "note": note[:200]}, acteur, conn)
         conn.execute("UPDATE memoire_doutes SET statut=?, resolution=?, resolu_le=?, resolu_par=? WHERE id=?",
                      ("annule" if choix == "annule" else "resolu", (choix + (" · " + note[:200] if note else "")), now, acteur, d["id"]))
@@ -19150,10 +19388,15 @@ def memoire_veto_examiner(mid: int) -> dict:
         conn.close()
     raison = ""
     contenu = str(piece["contenu"] or "") if piece else ""
+    # LE GARDE MÉCANIQUE N'EST PLUS UN JUGE (08-10) : « aucun terme du fait dans la pièce » ouvrait un doute à lui
+    # seul, et il comparait mot pour mot, accents compris, à une pièce qui n'était que la question — « Redémarre
+    # sensorium » contre « cassandra-collector.service ». Il compare désormais sans accents ni flexions, et un
+    # écart n'est qu'un SIGNAL transmis à Itare ; il ne décide seul que lorsqu'Itare n'est pas là pour relire.
+    signal = ""
     if len(contenu) >= 40:
-        termes = [t for t in re.findall(r"[a-zàâäéèêëïîôöùûüç0-9]{5,}", str(m["valeur"]).lower()) if t not in _MEMOIRE_STOP]
-        if termes and not any(t in contenu.lower() for t in termes):
-            raison = "aucun terme du fait n'est dans la pièce"
+        termes = _memoire_jetons(m["valeur"])
+        if termes and not (termes & _memoire_jetons(contenu)):
+            signal = "aucun terme du fait n'est dans la pièce"
     verdict_itare = None
     sans_verdict = None
     if not raison:
@@ -19165,7 +19408,8 @@ def memoire_veto_examiner(mid: int) -> dict:
             try:
                 brut = _itare_agent_text([{"role": "user", "content": _MEMOIRE_PROMPT_VETO.format(
                     categorie=m["categorie"], provenance=m["provenance"], confiance=m["confiance"], cle=m["cle"],
-                    valeur=str(m["valeur"])[:600], piece=(contenu[:600] or "aucune"),
+                    valeur=str(m["valeur"])[:600], piece=(contenu[:1500] or "aucune") + (
+                        "\n(Signal du garde mécanique : %s. Ce n'est qu'un indice — juge sur le fond.)" % signal if signal else ""),
                     active=("« %s » (%s, conf %s)" % (str(actif["valeur"])[:300], actif["provenance"], actif["confiance"])) if actif else "aucune")}],
                     system="Tu réponds en JSON strict, une ligne.", max_tokens=300, allow_reasoning=False, timeout=60)
                 obj = _evo_json_extract(brut or "") or {}
@@ -19181,12 +19425,14 @@ def memoire_veto_examiner(mid: int) -> dict:
                     sans_verdict = (brut or "")[:200]
             except Exception as e:
                 logging.info("[MEMOIRE] veto : Itare injoignable (%s), gardes mécaniques seules", str(e)[:80])
+    if verdict_itare is None and signal:
+        raison = signal
     if raison:
         conn = _memoire_conn()
         try:
             conn.execute("UPDATE memoires SET statut='conteste', maj_le=? WHERE id=? AND statut='quarantaine'", (_memoire_now(), m["id"]))
             _memoire_journal("veto", m["id"], {"raison": raison, "cle": m["cle"]}, "itare" if verdict_itare is False else "garde", conn)
-            memoire_douter("veto", "Veto sur « %s » : « %s » (%s). L'écrire quand même ?" % (m["cle"], str(m["valeur"])[:200], raison),
+            memoire_douter("veto", _memoire_question("veto", m["valeur"], raison=raison),
                            m["proprietaire"], memoire_id=m["id"], acteur="itare" if verdict_itare is False else "garde", conn=conn)
             conn.commit()
         finally:
@@ -20356,11 +20602,9 @@ def consult_second_agent(task: str, allow_bash=None) -> dict:
         rv = _itare_self_review(final, facts, task)
         if rv and rv != final:
             final, reviewed = rv, True
-    try:
-        if final:
-            itare_remember(task[:80], final[:400], "tâche")
-    except Exception:
-        pass
+    # LE RÉSULTAT D'UNE TÂCHE N'EST PAS UN SOUVENIR (07-10) : il était rangé sous le texte de la tâche comme clé
+    # (« PROJET : Salvation — Apogée [actif · Vierge…] ») et la garde le refusait à chaque fois — seize refus par
+    # semaine au journal, sans rien d'appris. Ce qu'une tâche établit de durable passe par la distillation du tour.
     return {"ok": True, "result": final or (transcript[-1] if transcript else ""),
             "commands": ran, "local": local, "bash": bash_ok,
             "grounded": bool(grounding), "reviewed": reviewed}
@@ -64763,7 +65007,8 @@ def _remember_impl(args: dict) -> tuple:
     # souvenir de l'outil portait « aucune : dette de preuve ».
     piece = None
     if tour.get("question"):
-        piece = {"type": "message", "source_table": "conversations", "contenu": str(tour["question"])[:300],
+        piece = {"type": "message", "source_table": "conversations",
+                 "contenu": memoire_piece_du_tour(tour["question"], tour.get("debut"), get_current_user() or None),
                  "date": tour.get("debut") or _memoire_now()}
     # « OBSERVE » SE PROUVE : aucun geste de cage depuis le début du tour, donc rien n'a été mesuré — ce que
     # l'outil retient, c'est ce qu'on lui a DIT. Le modèle écrivait « hostname vérifié » sans rien avoir vérifié.
@@ -64781,6 +65026,8 @@ def _remember_impl(args: dict) -> tuple:
                  "quarantaine": "Retenu en QUARANTAINE : critique, il attend le veto d'Itare avant d'être servi",
                  "conteste": "Retenu en CONTESTÉ : une version plus forte existe, elle reste servie",
                  "inchange": "Déjà su, inchangé"}.get(r.get("action"), "Retenu")
+        if r.get("rapproche_de"):
+            note += " · même fait que la clé « %s » : rangé comme sa nouvelle version" % r.get("cle")
         return r, "✅ %s [M:%d]%s" % (verbe, r["id"], note), "#00c896"
     raisons = {"secret": "un secret ne va pas en mémoire : range-le dans le coffre (vault_store_secret)",
                "consigne": "un souvenir est un fait, jamais une consigne",
@@ -73510,7 +73757,8 @@ def proactive_scan(auto_act: bool = None) -> dict:
                             memoire_distiller("incident_clos", "Incident clos : %s\n%s" % (_t, (_d or "")[:600]),
                                               "Action appliquée : %s" % ((_a or "")[:400]),
                                               piece={"type": "arbitrage", "source_table": "proactive_findings",
-                                                     "contenu": (_t or "")[:300], "date": now_str},
+                                                     "contenu": ("%s\n%s\n— action : %s" % (_t or "", (_d or "")[:600], (_a or "")[:400]))[:1500],
+                                                     "date": now_str},
                                               acteur="cassandra", maxi=2)
                     except Exception as _e:
                         logging.debug("[MEMOIRE] incident clos : %s", _e)
@@ -104284,27 +104532,27 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
     </header>
     <div class="mx-body" id="mv-page">
       <aside class="mx-rail" id="mv-rail" aria-label="Mémoire">
-        <div class="mx-rail-h"><b>L’îlot</b><span id="mv-rail-sous">—</span></div>
+        <div class="mx-rail-h"><b>Mémoire</b><span id="mv-rail-sous">—</span></div>
         <input class="mx-select" id="mv-q" placeholder="Chercher dans les souvenirs (plein texte)…" aria-label="Chercher dans les souvenirs" onkeydown="if(event.key==='Enter'){MV.q=this.value;memoireAller(MV_VUES[MV.sec].statut?MV.sec:'actifs');}">
         <div class="mx-fam">Souvenirs</div>
         <button class="mx-item" id="mvnav-vue" data-s="vue" onclick="memoireAller('vue')"><span class="mx-dot" id="mv-etat-vue"></span><span class="nm">Vue d’ensemble</span><span class="mx-st" id="mv-n-vue"></span></button>
-        <button class="mx-item" id="mvnav-actifs" data-s="actifs" onclick="memoireAller('actifs')"><span class="mx-dot" id="mv-etat-actifs"></span><span class="nm">Actifs</span><span class="mx-st" id="mv-n-actifs">—</span></button>
-        <button class="mx-item" id="mvnav-conteste" data-s="conteste" onclick="memoireAller('conteste')"><span class="mx-dot" id="mv-etat-conteste"></span><span class="nm">Contestés</span><span class="mx-st" id="mv-n-conteste">—</span></button>
-        <button class="mx-item" id="mvnav-quarantaine" data-s="quarantaine" onclick="memoireAller('quarantaine')"><span class="mx-dot" id="mv-etat-quarantaine"></span><span class="nm">Quarantaine</span><span class="mx-st" id="mv-n-quarantaine">—</span></button>
-        <button class="mx-item" id="mvnav-expire" data-s="expire" onclick="memoireAller('expire')"><span class="mx-dot" id="mv-etat-expire"></span><span class="nm">Expirés</span><span class="mx-st" id="mv-n-expire">—</span></button>
-        <div class="mx-fam">Ce qu’elle te demande</div>
-        <button class="mx-item" id="mvnav-doutes" data-s="doutes" onclick="memoireAller('doutes')"><span class="mx-dot" id="mv-etat-doutes"></span><span class="nm">Doutes</span><span class="mx-st" id="mv-n-doutes">—</span></button>
-        <button class="mx-item" id="mvnav-refus" data-s="refus" onclick="memoireAller('refus')"><span class="mx-dot" id="mv-etat-refus"></span><span class="nm">Refus de garde · 7 j</span><span class="mx-st" id="mv-n-refus">—</span></button>
-        <div class="mx-fam">Le temps</div>
-        <button class="mx-item" id="mvnav-episodes" data-s="episodes" onclick="memoireAller('episodes')"><span class="mx-dot" id="mv-etat-episodes"></span><span class="nm">Épisodes</span><span class="mx-st" id="mv-n-episodes">—</span></button>
-        <button class="mx-item" id="mvnav-rappels" data-s="rappels" onclick="memoireAller('rappels')"><span class="mx-dot" id="mv-etat-rappels"></span><span class="nm">Rappels conditionnés</span><span class="mx-st" id="mv-n-rappels">—</span></button>
-        <div class="mx-fam">La machine</div>
-        <button class="mx-item" id="mvnav-perception" data-s="perception" onclick="memoireAller('perception')"><span class="mx-dot" id="mv-etat-perception"></span><span class="nm">Perception</span><span class="mx-st" id="mv-n-perception"></span></button>
-        <button class="mx-item" id="mvnav-journal" data-s="journal" onclick="memoireAller('journal')"><span class="mx-dot" id="mv-etat-journal"></span><span class="nm">Journal</span><span class="mx-st" id="mv-n-journal">—</span></button>
-        <button class="mx-item" id="mvnav-rappel" data-s="rappel" onclick="memoireAller('rappel')"><span class="mx-dot" id="mv-etat-rappel"></span><span class="nm">Ce qu’elle rappellerait</span><span class="mx-st" id="mv-n-rappel"></span></button>
+        <button class="mx-item" id="mvnav-actifs" data-s="actifs" onclick="memoireAller('actifs')"><span class="mx-dot" id="mv-etat-actifs"></span><span class="nm">Ce qu’elle sait</span><span class="mx-st" id="mv-n-actifs">—</span></button>
+        <button class="mx-item" id="mvnav-conteste" data-s="conteste" onclick="memoireAller('conteste')"><span class="mx-dot" id="mv-etat-conteste"></span><span class="nm">Versions en concurrence</span><span class="mx-st" id="mv-n-conteste">—</span></button>
+        <button class="mx-item" id="mvnav-quarantaine" data-s="quarantaine" onclick="memoireAller('quarantaine')"><span class="mx-dot" id="mv-etat-quarantaine"></span><span class="nm">En relecture</span><span class="mx-st" id="mv-n-quarantaine">—</span></button>
+        <button class="mx-item" id="mvnav-expire" data-s="expire" onclick="memoireAller('expire')"><span class="mx-dot" id="mv-etat-expire"></span><span class="nm">Anciennes versions</span><span class="mx-st" id="mv-n-expire">—</span></button>
+        <div class="mx-fam">À toi de voir</div>
+        <button class="mx-item" id="mvnav-doutes" data-s="doutes" onclick="memoireAller('doutes')"><span class="mx-dot" id="mv-etat-doutes"></span><span class="nm">Questions pour toi</span><span class="mx-st" id="mv-n-doutes">—</span></button>
+        <button class="mx-item" id="mvnav-refus" data-s="refus" onclick="memoireAller('refus')"><span class="mx-dot" id="mv-etat-refus"></span><span class="nm">Écartés · 7 jours</span><span class="mx-st" id="mv-n-refus">—</span></button>
+        <div class="mx-fam">Dans le temps</div>
+        <button class="mx-item" id="mvnav-episodes" data-s="episodes" onclick="memoireAller('episodes')"><span class="mx-dot" id="mv-etat-episodes"></span><span class="nm">Conversations résumées</span><span class="mx-st" id="mv-n-episodes">—</span></button>
+        <button class="mx-item" id="mvnav-rappels" data-s="rappels" onclick="memoireAller('rappels')"><span class="mx-dot" id="mv-etat-rappels"></span><span class="nm">Rappels sur condition</span><span class="mx-st" id="mv-n-rappels">—</span></button>
+        <div class="mx-fam">Coulisses</div>
+        <button class="mx-item" id="mvnav-perception" data-s="perception" onclick="memoireAller('perception')"><span class="mx-dot" id="mv-etat-perception"></span><span class="nm">Mesures en direct</span><span class="mx-st" id="mv-n-perception"></span></button>
+        <button class="mx-item" id="mvnav-journal" data-s="journal" onclick="memoireAller('journal')"><span class="mx-dot" id="mv-etat-journal"></span><span class="nm">Historique des changements</span><span class="mx-st" id="mv-n-journal">—</span></button>
+        <button class="mx-item" id="mvnav-rappel" data-s="rappel" onclick="memoireAller('rappel')"><span class="mx-dot" id="mv-etat-rappel"></span><span class="nm">Tester sa mémoire</span><span class="mx-st" id="mv-n-rappel"></span></button>
         <div class="mx-fam">Comprendre</div>
-        <button class="mx-item" id="mvnav-moteurs" data-s="moteurs" onclick="memoireAller('moteurs')"><span class="mx-dot" id="mv-etat-moteurs"></span><span class="nm">Les moteurs</span><span class="mx-st" id="mv-n-moteurs"></span></button>
-        <div class="mx-rail-foot"><b style="color:var(--txt-soft)">Portée</b><br><span class="mono" id="mv-portee">—</span><br>Le cloisonnement est dans la requête : un compte ne voit que son étagère, l’administrateur ne voit pas les comptes.</div>
+        <button class="mx-item" id="mvnav-moteurs" data-s="moteurs" onclick="memoireAller('moteurs')"><span class="mx-dot" id="mv-etat-moteurs"></span><span class="nm">Comment elle fonctionne</span><span class="mx-st" id="mv-n-moteurs"></span></button>
+        <div class="mx-rail-foot"><b style="color:var(--txt-soft)">Portée</b><br><span class="mono" id="mv-portee">—</span><br>Chaque compte ne voit que sa propre mémoire ; l’administrateur ne voit pas celle des autres comptes.</div>
       </aside>
       <main class="mx-main" id="mv-main">
         <div id="mv-barre"></div>
@@ -111358,25 +111606,25 @@ function mvBandeau(){
     let mark, titre, sous;
     if(!e.ok){ mark='inconnu'; titre='La mémoire n’a pas répondu'; sous='L’état n’a pas pu être lu : les chiffres ci-dessous sont ceux du dernier relevé.'; }
     else if(rompue){ mark='panne'; titre='La chaîne du journal est rompue'; sous=`Une altération hors de la porte, à l’entrée ${mvAttr((function(){try{return JSON.parse(chaine.details).rupture;}catch(x){return '?';}})())} : elle ne s’efface pas, elle se montre. Recalcule depuis le journal, puis regarde qui a écrit dans la base.`; }
-    else if(doutes){ mark=''; titre=`${doutes} doute${doutes>1?'s':''} attend${doutes>1?'ent':''} ta réponse`; sous=`Elle sait ${nAct} chose${nAct>1?'s':''}${parts.length?' — '+parts.join(', ')+' —':''} et ne tranche pas seule : deux doutes par tour, dans le chat ou ici, expirés à sept jours.`; }
-    else if(quar){ mark=''; titre=`${quar} écriture${quar>1?'s':''} critique${quar>1?'s':''} attend${quar>1?'ent':''} le veto d’Itare`; sous=`Elle sait ${nAct} chose${nAct>1?'s':''}${parts.length?' — '+parts.join(', ')+' —':''}. Une écriture critique d’agent reste en quarantaine jusqu’au veto ; ta parole, elle, n’attend pas.`; }
-    else if(!nAct){ mark='inconnu'; titre='Elle ne sait encore rien'; sous='« Je ne sais pas » est une réponse honnête. Les souvenirs naîtront des déclencheurs : « retiens que… », une correction, un geste de cage, un incident clos, ou le bouton Retenir.'; }
-    else { mark='stable'; titre=`Elle sait ${nAct} chose${nAct>1?'s':''}${refus?`, et la garde a refusé ${refus}${refus>=30?'+':''} écriture${refus>1?'s':''} en sept jours`:''}`;
-           sous=`${parts.length?parts.join(', ')+'. ':''}Aucun doute ouvert, aucune quarantaine${cad.rappel_vide?` ; ${cad.rappel_vide.n} rappel${cad.rappel_vide.n>1?'s':''} sans réponse au cadran`:''}${chaine?`, chaîne intacte (${nGestes} gestes)`:''}.`; }
+    else if(doutes){ mark=''; titre=`${doutes} doute${doutes>1?'s':''} attend${doutes>1?'ent':''} ta réponse`; sous=`Elle sait ${nAct} chose${nAct>1?'s':''}${parts.length?' — '+parts.join(', ')+' —':''}. Quand elle n’est pas sûre, elle ne décide pas seule : elle te pose la question ici, ou dans le chat (deux à la fois). Sans réponse, une question disparaît au bout de 7 jours.`; }
+    else if(quar){ mark=''; titre=`${quar} souvenir${quar>1?'s':''} sensible${quar>1?'s':''} en relecture`; sous=`Elle sait ${nAct} chose${nAct>1?'s':''}${parts.length?' — '+parts.join(', ')+' —':''}. Ce qu’un agent veut retenir sur la sécurité, l’architecture ou les personnes est relu par Itare avant d’entrer ; ce que tu dis toi-même entre tout de suite.`; }
+    else if(!nAct){ mark='inconnu'; titre='Elle ne sait encore rien'; sous='« Je ne sais pas » est une réponse honnête. Elle retiendra quand tu lui dis « retiens que… », quand tu la corriges, après une intervention sur la machine, ou avec le bouton « Retenir un fait ».'; }
+    else { mark='stable'; titre=`Elle sait ${nAct} chose${nAct>1?'s':''}`;
+           sous=`${parts.length?parts.join(', ')+'. ':''}Aucune question pour toi, rien en relecture${refus?` ; ${refus}${refus>=30?'+':''} note${refus>1?'s':''} écartée${refus>1?'s':''} cette semaine`:''}${chaine?' ; historique intact':''}.`; }
     const kpi=(k,b,em,cls,small,go)=>`<button class="mx-kpi mv-kpi" type="button" onclick="memoireAller('${go}')"><span>${k}</span><b${cls?' class="'+cls+'"':''}>${b}</b>${em?`<em>${em}</em>`:''}${small?`<small>${small}</small>`:''}</button>`;
     return `<section class="mx-sec" id="mv-verdict">
-      <div class="mx-eyebrow">La mémoire, maintenant · relevé à ${mvAttr((document.getElementById('mv-releve')||{}).textContent||'—')}</div>
+      <div class="mx-eyebrow">La mémoire · relevé à ${mvAttr((document.getElementById('mv-releve')||{}).textContent||'—')}</div>
       <div class="mx-verdict"><span class="mx-vmark ${mark}"></span><div class="mx-vbody">
         <h2 class="mx-vtitle">${mvAttr(titre)}</h2><p class="mx-vsub" style="margin:0">${sous}</p>
-        <div class="mx-gest" style="justify-content:flex-start"><button class="mx-btn primary" onclick="mvConfirmer('retenir')">Retenir un fait</button>${refus?`<button class="mx-btn" onclick="memoireAller('refus')">Voir les refus</button>`:''}<button class="mx-btn" onclick="memoireAller('rappel')">Ce qu’elle rappellerait</button></div>
+        <div class="mx-gest" style="justify-content:flex-start"><button class="mx-btn primary" onclick="mvConfirmer('retenir')">Retenir un fait</button>${refus?`<button class="mx-btn" onclick="memoireAller('refus')">Voir ce qui a été écarté</button>`:''}<button class="mx-btn" onclick="memoireAller('rappel')">Tester sa mémoire</button></div>
       </div></div>
       <div class="mx-kpis">
-        ${kpi('Souvenirs actifs', nAct, parts.length?parts.join(' · ').replace(/<\/?b>/g,''):'aucun', '', 'statut = actif · portée', 'actifs')}
-        ${kpi('Contestés · quarantaine', (st.conteste||0)+' · '+quar, quar?'un veto attend':'rien n’attend un veto', quar?'doux':'', 'plus faibles que l’actif · critiques d’agent', quar?'quarantaine':'conteste')}
-        ${kpi('Doutes ouverts', doutes, doutes?'à toi de répondre':'rien ne t’attend', doutes?'doux':'', 'échéance 7 j · 2 par tour', 'doutes')}
-        ${kpi('Refus de garde · 7 j', refus+(refus>=30?'+':''), refus?'la porte a gardé':'rien n’a forcé la porte', refus?'doux':'', 'journal · verbe refus_garde', 'refus')}
-        ${kpi('Rappels · cadran', `${cad.rappel_vide?cad.rappel_vide.n:0} vides · ${cad.rappel_plein?cad.rappel_plein.n:0} pleins`, 'compteurs, hors chaîne', '', 'memoire_cadran', 'journal')}
-        ${kpi('Gestes chaînés', nGestes, chaine?((rompue?'ROMPUE':'intacte')+' · '+mvHeure(chaine.ts)):'jamais vérifiée', rompue?'bad':'', 'une fois par jour', 'journal')}
+        ${kpi('Ce qu’elle sait', nAct, parts.length?parts.join(' · ').replace(/<\/?b>/g,''):'rien encore', '', 'faits retenus et utilisés', 'actifs')}
+        ${kpi('Questions pour toi', doutes, doutes?'elle attend ta réponse':'rien ne t’attend', doutes?'doux':'', 'sans réponse, elles disparaissent à 7 jours', 'doutes')}
+        ${kpi('En attente', (st.conteste||0)+quar, quar?quar+' en relecture':((st.conteste||0)?'versions en concurrence':'rien en attente'), quar?'doux':'', 'une version plus sûre existe, ou relecture en cours', quar?'quarantaine':'conteste')}
+        ${kpi('Écartés · 7 jours', refus+(refus>=30?'+':''), refus?'elle a refusé de les retenir':'rien d’écarté', '', 'secrets, ordres, notes creuses ou mal formées', 'refus')}
+        ${kpi('Recherches sans résultat', cad.rappel_vide?cad.rappel_vide.n:0, `${cad.rappel_plein?cad.rappel_plein.n:0} avec résultat`, '', 'quand elle a cherché dans sa mémoire', 'rappel')}
+        ${kpi('Historique', nGestes, chaine?((rompue?'ALTÉRÉ':'intact')+' · vérifié '+mvHeure(chaine.ts)):'jamais vérifié', rompue?'bad':'', 'chaque changement est tracé', 'journal')}
       </div></section>`;
 }
 function mvRail(){
@@ -111395,9 +111643,9 @@ function mvRail(){
 // « CE QUI DEMANDE UN GESTE » : calculé ici, rendu sous le verdict (l'ancien « À toi » du rail).
 function mvVigilances(){
     const e=MV.etat||{}, st=e.statuts||{}, l=[];
-    if(e.doutes_ouverts) l.push(['avert', e.doutes_ouverts+' doute'+(e.doutes_ouverts>1?'s':'')+' à répondre : elle attend ta réponse.', 'doutes', 'répondre']);
-    if(st.quarantaine) l.push(['info', st.quarantaine+' écriture'+(st.quarantaine>1?'s':'')+' critique'+(st.quarantaine>1?'s':'')+' en attente du veto d\'Itare.', 'quarantaine', 'voir']);
-    if(e.chaine && e.chaine.verbe==='chaine_rompue') l.push(['erreur', 'La chaîne du journal est rompue : une altération hors de la porte.', 'journal', 'voir']);
+    if(e.doutes_ouverts) l.push(['avert', e.doutes_ouverts+' question'+(e.doutes_ouverts>1?'s':'')+' pour toi : elle attend ta réponse.', 'doutes', 'répondre']);
+    if(st.quarantaine) l.push(['info', st.quarantaine+' souvenir'+(st.quarantaine>1?'s':'')+' sensible'+(st.quarantaine>1?'s':'')+' en relecture par Itare.', 'quarantaine', 'voir']);
+    if(e.chaine && e.chaine.verbe==='chaine_rompue') l.push(['erreur', 'L’historique a été modifié en dehors de Cassandra.', 'journal', 'voir']);
     const tires=(MV.rappels||[]).filter(x=>x.actif && x.dernier_declenche && (Date.now()-new Date(x.dernier_declenche.replace(' ','T')+'Z').getTime())<86400000);
     if(tires.length) l.push(['ok', 'Un rappel s\'est déclenché : '+tires[0].message.slice(0,60), 'rappels', 'voir']);
     MV.vig=l;
@@ -111407,14 +111655,14 @@ function mvGestesHtml(){
     const l=MV.vig||[];
     return `<section class="mx-sec"><div class="mx-chart-h"><h2>Ce qui demande un geste</h2><span class="mx-meta">tiré de l’état · ${l.length} vigilance${l.length>1?'s':''}</span></div>
       ${l.length?l.map(x=>`<div class="fp2-alerte"><i class="${x[0]==='erreur'?'erreur':(x[0]==='ok'?'ok':'')}"></i><div><b>${mvAttr(x[1])}</b></div><button class="mx-btn" onclick="memoireAller('${x[2]}')">${mvAttr(x[3])}</button></div>`).join('')
-        :`<div class="mx-silence"><b>Rien ne t’attend.</b> Un doute, une quarantaine, une chaîne rompue ou un rappel déclenché apparaîtraient ici.</div>`}</section>`;
+        :`<div class="mx-silence"><b>Rien ne t’attend.</b> Une question, une relecture ou un rappel déclenché apparaîtraient ici.</div>`}</section>`;
 }
 function mvChaine(){
     const c=document.getElementById('mv-chaine'); if(!c) return;
     if(!MV.admin){ c.style.display='none'; return; }
     const e=MV.etat||{}; c.style.display='';
     c.className='mx-pill '+(e.chaine?(e.chaine.verbe==='chaine_verifiee'?'ok':'panne'):'regarder');
-    c.textContent = e.chaine ? ((e.chaine.verbe==='chaine_verifiee'?'chaîne intacte':'chaîne ROMPUE')+' · '+mvHeure(e.chaine.ts)) : 'chaîne jamais vérifiée · vérifier';
+    c.textContent = e.chaine ? ((e.chaine.verbe==='chaine_verifiee'?'historique intact':'historique ALTÉRÉ')+' · '+mvHeure(e.chaine.ts)) : 'historique jamais vérifié · vérifier';
 }
 async function memoireChaine(){
     let v; try{ v=await apiPost('/api/memoire/chaine',{}); }catch(e){ v={ok:false}; }
@@ -111423,19 +111671,19 @@ async function memoireChaine(){
 }
 
 const MV_VUES = {
-  vue:{titre:"Vue d’ensemble", src:"l’état de la mémoire, ses chiffres et ce qui demande un geste"},
-  actifs:{titre:"Souvenirs actifs", src:"statut = actif · propriétaire dans la portée", statut:"actif"},
-  conteste:{titre:"Contestés", src:"une version plus forte existe : jamais servis en tête", statut:"conteste", avant:`<div class="mx-silence"><b>Contestés.</b> Un candidat plus faible que la version active ne l’écrase pas : il entre ici, et la mémoire te pose la question. Le silence ne vaut ni oui ni non ; à sept jours le doute expire et le contesté reste contesté.</div>`},
-  quarantaine:{titre:"Quarantaine", src:"critiques d’agent en attente du veto d’Itare", statut:"quarantaine", avant:`<div class="mx-silence"><b>Le veto, hors du chemin de la réponse.</b> Une écriture critique (security, architecture, rule, decision, personne) qui ne vient pas de toi attend ici. Les gardes mécaniques passent d’abord, puis Itare en JSON strict. Levée : la ligne devient active. Refus : contestée, et un doute te le dit.</div>`},
-  expire:{titre:"Expirés", src:"remplacés, corrigés, oubliés : la ligne reste, la fenêtre est fermée", statut:"expire"},
-  doutes:{titre:"Doutes", src:"deux par tour, à un humain, différables une fois, expirés à sept jours"},
-  refus:{titre:"Refus de garde", src:"journal · verbe = refus_garde · 7 jours"},
-  episodes:{titre:"Épisodes", src:"fermés par 90 min de silence · résumé par le modèle"},
-  rappels:{titre:"Rappels conditionnés", src:"évalués à chaque relevé · elle rappelle, elle n’exécute rien"},
-  perception:{titre:"Perception", src:"capteurs de la vigie et du collecteur · mesurée à l’instant, jamais rappelée"},
-  journal:{titre:"Journal", src:"chaîné par empreinte · jamais effacé"},
-  rappel:{titre:"Ce qu’elle rappellerait", src:"le bloc exact injecté dans le prompt pour une question"},
-  moteurs:{titre:"Les moteurs de la mémoire", src:"comment un fait naît, vit, se rappelle, se corrige et s’oublie · lus dans le code en service"},
+  vue:{titre:"Vue d’ensemble", src:"ce qu’elle sait, ce qu’elle te demande, ce qui a changé"},
+  actifs:{titre:"Ce qu’elle sait", src:"les faits qu’elle retient et utilise pour te répondre", statut:"actif"},
+  conteste:{titre:"Versions en concurrence", src:"une version plus sûre est déjà retenue : celles-ci ne servent pas", statut:"conteste", avant:`<div class="mx-silence"><b>Deux versions d’un même fait.</b> Quand une nouvelle information est moins sûre que celle déjà retenue, elle ne la remplace pas : elle attend ici, et une question t’est posée pour trancher.</div>`},
+  quarantaine:{titre:"En relecture", src:"souvenirs sensibles proposés par un agent, relus avant d’entrer", statut:"quarantaine", avant:`<div class="mx-silence"><b>Relus avant d’entrer.</b> Ce qu’un agent veut retenir sur la sécurité, l’architecture, les règles, les décisions ou les personnes est d’abord relu par Itare. Accepté, il entre ; refusé, une question t’est posée.</div>`},
+  expire:{titre:"Anciennes versions", src:"remplacées, corrigées ou oubliées — gardées pour l’historique, plus utilisées", statut:"expire"},
+  doutes:{titre:"Questions pour toi", src:"elle ne tranche pas seule · sans réponse, une question disparaît au bout de 7 jours"},
+  refus:{titre:"Écartés · 7 jours", src:"ce qu’elle a refusé de retenir, et pourquoi"},
+  episodes:{titre:"Conversations résumées", src:"chaque conversation est résumée après 1 h 30 de silence"},
+  rappels:{titre:"Rappels sur condition", src:"« quand le disque passe sous 20 Go, rappelle-moi de… » · elle rappelle, elle n’exécute rien"},
+  perception:{titre:"Mesures en direct", src:"l’état des machines se mesure à l’instant, il ne se retient pas"},
+  journal:{titre:"Historique des changements", src:"chaque ajout, correction ou oubli est tracé, rien ne s’efface"},
+  rappel:{titre:"Tester sa mémoire", src:"pose une question : voici exactement ce qu’elle se rappellerait pour y répondre"},
+  moteurs:{titre:"Comment elle fonctionne", src:"comment un fait est retenu, utilisé, corrigé et oublié"},
 };
 function memoireAller(s, sansFiche){
     MV.sec = MV_VUES[s]?s:'vue';
@@ -111498,18 +111746,25 @@ function mvTableau(rows){
 async function mvVueDoutes(box){
     let d; try{ d=await apiPost('/api/memoire/doutes',{}); }catch(e){ d={doutes:[]}; }
     const l=d.doutes||[];
-    box.innerHTML=`<section class="mx-sec">`+(l.length?l.map(x=>`<div class="mv-doute"><div class="mx-chart-h"><span>${mvPuce(x.source, x.source==='reconciliation'?'avert':'info')} <span class="mv-ref">D:${x.id}</span></span><span class="mx-meta">ouvert le ${mvHeure(x.ts)} · posé ${x.nb_poses||0}× · échéance ${mvHeure(x.echeance)}</span></div>
-        <p>${mvAttr(x.question)}</p><div class="mv-choix">${(x.options||[]).map(o=>`<button class="mx-btn" onclick="memoireDoute(${x.id},'${mvAttr(o[0])}')">${mvAttr(o[1])}<small>${mvAttr(o[0])}</small></button>`).join('')}<button class="mx-btn" style="color:var(--txt-faint)" onclick="memoireDoute(${x.id},'annule')">annuler</button></div></div>`).join('')
-      :`<div class="mx-silence"><b>Aucun doute ouvert.</b> Un doute naît d’une réconciliation (deux versions), d’une revalidation (un souvenir inféré, faible, vieux et cité), ou d’un veto. Il expire à sept jours sans effet.</div>`)
-      +`<div class="mx-eyebrow" style="margin-top:14px">Dans le chat, la même réponse</div><div class="mv-pied-chat"><div class="bulle">La question se pose à la fin d’une réponse, avec ses choix ; tu réponds dans le chat : <span class="mono" style="color:var(--txt-faint)">doute 6 : active</span></div></div></section>`;
+    const genre={veto:['à vérifier','info'], reconciliation:['deux versions','avert'], revalidation:['encore vrai ?','info']};
+    box.innerHTML=`<section class="mx-sec">`+(l.length?l.map(x=>`<div class="mv-doute"><div class="mx-chart-h"><span>${mvPuce((genre[x.source]||[x.source])[0], (genre[x.source]||[0,'info'])[1])}</span><span class="mx-meta">depuis le ${mvHeure(x.ts)} · disparaît le ${mvHeure(x.echeance)} sans réponse</span></div>
+        <p>${mvAttr(x.question)}</p><div class="mv-choix">${(x.options||[]).map(o=>`<button class="mx-btn" onclick="memoireDoute(${x.id},'${mvAttr(o[0])}')">${mvAttr(o[1])}</button>`).join('')}<button class="mx-btn" style="color:var(--txt-faint)" onclick="memoireDoute(${x.id},'annule')">Ignorer</button></div></div>`).join('')
+      :`<div class="mx-silence"><b>Aucune question pour toi.</b> Elle t’en pose une quand deux versions d’un fait se contredisent, quand un vieux souvenir mérite d’être revérifié, ou quand un souvenir proposé n’a pas pu être confirmé.</div>`)
+      +`<div class="mx-eyebrow" style="margin-top:14px">Tu peux aussi répondre dans le chat</div><div class="mv-pied-chat"><div class="bulle">Elle pose la question à la fin d’une réponse ; tu réponds simplement, par exemple : <span class="mono" style="color:var(--txt-faint)">doute 6 : oui</span></div></div></section>`;
 }
+// Les raisons d'un refus, dites en français (les codes restent au journal).
+const MV_REFUS = {secret:"contenait un secret (sa place est le coffre)", consigne:"était un ordre, pas un fait", spi:"donnée personnelle sensible",
+  cle:"mal formé (intitulé trop long, comme une phrase)", vide:"vide", creux:"trop creux pour servir", nature:"ne disait pas s’il est daté ou mesurable",
+  sonde:"la vérification automatique a échoué", sujet:"concernait un autre compte", quota:"trop d’écritures d’un coup",
+  categorie:"type inconnu", piece_ancienne:"plus ancien que ce qu’elle sait déjà"};
 function mvVueRefus(box){
     const l=(MV.etat&&MV.etat.refus_7j)||[];
     const par={}; l.forEach(r=>{ let o={}; try{o=JSON.parse(r.details||'{}')||{};}catch(e){} const k=o.raison||'?'; par[k]=(par[k]||0)+1; });
-    box.innerHTML=`<section class="mx-sec"><div class="mx-silence"><b>Un refus n’est pas une erreur.</b> La porte a gardé : secret, consigne, donnée sensible, clé en phrase, sujet hors du compte, nature muette, quota. Chaque refus dit sa raison. Un refus injuste se corrige en desserrant une garde précise, jamais à l’aveugle.</div>
-      ${l.length?`<div class="mx-kpis">${Object.keys(par).sort((a,b)=>par[b]-par[a]).slice(0,4).map(k=>`<div class="mx-kpi"><span>${mvAttr(k)}</span><b>${par[k]}</b><small>sur les ${l.length} derniers</small></div>`).join('')}</div>
-      <div class="mx-tbl"><table class="mv-liste"><tr><th>Quand</th><th>Raison</th><th>Ce qui a été refusé</th><th>Acteur</th></tr>${l.map(r=>{let o={};try{o=JSON.parse(r.details||'{}')||{};}catch(e){} return `<tr><td class="num">${mvHeure(r.ts)}</td><td>${mvPuce(o.raison||'?', o.raison==='secret'?'erreur':'avert')}</td><td>${mvAttr((o.categorie||'')+(o.cle?' · « '+o.cle+' »':'')+(o.detail?' · '+o.detail:''))}</td><td class="num">${mvAttr(r.acteur)}</td></tr>`;}).join('')}</table></div>`
-      :`<div class="mx-silence" style="margin-top:10px"><b>Aucun refus en sept jours.</b> Rien n’a essayé d’entrer sans passer la garde.</div>`}</section>`;
+    const dit=k=>MV_REFUS[k]||k;
+    box.innerHTML=`<section class="mx-sec"><div class="mx-silence"><b>Écarter n’est pas une erreur.</b> Avant de retenir quelque chose, elle vérifie que ce n’est ni un secret, ni un ordre, ni une donnée sensible, ni une note creuse ou mal formée. Voici ce qu’elle a écarté cette semaine, et pourquoi.</div>
+      ${l.length?`<div class="mx-kpis">${Object.keys(par).sort((a,b)=>par[b]-par[a]).slice(0,4).map(k=>`<div class="mx-kpi"><span>${mvAttr(dit(k))}</span><b>${par[k]}</b><small>sur ${l.length}</small></div>`).join('')}</div>
+      <div class="mx-tbl"><table class="mv-liste"><tr><th>Quand</th><th>Pourquoi</th><th>Ce qu’elle voulait retenir</th><th>Qui</th></tr>${l.map(r=>{let o={};try{o=JSON.parse(r.details||'{}')||{};}catch(e){} return `<tr><td class="num">${mvHeure(r.ts)}</td><td>${mvPuce(dit(o.raison||'?'), o.raison==='secret'?'erreur':'avert')}</td><td>${mvAttr(String(o.cle||'').replace(/\s+/g,' ').slice(0,140))}</td><td class="num">${mvAttr(mvActeur(r.acteur))}</td></tr>`;}).join('')}</table></div>`
+      :`<div class="mx-silence" style="margin-top:10px"><b>Rien d’écarté en sept jours.</b></div>`}</section>`;
 }
 function mvVueEpisodes(box){
     const l=MV.episodes||[];
