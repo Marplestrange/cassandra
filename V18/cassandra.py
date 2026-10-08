@@ -33952,7 +33952,10 @@ def pj_projet_supprimer(pid) -> dict:
         conn = _pj_conn()
         if not _pj_ligne(conn, pid):
             return {"ok": False, "reason": "projet introuvable"}
-        for t in ("pj_phases", "pj_jalons", "pj_decisions", "itare_project_links"):
+        # LA CORBEILLE (07-10, « en cas d'erreur, il faut pouvoir le récupérer ») : tout ce que la suppression
+        # efface part d'abord, entier, dans pj_corbeille — dans la MÊME transaction, donc jamais l'un sans l'autre.
+        _pj_corbeille_deposer(conn, pid)
+        for t in _PJ_CORBEILLE_TABLES:
             conn.execute("DELETE FROM %s WHERE project_id=?" % t, (int(pid),))
         conn.execute("UPDATE itare_tasks SET project_id=NULL WHERE project_id=?", (int(pid),))
         conn.execute("DELETE FROM itare_projects WHERE id=?", (int(pid),))
@@ -33967,6 +33970,129 @@ def pj_projet_supprimer(pid) -> dict:
                 conn.close()
             except Exception:
                 pass
+
+
+# ── LA CORBEILLE DES PROJETS (07-10) ─────────────────────────────────────────────────────────────────────────────
+# Un projet supprimé n'est plus perdu : sa fiche et tout ce que la suppression efface (phases, jalons, décisions,
+# rattachements) sont gardés en un paquet, avec la liste des tâches qu'on a détachées. Le reste — équipe, Fil,
+# commentaires, courrier rangé — n'a jamais été effacé : il garde le numéro du projet, et les identifiants ne se
+# réutilisent pas (AUTOINCREMENT). Restaurer, c'est réécrire la fiche sous SON numéro : tout se raccroche seul.
+_PJ_CORBEILLE_TABLES = ("pj_phases", "pj_jalons", "pj_decisions", "itare_project_links")
+
+
+def _pj_corbeille_table(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS pj_corbeille (pid INTEGER PRIMARY KEY, compte TEXT, nom TEXT, "
+                 "supprime_le TEXT, par TEXT, paquet TEXT)")
+
+
+def _pj_corbeille_deposer(conn, pid):
+    """Le paquet d'un projet, pris AVANT l'effacement. Lève si quelque chose manque : mieux vaut refuser de
+    supprimer que de supprimer sans filet."""
+    _pj_corbeille_table(conn)
+
+    def _lignes(sql, args):
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    fiche = _lignes("SELECT * FROM itare_projects WHERE id=?", (int(pid),))[0]
+    paquet = {"projet": fiche, "taches": [r[0] for r in conn.execute(
+        "SELECT id FROM itare_tasks WHERE project_id=?", (int(pid),))]}
+    for t in _PJ_CORBEILLE_TABLES:
+        paquet[t] = _lignes("SELECT * FROM %s WHERE project_id=?" % t, (int(pid),))
+    conn.execute("INSERT OR REPLACE INTO pj_corbeille (pid, compte, nom, supprime_le, par, paquet) VALUES (?,?,?,?,?,?)",
+                 (int(pid), str(fiche.get("compte") or ""), str(fiche.get("name") or ""),
+                  time.strftime("%Y-%m-%d %H:%M:%S"), str(get_current_user() or ""),
+                  json.dumps(paquet, ensure_ascii=False, default=str)))
+
+
+def _pj_corbeille_mien(r) -> bool:
+    """Un projet de la corbeille se voit par son propriétaire et par qui l'a supprimé — pas par les autres,
+    administrateur compris (administrer n'est pas voir)."""
+    moi = str(get_current_user() or "").strip().lower()
+    if not moi and _iso_agent():
+        return True
+    return bool(moi) and moi in (str(r["compte"] or "").strip().lower(), str(r["par"] or "").strip().lower())
+
+
+def pj_corbeille() -> list:
+    """Les projets supprimés que je peux restaurer, du plus récent au plus ancien."""
+    conn = None
+    try:
+        conn = _pj_conn()
+        _pj_corbeille_table(conn)
+        rows = conn.execute("SELECT pid, compte, nom, supprime_le, par, paquet FROM pj_corbeille "
+                            "ORDER BY supprime_le DESC").fetchall()
+    except Exception as e:
+        logging.info("[PROJET] corbeille : %s", e)
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+    out = []
+    for r in rows:
+        if not _pj_corbeille_mien(r):
+            continue
+        try:
+            p = json.loads(r["paquet"] or "{}")
+        except Exception:
+            p = {}
+        out.append({"pid": int(r["pid"]), "nom": r["nom"] or "(sans nom)", "supprime_le": r["supprime_le"] or "",
+                    "par": r["par"] or "", "phases": len(p.get("pj_phases") or []),
+                    "taches": len(p.get("taches") or []), "nature": (p.get("projet") or {}).get("nature") or ""})
+    return out
+
+
+def pj_corbeille_restaurer(pid) -> dict:
+    """La fiche revient sous son numéro, avec ses phases, jalons, décisions, rattachements, et les tâches qu'on
+    avait détachées (si personne ne les a rattachées ailleurs entre-temps)."""
+    conn = None
+    try:
+        conn = _pj_conn()
+        _pj_corbeille_table(conn)
+        r = conn.execute("SELECT * FROM pj_corbeille WHERE pid=?", (int(pid),)).fetchone()
+        if not r or not _pj_corbeille_mien(r):
+            return {"ok": False, "reason": "projet introuvable dans la corbeille"}
+        if conn.execute("SELECT 1 FROM itare_projects WHERE id=?", (int(pid),)).fetchone():
+            return {"ok": False, "reason": "un projet porte déjà ce numéro"}
+        p = json.loads(r["paquet"] or "{}")
+
+        def _remettre(table, ligne):
+            cols = [c[1] for c in conn.execute("PRAGMA table_info(%s)" % table)]
+            k = [c for c in cols if c in ligne]      # une colonne retirée depuis ne bloque pas la restauration
+            conn.execute("INSERT INTO %s (%s) VALUES (%s)" % (table, ",".join(k), ",".join("?" * len(k))),
+                         [ligne[c] for c in k])
+        _remettre("itare_projects", p["projet"])
+        for t in _PJ_CORBEILLE_TABLES:
+            for ligne in p.get(t) or []:
+                _remettre(t, ligne)
+        for tid in p.get("taches") or []:
+            conn.execute("UPDATE itare_tasks SET project_id=? WHERE id=? AND project_id IS NULL", (int(pid), int(tid)))
+        conn.execute("DELETE FROM pj_corbeille WHERE pid=?", (int(pid),))
+        conn.commit()
+        return {"ok": True, "pid": int(pid), "nom": r["nom"] or ""}
+    except Exception as e:
+        logging.warning("[PROJET] restauration %s : %s", pid, e)
+        return {"ok": False, "reason": str(e)[:160]}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def pj_corbeille_purger(pid) -> dict:
+    """Vider pour de bon : le paquet part. Rien d'autre n'est touché."""
+    conn = None
+    try:
+        conn = _pj_conn()
+        _pj_corbeille_table(conn)
+        r = conn.execute("SELECT * FROM pj_corbeille WHERE pid=?", (int(pid),)).fetchone()
+        if not r or not _pj_corbeille_mien(r):
+            return {"ok": False, "reason": "projet introuvable dans la corbeille"}
+        conn.execute("DELETE FROM pj_corbeille WHERE pid=?", (int(pid),))
+        conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)[:160]}
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _pj_poser_modele(pid, cle):
@@ -35448,8 +35574,10 @@ def _pj_courrier_adresses(pid) -> list:
     return sorted(a for a in adrs if _EMAIL_RE.match(a))[:60]
 
 
-def pj_courrier(pid, q: str = "", limite: int = 80) -> dict:
-    """Les fils de courrier du projet, du plus récent au plus ancien. Avec `q` : des courriels de la boîte, à ranger."""
+def pj_courrier(pid, q: str = "", limite: int = 80, boite: bool = False) -> dict:
+    """Les fils de courrier du projet, du plus récent au plus ancien. Avec `q` : des courriels de la boîte, à ranger.
+    Avec `boite` (07-10, « un menu qui liste notre boîte ») : les derniers fils de la boîte entière, sans rien
+    taper — le sélecteur de l'Atelier les montre, on coche, on joint. `q` s'y ajoute comme filtre."""
     if not pj_peut(pid, "lire"):
         return _pj_refus(pid, "lire")
     p = _pj_ligne(None, pid) or {}
@@ -35472,8 +35600,11 @@ def pj_courrier(pid, q: str = "", limite: int = 80) -> dict:
             if q:
                 like = "%" + q.replace("%", "").replace("_", "") + "%"
                 rows = conn.execute("SELECT %s FROM mail_cache WHERE account=? AND (subject LIKE ? OR from_addr LIKE ? "
-                                    "OR from_name LIKE ?) ORDER BY date_iso DESC LIMIT 60" % cols,
-                                    (compte, like, like, like)).fetchall()
+                                    "OR from_name LIKE ? OR to_addr LIKE ? OR preview LIKE ?) ORDER BY date_iso DESC LIMIT ?" % cols,
+                                    (compte, like, like, like, like, like, 400 if boite else 60)).fetchall()
+            elif boite:
+                rows = conn.execute("SELECT %s FROM mail_cache WHERE account=? ORDER BY date_iso DESC LIMIT 600" % cols,
+                                    (compte,)).fetchall()
             else:
                 cond, args = [], [compte]
                 adrs = _pj_courrier_adresses(pid)
@@ -35503,7 +35634,7 @@ def pj_courrier(pid, q: str = "", limite: int = 80) -> dict:
         if any(h in str(r["folder"] or "").lower() for h in _PJ_COURRIER_HORS):
             continue
         k = _pj_courrier_cle(r)
-        if modes.get(k) == "ecarte" and not q:
+        if modes.get(k) == "ecarte" and not q and not boite:
             continue
         f = fils.get(k)
         if f is None:
@@ -35514,8 +35645,11 @@ def pj_courrier(pid, q: str = "", limite: int = 80) -> dict:
                            "de": de, "de_nom": r["from_name"] or "", "quand": quand, "apercu": str(r["preview"] or "")[:200],
                            "n": 0, "non_lus": 0, "pj": False, "moi": de in moi,
                            "attend": (de not in moi) and not r["answered"] and quand[:10] >= recent,
-                           "mode": modes.get(k) or ""}
+                           "mode": modes.get(k) or "", "msgs": []}
             ordre.append(k)
+        # Tous les messages du fil : l'Atelier reconnaît le fil quel que soit le message ouvert (« Retirer du
+        # projet » ne s'affichait que sur le dernier).
+        f["msgs"].append("%s/%s" % (r["uid"], r["folder"]))
         f["n"] += 1
         f["non_lus"] += 0 if r["seen"] else 1
         f["pj"] = f["pj"] or bool(r["has_attach"])
@@ -37309,6 +37443,12 @@ def ranger_etat() -> dict:
                            for a in (pj_archives() or [])]
     except Exception:
         pass
+    # La corbeille des projets (07-10) : à chacun les siens, administrateur compris.
+    try:
+        out["projets_supprimes"] = pj_corbeille()
+    except Exception as e:
+        out["projets_supprimes"] = []
+        logging.info("[RANGER] corbeille des projets : %s", e)
     out["n"] = len(out["notes"]) + len(out["projets"])
     return out
 
@@ -46122,10 +46262,32 @@ def mail_media_index(folder="INBOX", limit=40) -> dict:
 
     Par lots : lire un message entier coûte cher, et une boîte de plusieurs
     milliers de messages bloquerait l'interface plusieurs minutes si on tentait
-    tout d'un coup. L'appelant relance tant que `remaining` n'est pas nul."""
+    tout d'un coup. L'appelant relance tant que `remaining` n'est pas nul.
+
+    `folder="*"` (07-10) : TOUTE la boîte, corbeille et indésirables exceptés. Une boîte triée par règles range
+    ses courriels hors d'INBOX — Envoyés, Factures, Technique… — et l'index ne lisait que le dossier ouvert :
+    74 messages porteurs de pièces, 0 pièce indexée, et « Pièces jointes » restait vide sans dire pourquoi."""
     _mail_media_migrate()
     _mail_cache_migrate()
     compte = _mail_account()
+    if folder == "*":
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            dossiers = [r[0] for r in conn.execute(
+                "SELECT DISTINCT folder FROM mail_cache WHERE account=? AND has_attach=1 ORDER BY folder", (compte,))
+                if not any(h in str(r[0] or "").lower() for h in _PJ_COURRIER_HORS)]
+            conn.close()
+        except Exception as e:
+            return {"ok": False, "reason": str(e)}
+        vus, trouves, restant, reste = 0, 0, 0, max(0, int(limit))
+        for dos in dossiers:
+            r = mail_media_index(dos, reste)
+            if not r.get("ok"):
+                return r
+            vus += r["scanned"]; trouves += r["found"]; restant += r["remaining"]
+            reste = max(0, reste - r["scanned"])
+        return {"ok": True, "scanned": vus, "found": trouves, "remaining": restant, "folder": "*",
+                "dossiers": len(dossiers)}
     try:
         conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10); conn.row_factory = sqlite3.Row
         cibles = conn.execute(
@@ -90283,7 +90445,7 @@ class CassandraHandler(BaseHTTPRequestHandler):
                 # L'Atelier (05-10) : le coffre du projet, borné par _pj_ligne comme la fiche.
                 "/api/pj/coffre/lister", "/api/pj/coffre/lire", "/api/pj/coffre/etat", "/api/pj/coffre/ecrire", "/api/pj/coffre/deplacer", "/api/pj/coffre/dossier", "/api/pj/coffre/retirer", "/api/pj/coffre/versions", "/api/pj/coffre/version", "/api/pj/coffre/remettre", "/api/pj/coffre/index", "/api/pj/dossier/parcourir", "/api/pj/dossier/creer", "/api/pj/dossier/local", "/api/pj/dossier/corbeille", "/api/pj/coffre/fichier",
                 "/api/pj/ligne/save", "/api/pj/ligne/delete", "/api/pj/refiger",
-                "/api/pj/modeles", "/api/pj/archives", "/api/pj/supprimer",
+                "/api/pj/modeles", "/api/pj/archives", "/api/pj/supprimer", "/api/pj/corbeille/restaurer", "/api/pj/corbeille/purger",
                 "/api/pj/cadrage/proposer", "/api/pj/cadrage/appliquer",
                 "/api/itare/tasks", "/api/itare/task/save", "/api/itare/task/creneau", "/api/itare/task/context",
                 "/api/itare/task/link", "/api/itare/task/unlink", "/api/itare/task/delete",
@@ -91443,7 +91605,7 @@ class CassandraHandler(BaseHTTPRequestHandler):
                     "/api/pj/nav/fermer", "/api/pj/nav/clipper",
                     "/api/pj/coffre/lister", "/api/pj/coffre/lire", "/api/pj/coffre/etat", "/api/pj/coffre/ecrire", "/api/pj/coffre/deplacer", "/api/pj/coffre/dossier", "/api/pj/coffre/retirer", "/api/pj/coffre/versions", "/api/pj/coffre/version", "/api/pj/coffre/remettre", "/api/pj/coffre/index", "/api/pj/dossier/parcourir", "/api/pj/dossier/creer", "/api/pj/dossier/local", "/api/pj/dossier/corbeille", "/api/pj/coffre/fichier",
                     "/api/pj/ligne/save", "/api/pj/ligne/delete", "/api/pj/refiger",
-                    "/api/pj/modeles", "/api/pj/archives", "/api/pj/creer", "/api/pj/supprimer",
+                    "/api/pj/modeles", "/api/pj/archives", "/api/pj/creer", "/api/pj/supprimer", "/api/pj/corbeille/restaurer", "/api/pj/corbeille/purger",
                     # Les notes d'Itare — fiches numérotées.
                     "/api/me/agenda", "/api/me/agenda/save", "/api/me/agenda/detach",
                     "/api/me/notifs",
@@ -91737,7 +91899,8 @@ class CassandraHandler(BaseHTTPRequestHandler):
                 if path in ("/api/pj/courrier", "/api/pj/courrier/ranger", "/api/pj/courrier/piece"):
                     _cb3 = _brut_req if isinstance(_brut_req, dict) else {}
                     if path == "/api/pj/courrier":
-                        r = pj_courrier(data.get("pid"), str(_cb3.get("q", "") or ""))
+                        r = pj_courrier(data.get("pid"), str(_cb3.get("q", "") or ""),
+                                        limite=200 if _cb3.get("boite") else 80, boite=bool(_cb3.get("boite")))
                     elif path == "/api/pj/courrier/ranger":
                         r = pj_courrier_ranger(data.get("pid"), str(_cb3.get("folder", "") or ""), str(data.get("uid", "")),
                                                str(data.get("mode", "") or ""))
@@ -91888,6 +92051,9 @@ class CassandraHandler(BaseHTTPRequestHandler):
                     self.send_json(r, 200 if r.get("ok") else 400); return
                 if path == "/api/pj/supprimer":
                     r = pj_projet_supprimer(data.get("id"))
+                    self.send_json(r, 200 if r.get("ok") else 400); return
+                if path in ("/api/pj/corbeille/restaurer", "/api/pj/corbeille/purger"):
+                    r = (pj_corbeille_restaurer if path.endswith("restaurer") else pj_corbeille_purger)(data.get("pid"))
                     self.send_json(r, 200 if r.get("ok") else 400); return
                 # ── Notes d'Itare ────────────────────────────────────────────────
                 if path == "/api/notes/lister":
@@ -99301,6 +99467,14 @@ select.cv-mod{font-size:11px!important;color:var(--txt-soft)!important;
 .at-n.at-nl span{font-weight:650}
 .at-att{color:var(--warn);font-style:normal;font-size:9px;margin-left:auto;padding-left:6px}
 .at-src-b{border:0;background:none;color:var(--accent);cursor:pointer;font-size:13px;padding:0 0 0 6px}
+.at-ml-x{margin-left:auto;padding:0 4px;color:var(--txt-faint);opacity:0;cursor:pointer;font-size:11px}
+.at-n:hover .at-ml-x{opacity:1}.at-ml-x:hover{color:var(--danger)}
+.at-mb-l{margin-top:10px;max-height:min(56vh,520px);overflow:auto;border:1px solid var(--ov-08);border-radius:10px}
+.at-mb-r{display:flex;gap:10px;align-items:flex-start;padding:9px 12px;border-bottom:1px solid var(--ov-06);cursor:pointer}
+.at-mb-r:hover{background:var(--ov-04)}.at-mb-r.lie{opacity:.6;cursor:default}
+.at-mb-r input{margin-top:3px}.at-mb-t{display:flex;flex-direction:column;gap:2px;min-width:0}
+.at-mb-t b{font-weight:600;color:var(--txt-strong)}.at-mb-t em{font-style:normal;font-size:11.5px;color:var(--txt-muted)}
+.at-mb-t i{font-style:normal;font-size:11.5px;color:var(--txt-faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .at-media{display:grid;place-items:center;height:100%;padding:16px}
 .at-media img{max-width:100%;max-height:100%;object-fit:contain}
 .at-media audio{width:min(520px,90%)}
@@ -116016,6 +116190,9 @@ async function mailMediaLoad(){
             limit:MEDIA.limit, offset:MEDIA.offset});
         if(!d.ok){ r.innerHTML='<div class="empty-state" style="padding:40px">'+escapeHtml(d.reason||'échec')+'</div>'; return; }
         mailMediaRender(d);
+        // UNE LISTE VIDE N'ATTEND PAS UN CLIC (07-10) : l'index n'avait jamais tourné et rien ne le disait.
+        // Une fois par onglet, sans filtre ni recherche : on parcourt la boîte d'office.
+        if(!d.total && !MEDIA.query && !MEDIA.kind && !MEDIA.autoIndexe){ MEDIA.autoIndexe=true; mailMediaIndex(); }
     }catch(e){ r.innerHTML='<div class="empty-state" style="padding:40px">Erreur réseau</div>'; }
 }
 
@@ -116037,7 +116214,7 @@ function mailMediaRender(d){
                style="flex:1;min-width:150px;background:var(--ov-05);border:1px solid var(--ov-12);border-radius:6px;color:var(--txt-strong);font-size:11.5px;padding:6px 9px">
         <button class="s-btn mini" onclick="mailMediaSearch()">🔍</button>
         <button class="s-btn mini" id="media-idx-btn" onclick="mailMediaIndex()"
-                title="Parcourir le dossier courant pour y trouver les pièces jointes">⟳ Indexer ${escapeHtml(MAIL.folder)}</button>
+                title="Parcourir toute la boîte (corbeille et indésirables exceptés) pour y trouver les pièces jointes">⟳ Indexer la boîte</button>
       </div>
       <div style="display:flex;gap:5px;flex-wrap:wrap;padding:9px 18px;border-bottom:1px solid var(--ov-06)">
         ${onglet('','tout',total)}
@@ -116237,14 +116414,16 @@ async function mailMediaIndex(){
     const p=document.getElementById('media-progress');
     const b=document.getElementById('media-idx-btn');
     if(b) b.disabled=true;
-    if(p){ p.style.display='block'; p.textContent='Indexation de '+MAIL.folder+'…'; }
+    // TOUTE LA BOÎTE (07-10) : une boîte triée par règles range ses pièces hors d'INBOX (Envoyés, Factures…) ;
+    // n'indexer que le dossier ouvert laissait « Pièces jointes » vide. Corbeille et indésirables restent dehors.
+    if(p){ p.style.display='block'; p.textContent='Indexation de toute la boîte…'; }
     let vus=0, trouves=0;
     try{
         for(let tour=0; tour<40; tour++){
-            const d=await apiPost('/api/itare/mail/media/index',{folder:MAIL.folder, limit:25});
+            const d=await apiPost('/api/itare/mail/media/index',{folder:'*', limit:25});
             if(!d.ok){ if(p) p.textContent='Échec : '+escapeHtml(d.reason||''); break; }
             vus+=d.scanned; trouves+=d.found;
-            if(p) p.textContent='Indexation de '+MAIL.folder+' — '+vus+' message(s) lus, '+
+            if(p) p.textContent='Indexation de toute la boîte — '+vus+' message(s) lus, '+
                                 trouves+' pièce(s) trouvée(s), '+d.remaining+' restant(s).';
             if(!d.scanned || !d.remaining) break;
         }
@@ -117602,6 +117781,8 @@ function atNeuf(c){
         .forEach(function(x){ x.hidden=true; });
     // Les noms de fichiers portent des apostrophes et des espaces : ils voyagent en data-p, jamais dans un onclick.
     d.querySelector('#at-arbre').addEventListener('click',function(e){
+        const rt=e.target.closest('[data-retire]');
+        if(rt){ e.stopPropagation(); const k=rt.getAttribute('data-retire'), i=k.indexOf('/'); atMailRetirer(k.slice(0,i),k.slice(i+1),rt.getAttribute('data-sujet')||''); return; }
         const v=e.target.closest('[data-v]');
         if(v){ const x=v.getAttribute('data-v'); if(x.indexOf('::mail/')===0) atOuvrir(x); else if(x.indexOf('::note/')===0) atOuvrirNote(x.slice(7)); else if(x.indexOf('::doc/')===0) atOuvrirDoc(+x.slice(6),v.getAttribute('data-nom')); return; }
         const x=e.target.closest('[data-x]'); if(x){ e.stopPropagation(); atDossierCorbeille(x.getAttribute('data-x')); return; }
@@ -117661,18 +117842,83 @@ function _atSources(){
     if(S.boite){
         const C=S.courrier||[], M=function(f){ const v='::mail/'+f.uid+'/'+f.folder;
             return '<button class="at-n'+on(v)+(f.non_lus?' at-nl':'')+'" data-v="'+escapeAttr(v)+'" title="'+escapeAttr((f.de_nom||f.de)+' · '+f.quand+(f.n>1?' · '+f.n+' messages':''))+'">'+
-              '<b class="at-ml-i">✉</b><span>'+_pjEsc(f.sujet)+'</span>'+(f.attend?'<i class="at-att" title="Attend ta réponse">●</i>':'')+'</button>'; };
+              '<b class="at-ml-i">✉</b><span>'+_pjEsc(f.sujet)+'</span>'+(f.attend?'<i class="at-att" title="Attend ta réponse">●</i>':'')+
+              (!AT.lecture&&f.mode!=='ecarte'?'<span class="at-ml-x" role="button" data-retire="'+escapeAttr(f.uid+'/'+f.folder)+'" data-sujet="'+escapeAttr(f.sujet)+'" title="Retirer du projet">✕</span>':'')+'</button>'; };
         h+='<div class="at-src"><span>✉ Courrier</span><span class="pj-f-d">'+C.length+' <button class="at-src-b" onclick="atMailChercher()" title="Ranger un courriel de votre boîte dans le projet">＋</button></span></div>';
         h+=C.length?C.map(M).join(''):'<div class="at-m">Aucun courriel avec les personnes du projet. ＋ pour en ranger un.</div>';
         if(AT.mailRes) h+='<div class="at-m">Dans votre boîte — ouvrez-le, puis « Ranger dans le projet » :</div>'+(AT.mailRes.length?AT.mailRes.map(M).join(''):'<div class="at-m">Rien trouvé.</div>');
     }
     return h;
 }
+// LE SÉLECTEUR DE COURRIEL (07-10, « un menu déroulant qui liste notre boîte ») : il fallait taper l'objet EXACT
+// pour joindre un courriel. La feuille montre d'office les derniers fils de la boîte (corbeille et indésirables
+// exceptés), filtre au fil de la frappe — objet, personnes, texte — et joint d'un coup ce qu'on a coché.
+// La sélection vit dans AT.mailSel : la feuille se ferme AVANT d'appeler son bouton, les cases avec elle.
 async function atMailChercher(){
-    const q=await buSaisir('Chercher dans votre boîte (objet, expéditeur) :'); if(!q||!q.trim()) return;
-    let r=null; try{ r=await apiPost('/api/pj/courrier',{pid:AT.pid,q:q.trim()}); }catch(e){}
-    AT.mailRes=(r&&r.ok)?(r.fils||[]):[];
+    AT.mailSel={};
+    ntFeuille({titre:'Joindre des courriels au projet',
+        sous:'Votre boîte, du plus récent au plus ancien — cochez, puis « Joindre ». Corbeille et indésirables exceptés.',
+        html:'<input class="bu-inp" id="at-mb-q" placeholder="Filtrer : objet, expéditeur, destinataire, texte…" autocomplete="off" style="width:100%">'+
+             '<div id="at-mb-l" class="at-mb-l"><div class="at-m">Lecture de la boîte…</div></div>',
+        boutons:[{label:'Joindre au projet', cls:'pri', onclick:atMailJoindre}]});
+    const q=document.getElementById('at-mb-q'), l=document.getElementById('at-mb-l');
+    let t=null;
+    q.addEventListener('input',function(){ clearTimeout(t); t=setTimeout(function(){ _atMbCharger(q.value.trim()); },250); });
+    l.addEventListener('change',function(e){
+        const c=e.target.closest('input[data-k]'); if(!c) return;
+        AT.mailSel[c.getAttribute('data-k')]=c.checked?{uid:c.getAttribute('data-u'),folder:c.getAttribute('data-f')}:null;
+        _atMbCompte();
+    });
+    _atMbCompte(); q.focus(); _atMbCharger('');
+}
+function _atMbCompte(){
+    const n=Object.keys(AT.mailSel||{}).filter(function(k){ return AT.mailSel[k]; }).length, b=document.getElementById('nt-fx-b0');
+    if(b){ b.textContent=n?'Joindre au projet ('+n+')':'Joindre au projet'; b.disabled=!n; }
+}
+async function _atMbCharger(q){
+    const l=document.getElementById('at-mb-l'); if(!l) return;
+    const tour=(AT._mbTour=(AT._mbTour||0)+1);
+    let r=null; try{ r=await apiPost('/api/pj/courrier',{pid:AT.pid,q:q,boite:true}); }catch(e){}
+    if(tour!==AT._mbTour||!document.getElementById('at-mb-l')) return;     // une frappe plus récente a la main
+    if(!r||!r.ok){ l.innerHTML='<div class="at-m">'+_pjEsc((r&&r.reason)||'boîte illisible')+'</div>'; return; }
+    if(!r.boite){ l.innerHTML='<div class="at-m">Aucune boîte mail reliée à ce compte.</div>'; return; }
+    const F=r.fils||[];
+    l.innerHTML=F.length?F.map(function(f){
+        const lie=f.mode==='lie', sel=!!(AT.mailSel||{})[f.cle];
+        const dos=String(f.folder||'').replace(/^INBOX(\.INBOX)?\.?/,'')||'Réception';
+        return '<label class="at-mb-r'+(lie?' lie':'')+'"><input type="checkbox" data-k="'+escapeAttr(f.cle)+'" data-u="'+escapeAttr(f.uid)+'" data-f="'+escapeAttr(f.folder)+'"'+
+          (lie?' checked disabled title="Déjà dans le projet"':(sel?' checked':''))+'>'+
+          '<span class="at-mb-t"><b>'+_pjEsc(f.sujet)+'</b>'+(f.pj?' 📎':'')+
+          '<em>'+_pjEsc(f.de_nom||f.de)+' · '+_pjEsc(f.quand)+(f.n>1?' · '+f.n+' messages':'')+' · '+_pjEsc(dos)+(lie?' · déjà dans le projet':'')+'</em>'+
+          (f.apercu?'<i>'+_pjEsc(String(f.apercu).slice(0,110))+'</i>':'')+'</span></label>';
+      }).join(''):'<div class="at-m">Rien trouvé'+(q?' pour « '+_pjEsc(q)+' »':'')+'.</div>';
+}
+async function atMailJoindre(){
+    const L=Object.keys(AT.mailSel||{}).map(function(k){ return AT.mailSel[k]; }).filter(Boolean);
+    if(!L.length) return;
+    let ok=0, ko='';
+    for(const m of L){
+        let r=null; try{ r=await apiPost('/api/pj/courrier/ranger',{pid:AT.pid,uid:m.uid,folder:m.folder,mode:'lie'}); }catch(e){}
+        if(r&&r.ok) ok++; else ko=(r&&r.reason)||'échec';
+    }
+    AT.mailSel={}; await _atMailRafraichir();
+    if(typeof showToast==='function') showToast(ok+' courriel'+(ok>1?'s':'')+' joint'+(ok>1?'s':'')+' au projet'+(ko?' — un refus : '+ko:''),ko?'error':'success');
+}
+async function _atMailRafraichir(){
+    AT.mailRes=null; AT.src=null;
+    try{ const s=await apiPost('/api/pj/atelier/sources',{pid:AT.pid}); AT.src=Object.assign({pid:AT.pid},(s&&s.ok)?s:{}); }catch(e){}
     AT.noeud.querySelector('#at-arbre').innerHTML=_atBranche('')+_atSources();
+    const d=AT.doc; if(d&&d.genre==='mail'&&d.mail) AT.noeud.querySelector('#at-ed').innerHTML=_atMailRendu(d.mail);
+}
+// DÉTACHER D'UN CLIC (07-10, « aucun moyen de le dissocier en cas d'erreur ») : ✕ sur chaque courriel de la liste.
+// « Écarté », pas seulement délié : un fil avec les personnes du projet reviendrait sinon tout seul.
+async function atMailRetirer(uid, folder, sujet){
+    if(!await buConfirmer('Retirer « '+sujet+' » du projet ?\n\nLe courriel reste dans votre boîte ; il ne s\'affiche plus dans ce projet. '+
+                          'On le rejoint de nouveau avec ＋.')) return;
+    let r=null; try{ r=await apiPost('/api/pj/courrier/ranger',{pid:AT.pid,uid:uid,folder:folder,mode:'ecarte'}); }catch(e){}
+    if(!r||!r.ok){ if(typeof showToast==='function') showToast((r&&r.reason)||'échec','error'); return; }
+    await _atMailRafraichir();
+    if(typeof showToast==='function') showToast('Retiré du projet','success');
 }
 async function atOuvrirMail(uid,folder){
     if(AT.sale&&!(await atEnregistrer())) return;
@@ -117699,13 +117945,14 @@ async function atOuvrirMail(uid,folder){
 }
 function _atMailFil(){
     const d=AT.doc||{};
-    return ((AT.src||{}).courrier||[]).filter(function(f){ return f.uid===d.uid&&f.folder===d.folder; })[0]||null;
+    const k=d.uid+'/'+d.folder;
+    return ((AT.src||{}).courrier||[]).filter(function(f){ return (f.uid===d.uid&&f.folder===d.folder)||(f.msgs||[]).indexOf(k)>=0; })[0]||null;
 }
 function _atMailRendu(m){
     const peut=!AT.lecture, f=_atMailFil();
     const pj=(m.attachments||[]).map(function(a){ return '<span class="at-ml-pj">📎 '+_pjEsc(a.filename)+
         (peut?' <button class="pj-lien" onclick="atMailPiece('+(+a.index||0)+',this)">→ Documents du projet</button>':'')+'</span>'; }).join('');
-    const ranger=f?(f.mode==='lie'?['','Retirer du projet']:['ecarte','Écarter du projet']):['lie','Ranger dans le projet'];
+    const ranger=f?['ecarte','Retirer du projet']:['lie','Ranger dans le projet'];
     return '<div class="at-ml"><h3>'+_pjEsc(m.subject||'(sans objet)')+'</h3>'+
       '<div class="at-ml-m"><b>'+_pjEsc(m.from||'')+'</b> · '+_pjEsc(String(m.date_iso||m.date||'').slice(0,16))+'</div>'+
       '<div class="at-ml-m">À : '+_pjEsc(m.to||'')+(m.cc?' · Cc : '+_pjEsc(m.cc):'')+'</div>'+
@@ -117789,7 +118036,7 @@ async function atMailRanger(mode){
     try{ const s=await apiPost('/api/pj/atelier/sources',{pid:AT.pid}); AT.src=Object.assign({pid:AT.pid},(s&&s.ok)?s:{}); }catch(e){}
     AT.noeud.querySelector('#at-arbre').innerHTML=_atBranche('')+_atSources();
     if(d.mail) AT.noeud.querySelector('#at-ed').innerHTML=_atMailRendu(d.mail);
-    if(typeof showToast==='function') showToast(mode==='lie'?'Rangé dans le projet':(mode==='ecarte'?'Écarté du projet':'Rendu au tri automatique'),'success');
+    if(typeof showToast==='function') showToast(mode==='lie'?'Rangé dans le projet':(mode==='ecarte'?'Retiré du projet':'Rendu au tri automatique'),'success');
 }
 async function atOuvrirNote(ref){
     if(AT.sale&&!(await atEnregistrer())) return;
@@ -119308,12 +119555,12 @@ async function pjArchiver(){
 async function pjSupprimerProjet(){
     if(!ETAT.projets._pjSel) return;
     const _nm=((ETAT.projets._pjCtx||{}).projet||{}).name||'ce projet';
-    if(!await buConfirmer('Supprimer définitivement « '+_nm+' » ?\n\nSa fiche part : phases, étapes, décisions, Fil et '+
-                          'rattachements. Ses tâches restent, détachées.\n\nSon DOSSIER et ses notes ne sont pas touchés : ils restent '+
-                          'sur leur machine, et un nouveau projet peut s\'y rattacher.')) return;
+    if(!await buConfirmer('Supprimer « '+_nm+' » ?\n\nLe projet part dans la corbeille : Suivre › Ranger › Projets supprimés. '+
+                          'Il s\'y restaure d\'un clic, avec ses phases, étapes, décisions et tâches.\n\nSon DOSSIER et ses notes ne sont pas touchés.')) return;
     try{
         const r=await apiPost('/api/pj/supprimer',{id:ETAT.projets._pjSel});
         if(!r||!r.ok){ buDire((r&&r.reason)||'échec'); return; }
+        if(typeof toast==='function') toast('« '+_nm+' » est dans la corbeille de Ranger');
     }catch(e){ buDire('Erreur : '+e.message); return; }
     ETAT.projets._pjSel=null; ETAT.projets._pjCtx=null;
     await pjCharger(); pjVue('porte');
@@ -131846,7 +132093,23 @@ function rgRendre(){
         '<div class="card"><div class="bu-ct">Archivés<span class="tk-chipf" style="margin-left:6px">'+(d.archives||[]).length+'</span></div>'+
           ((d.archives||[]).length?(d.archives||[]).map(function(x){ return '<div class="rg-mini"><span>'+escapeHtml(x.titre)+'</span><em>'+(x.le?'archivé le '+escapeHtml(x.le)+' · ':'')+
             '<button class="btn-x mini" onclick="rgProjet('+x.id+')">Ouvrir</button></em></div>'; }).join(''):'<p class="bu-note" style="padding:10px 16px">Aucun projet archivé.</p>')+'</div>'+
+        // LES PROJETS SUPPRIMÉS (07-10) : une suppression par erreur se rattrape ici, sous le même numéro.
+        '<div class="card"><div class="bu-ct">Projets supprimés<span class="tk-chipf" style="margin-left:6px">'+(d.projets_supprimes||[]).length+'</span></div>'+
+          ((d.projets_supprimes||[]).length?(d.projets_supprimes||[]).map(function(x){ return '<div class="rg-mini"><span>'+escapeHtml(x.nom)+'</span><em>supprimé le '+
+            escapeHtml(String(x.supprime_le||'').slice(0,16))+' · <button class="btn-x mini" onclick="rgProjetRestaurer('+(+x.pid)+')">Restaurer</button> '+
+            '<button class="btn-x mini dgr" onclick="rgProjetPurger('+(+x.pid)+',\''+escapeAttr(x.nom)+'\')" title="Effacer pour de bon">Supprimer définitivement</button></em></div>'; }).join(''):
+            '<p class="bu-note" style="padding:10px 16px">Aucun projet supprimé.</p>')+'</div>'+
       '</div></div>';
+}
+async function rgProjetRestaurer(pid){
+    const r=await apiPost('/api/pj/corbeille/restaurer',{pid:pid});
+    if(r&&r.ok){ toast('Projet restauré : '+(r.nom||'')); try{ await pjCharger(); }catch(e){} rgEcran(); }
+    else toast((r&&(r.reason||r.error))||'Restauration refusée','err');
+}
+async function rgProjetPurger(pid, nom){
+    if(!await buConfirmer('Supprimer définitivement « '+nom+' » ?\n\nSa fiche, ses phases, jalons et décisions ne pourront plus être restaurés.\nSon dossier et ses notes ne sont pas touchés.')) return;
+    const r=await apiPost('/api/pj/corbeille/purger',{pid:pid});
+    if(r&&r.ok){ toast('Projet effacé pour de bon'); rgEcran(); } else toast((r&&(r.reason||r.error))||'Refusé','err');
 }
 function rgLire(ref){ ETAT.notes._ntSel=ref; ETAT.notes._ntVue='biblio'; suAller('notes'); }
 async function rgJeter(ref){
