@@ -240,6 +240,7 @@ def init_all_tables():
         CREATE TABLE IF NOT EXISTS correlations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, entite TEXT, alerte TEXT, causes TEXT);
         CREATE TABLE IF NOT EXISTS paquets_curseur (source TEXT PRIMARY KEY, inode INTEGER, position INTEGER);
         CREATE TABLE IF NOT EXISTS controles (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, ok INTEGER, valeur TEXT, last_check TEXT);
+        CREATE TABLE IF NOT EXISTS mesures_diverses (id INTEGER PRIMARY KEY AUTOINCREMENT, cle TEXT UNIQUE, categorie TEXT, valeur TEXT, severite TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS logiciels (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, installe INTEGER, chemin TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS apt_updates (id INTEGER PRIMARY KEY AUTOINCREMENT, total INTEGER, securite INTEGER, paquets TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS system_state (id INTEGER PRIMARY KEY AUTOINCREMENT, uptime_s INTEGER, reboot_required INTEGER, reboot_pkgs TEXT, tailscale TEXT, tailscale_ip TEXT, last_check TEXT);
@@ -3051,14 +3052,28 @@ def collect_ssh_authorized_keys():
 
 
 def collect_firewall_rules():
+    """Les RÈGLES, pas les en-têtes de chaîne (08-10 : « Chain INPUT (policy ACCEPT) » comptait comme une règle) ;
+    iptables (forme -S) et nftables (Orion filtre en nft : le relevé ne voyait rien de ses 84 règles)."""
     rules = []
     now = datetime.now().isoformat()
-    out = run_cmd("iptables -L -n")
-    for line in out.splitlines():
-        if "ACCEPT" in line or "DROP" in line or "REJECT" in line:
-            rules.append({"tool": "iptables",
-                          "action": "ALLOW" if "ACCEPT" in line else "DENY",
-                          "raw": line[:200], "last_check": now})
+    for l in (run_cmd(["iptables", "-S"], timeout=10) or "").splitlines() if _qui("iptables") else []:
+        if l.startswith("-A "):
+            act = "DENY" if re.search(r"-j (DROP|REJECT)", l) else ("ALLOW" if "-j ACCEPT" in l else "AUTRE")
+            m = re.search(r"--dport (\d+)", l)
+            rules.append({"tool": "iptables", "chain": l.split()[1], "action": act, "port": m.group(1) if m else "",
+                          "raw": l[:200], "last_check": now})
+    if _qui("nft"):
+        chaine = ""
+        for l in (run_cmd(["nft", "list", "ruleset"], timeout=10) or "").splitlines():
+            t = l.strip()
+            if t.startswith("chain "):
+                chaine = t.split()[1]
+            elif t and not t.startswith(("table ", "chain ", "type ", "policy ", "}", "#", "set ", "elements", "flags ", "counter packets")) \
+                    and re.search(r"\b(accept|drop|reject|jump|goto|return|dnat|snat|masquerade)\b", t):
+                act = "DENY" if re.search(r"\b(drop|reject)\b", t) else ("ALLOW" if " accept" in " " + t else "AUTRE")
+                m = re.search(r"dport (\d+)", t)
+                rules.append({"tool": "nftables", "chain": chaine, "action": act, "port": m.group(1) if m else "",
+                              "raw": t[:200], "last_check": now})
     return rules
 
 
@@ -3964,6 +3979,126 @@ def collect_controles() -> list:
     return out
 
 
+# ============================================================
+# LES MESURES QUI MANQUAIENT (08-10)
+# ============================================================
+# Chaque collecteur rend des lignes {cle, categorie, valeur, severite} ; le modèle du monde les reprend telles
+# quelles sous `<cle>`. File d'attente du courrier, connexions SSH ratées, ressources de chaque conteneur,
+# renouvellement des certificats, poids des journaux.
+def _mesure(cle, cat, val, sev="info"):
+    return {"cle": cle, "categorie": cat, "valeur": str(val)[:300], "severite": sev, "last_check": datetime.now().isoformat()}
+
+
+def collect_file_courriel() -> list:
+    """Les messages coincés au départ (exim, postfix) : un serveur qui n'arrive plus à envoyer ne le dit à personne."""
+    if _qui("exim"):
+        n = (run_cmd(["exim", "-bpc"], timeout=15) or "").strip()
+        if n.isdigit():
+            n = int(n)
+            gel = len([l for l in (run_cmd(["exim", "-bp"], timeout=15) or "").splitlines() if "*** frozen ***" in l]) if n else 0
+            return [_mesure("courriel.file_attente", "courriel", "%d message%s en attente (exim)%s" % (n, "s" if n > 1 else "", ", dont %d gelés" % gel if gel else ""),
+                            "warning" if n >= 50 or gel else "info")]
+    if _qui("postqueue"):
+        sortie = run_cmd(["postqueue", "-p"], timeout=15) or ""
+        if "Mail queue is empty" in sortie:
+            return [_mesure("courriel.file_attente", "courriel", "0 message en attente (postfix)")]
+        m = re.search(r"in (\d+) Request", sortie)
+        n = int(m.group(1)) if m else 0
+        return [_mesure("courriel.file_attente", "courriel", "%d messages en attente (postfix)" % n, "warning" if n >= 50 else "info")]
+    return []
+
+
+def collect_ssh_echecs() -> list:
+    """Connexions SSH ratées sur l'heure écoulée, et les adresses qui insistent le plus."""
+    texte = ""
+    if _qui("journalctl"):
+        for unite in ("ssh", "sshd"):
+            texte += run_cmd(["journalctl", "-u", unite, "--since", "-1h", "--no-pager", "-q", "-o", "cat"], timeout=20) or ""
+    else:
+        for f in ("/var/log/auth.log", "/var/log/secure"):
+            try:
+                texte += "\n".join(Path(f).read_text(errors="replace").splitlines()[-5000:])
+            except Exception:
+                pass
+    echecs = re.findall(r"(?:Failed password|Invalid user|authentication failure|Connection closed by authenticating user)[^\n]*?from (\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f:]{6,})", texte)
+    par_ip = {}
+    for ip in echecs:
+        par_ip[ip] = par_ip.get(ip, 0) + 1
+    top = sorted(par_ip.items(), key=lambda x: -x[1])[:3]
+    val = "%d échec%s en 1 h" % (len(echecs), "s" if len(echecs) > 1 else "") + ((" · surtout %s" % ", ".join("%s (%d)" % t for t in top)) if top else "")
+    return [_mesure("ssh.echecs", "security", val, "warning" if len(echecs) >= 50 else "info")]
+
+
+def collect_docker_ressources() -> list:
+    """CPU et mémoire de chaque conteneur (un instantané, sans flux)."""
+    moteur = "docker" if _qui("docker") else ("podman" if _qui("podman") else "")
+    if not moteur:
+        return []
+    out = []
+    for l in (run_cmd([moteur, "stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}"], timeout=30) or "").splitlines():
+        p = l.split("|")
+        if len(p) >= 4:
+            try:
+                mp = float(p[3].strip().rstrip("%") or 0)
+            except ValueError:
+                mp = 0
+            out.append(_mesure("conteneur_ressources.%s" % p[0].strip(), "resource",
+                               "CPU %s · mémoire %s (%s)" % (p[1].strip(), p[2].strip(), p[3].strip()), "warning" if mp >= 90 else "info"))
+    return out
+
+
+def collect_certbot() -> list:
+    """Le renouvellement automatique des certificats : dernier passage, résultat, certificats suivis."""
+    out = []
+    ren = Path("/etc/letsencrypt/renewal")
+    n = len(list(ren.glob("*.conf"))) if ren.is_dir() else 0
+    if _qui("systemctl"):
+        info = dict(x.split("=", 1) for x in (run_cmd(["systemctl", "show", "certbot.service", "-p", "Result,ExecMainExitTimestamp,LoadState"], timeout=5) or "").splitlines() if "=" in x)
+        if info.get("LoadState") == "loaded":
+            ok = info.get("Result") == "success"
+            out.append(_mesure("certbot.renouvellement", "security",
+                               "%s · dernier passage %s · %d certificat%s suivi%s" % ("réussi" if ok else "ÉCHEC (" + info.get("Result", "?") + ")",
+                                                                                   (info.get("ExecMainExitTimestamp") or "jamais")[:30], n, "s" if n > 1 else "", "s" if n > 1 else ""),
+                               "info" if ok else "warning"))
+    if not out and n:
+        out.append(_mesure("certbot.renouvellement", "security", "%d certificat%s certbot suivi%s (planification hors systemd)" % (n, "s" if n > 1 else "", "s" if n > 1 else "")))
+    return out
+
+
+def collect_journaux_poids() -> list:
+    """Le poids des journaux : un journal qui gonfle remplit un disque sans bruit."""
+    out = []
+    if _qui("journalctl"):
+        m = re.search(r"take up ([\d.]+[KMGT])", run_cmd(["journalctl", "--disk-usage"], timeout=10) or "")
+        if m:
+            out.append(_mesure("journaux.journald", "resource", "%so sur le disque" % m.group(1), "warning" if m.group(1).endswith(("G", "T")) and float(m.group(1)[:-1]) >= 4 else "info"))
+    gros = []
+    try:
+        for f in Path("/var/log").rglob("*"):
+            try:
+                if f.is_file() and f.stat().st_size >= 500 * 1048576:
+                    gros.append((f.stat().st_size, str(f)))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    gros.sort(reverse=True)
+    out.append(_mesure("journaux.fichiers_lourds", "resource",
+                       ("; ".join("%s (%.1f Go)" % (pth, t / 1073741824) for t, pth in gros[:3])) if gros else "aucun fichier de plus de 500 Mo dans /var/log",
+                       "warning" if gros and gros[0][0] >= 2 * 1073741824 else "info"))
+    return out
+
+
+def collect_mesures_diverses() -> list:
+    rows = []
+    for fn in (collect_file_courriel, collect_ssh_echecs, collect_docker_ressources, collect_certbot, collect_journaux_poids):
+        try:
+            rows.extend(fn() or [])
+        except Exception as e:
+            print(f"[MESURES] {fn.__name__} : {e}", file=sys.stderr)
+    return rows
+
+
 # PERF[O3]: save_many() — INSERT ligne par ligne → executemany() en batch.
 # Avant : N appels conn.execute() individuels dans une boucle for.
 # Après : 1 appel conn.executemany() avec toutes les valeurs d'un coup.
@@ -4167,7 +4302,7 @@ def detect_diff(entity_type: str, current_names: list):
 # LE JOURNAL DES CHANGEMENTS DIT CE QUI CHANGE D'ÉTAT, PAS CE QUI BOUGE (08-10) : la charge CPU qui passe de
 # 2 % à 3 % écrivait une ligne toutes les 30 s — 7 193 par jour, qui noyaient les vrais changements (un
 # service tombé, un port ouvert). Une mesure continue n'entre au journal que si sa GRAVITÉ change.
-_WORLD_CONTINUS = ("resource", "prevision", "controle")
+_WORLD_CONTINUS = ("resource", "prevision", "controle", "erreurs")
 _WORLD_CONTINUS_CLES = ("system.uptime",)
 
 
@@ -4511,6 +4646,77 @@ def build_world_model():
                 U("system.pare_feu", "security", r["pare_feu"], divers, "warning" if r["pare_feu"] == "aucune règle" else "info")
             if r["securite_noyau"]:
                 U("system.protection_noyau", "security", r["securite_noyau"], divers)
+
+        # Mesures diverses (courriel, SSH, conteneurs, certbot, journaux)
+        def _diverses(lignes, vus):
+            for r in lignes:
+                U(r["cle"], r["categorie"] or "divers", r["valeur"], vus, r["severite"] or "info")
+        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux."):
+            _famille(_pref, _q("SELECT cle, categorie, valeur, severite FROM mesures_diverses WHERE cle LIKE ?", _pref + "%"), _diverses)
+
+        # Clés SSH autorisées, une par une : une clé ajoutée ou retirée entre au journal des changements
+        def _cles(lignes, vus):
+            for r in lignes:
+                U("cle_ssh.%s.%s" % (r["user"], r["key_hash"][:8]), "security", "%s %s" % (r["key_type"], r["comment"] or "(sans commentaire)"), vus)
+        _famille("cle_ssh.", _q("SELECT user, key_type, key_hash, comment FROM ssh_authorized_keys"), _cles)
+
+        # Pare-feu : le nombre de règles par outil, et ce qu'elles bloquent
+        def _parefeu(lignes, vus):
+            par = {}
+            for r in lignes:
+                t = r["tool"] or "?"
+                d = par.setdefault(t, {"n": 0, "bloque": set()})
+                d["n"] += 1
+                if r["action"] == "DENY" and r["port"]:
+                    d["bloque"].add(r["port"])
+            for t, d in par.items():
+                U("pare_feu.%s" % t, "security", "%d règles%s" % (d["n"], (" · bloque les ports %s" % ", ".join(sorted(d["bloque"], key=lambda x: int(x))[:10])) if d["bloque"] else ""), vus)
+        _famille("pare_feu.", _q("SELECT tool, action, port FROM firewall_rules"), _parefeu)
+
+        # Fail2ban : les adresses bannies maintenant, par prison
+        def _f2b(lignes, vus):
+            par = {}
+            for r in lignes:
+                par[r["jail"]] = par.get(r["jail"], 0) + 1
+            for j, n in par.items():
+                U("fail2ban.%s" % j, "security", "%d adresse%s bannie%s" % (n, "s" if n > 1 else "", "s" if n > 1 else ""), vus)
+            if not par:
+                U("fail2ban.total", "security", "aucune adresse bannie" if _qui("fail2ban-client") else "fail2ban absent", vus)
+        _famille("fail2ban.", _q("SELECT jail FROM fail2ban_banned_ips"), _f2b)
+
+        # Tâches planifiées, par propriétaire
+        def _crons(lignes, vus):
+            par = {}
+            for r in lignes:
+                par[r["user"] or "?"] = par.get(r["user"] or "?", 0) + 1
+            for u_, n in par.items():
+                U("cron.%s" % u_, "system", "%d tâche%s planifiée%s" % (n, "s" if n > 1 else "", "s" if n > 1 else ""), vus)
+        _famille("cron.", _q("SELECT user FROM cron_jobs"), _crons)
+
+        # FastPanel : comptes, bases (et leur taille), boîtes mail (et leur remplissage), FTP
+        fpv = set()
+        for r in _q("SELECT username, status, sites_count, databases_count FROM fastpanel_users")[0]:
+            U("fastpanel.compte.%s" % r["username"], "fastpanel", "%s · %s site(s) · %s base(s)" % (r["status"] or "?", r["sites_count"] or 0, r["databases_count"] or 0), fpv)
+        for r in _q("SELECT name, size_mb, owner, site FROM fastpanel_databases")[0]:
+            U("fastpanel.base.%s" % r["name"], "fastpanel", "%.1f Mo · %s%s" % (float(r["size_mb"] or 0), r["owner"] or "?", (" · " + r["site"]) if r["site"] else ""), fpv)
+        for r in _q("SELECT email, quota_mb, used_mb, status FROM fastpanel_mail_accounts")[0]:
+            q_, u_ = float(r["quota_mb"] or 0), float(r["used_mb"] or 0)
+            pct = (100 * u_ / q_) if q_ else 0
+            U("fastpanel.boite.%s" % r["email"], "fastpanel", "%.0f Mo%s · %s" % (u_, (" sur %.0f (%.0f %%)" % (q_, pct)) if q_ else "", r["status"] or "?"), fpv,
+              "warning" if pct >= 90 else "info")
+        n_ftp = _q("SELECT COUNT(*) AS n FROM fastpanel_ftp_accounts")[0]
+        if n_ftp:
+            U("fastpanel.ftp", "fastpanel", "%d compte(s) FTP" % n_ftp[0]["n"], fpv)
+        if _q("SELECT COUNT(*) FROM fastpanel_users")[1]:
+            familles_ok.append(("fastpanel.", fpv))
+
+        # Erreurs des journaux sur l'heure écoulée, par service (la courbe existait, le modèle ne la voyait pas)
+        def _erreurs(lignes, vus):
+            for r in lignes:
+                U("erreurs.%s" % r["service"], "erreurs", "%d erreur%s dans l'heure" % (r["n"], "s" if r["n"] > 1 else ""), vus,
+                  "warning" if r["n"] >= 30 else "info")
+        _depuis = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        _famille("erreurs.", _q("SELECT service, SUM(COALESCE(count,1)) AS n FROM log_errors WHERE ts >= ? GROUP BY service", _depuis), _erreurs)
 
         # Contrôles de bout en bout
         def _controles(lignes, vus):
@@ -5042,6 +5248,9 @@ class KnowledgeCollector:
                         ("hardware_state",         collect_hardware_state),
                         ("backups_state",          collect_backups),
                         ("controles",              collect_controles),
+                        ("mesures_diverses",       collect_mesures_diverses),
+                        ("firewall_rules",         collect_firewall_rules),
+                        ("ssh_authorized_keys",    collect_ssh_authorized_keys),
                     ]
                     full_results = self._run_parallel(full_tasks, max_workers=8, periode_s=300)
                     for table, data in full_results.items():

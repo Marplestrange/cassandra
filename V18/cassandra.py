@@ -18819,6 +18819,19 @@ def _perception_monde(q: str, deja: set, limite: int = 12, stricte: bool = False
             "system.tailscale": ("tailscale de cette machine", ("tailscale",)),
             "maj.paquets": ("mises à jour", ("mise à jour", "mises à jour", "mise a jour", "paquet", "apt ", "upgrade")),
             "systemd.failed_units": ("services en échec", ("échec", "echec", "failed", "planté"))}
+    _FAMILLES_MOTS = {
+        "courriel.": ("courriel", ("file d'attente", "mail bloqu", "mails bloqu", "courriel", "exim", "postfix", "gelé")),
+        "ssh.": ("ssh", ("ssh", "intrusion", "connexion ratée", "connexions ratées", "brute")),
+        "cle_ssh.": ("clé ssh", ("clé ssh", "cles ssh", "clés ssh", "authorized_keys", "qui peut se connecter")),
+        "pare_feu.": ("pare-feu", ("pare-feu", "firewall", "iptables", "nftables")),
+        "fail2ban.": ("fail2ban", ("fail2ban", "banni", "bannie")),
+        "cron.": ("crons de", ("cron", "tâche planifiée", "tâches planifiées")),
+        "fastpanel.": ("fastpanel", ("fastpanel", "compte ftp", "base de données", "bases de données", "boîte mail", "boîtes mail")),
+        "erreurs.": ("erreurs de", ("erreur", "plantage", "journal", "journaux", "log")),
+        "conteneur_ressources.": ("ressources du conteneur", ("conteneur", "docker", "consomme")),
+        "certbot.": ("certbot", ("certbot", "renouvel", "let's encrypt", "letsencrypt")),
+        "journaux.": ("journaux", ("journaux", "logs", "journald", "taille des log")),
+    }
 
     for r in rows:
         wk, cat, val, ts = str(r.get("wkey") or ""), str(r.get("category") or ""), str(r.get("value") or ""), r.get("observed_at")
@@ -18886,6 +18899,13 @@ def _perception_monde(q: str, deja: set, limite: int = 12, stricte: bool = False
             _m, _cle = wk.split(".", 2)[1], wk.split(".", 2)[2]
             if _cite(_m):
                 _ajouter("%s · %s" % (_m, _cle.replace("_", " ")), val, ts, PERCEPTION_TTL["machine_flotte"])
+        elif any(wk.startswith(p_) for p_ in _FAMILLES_MOTS):
+            # 08-10 : les mesures qui manquaient — courriel, SSH, clés, pare-feu, fail2ban, crons, FastPanel,
+            # erreurs des journaux, conteneurs, certificats, journaux
+            p_ = next(p_ for p_ in _FAMILLES_MOTS if wk.startswith(p_))
+            libelle, mots = _FAMILLES_MOTS[p_]
+            if _cite(wk[len(p_):]) or _mot(*mots):
+                _ajouter("%s %s" % (libelle, wk[len(p_):].replace("_", " ")), val, ts, PERCEPTION_TTL["systeme"])
         elif wk in _SYS:
             libelle, mots = _SYS[wk]
             if _mot(*mots):
@@ -114887,11 +114907,13 @@ const _MX_JOURS=['dim.','lun.','mar.','mer.','jeu.','ven.','sam.'];
 const SN = {etat:null, vue:'maintenant', fam:null};
 const SN_FAMILLES = [
   ['system','Système','system.'], ['ressources','Ressources','cpu.|ram.|swap.|load.|disk.|montage.'], ['service','Services','service.|systemd.'],
-  ['docker','Conteneurs','docker.'], ['web','Sites','web.'], ['controle','Contrôles de bout en bout','controle.'],
+  ['docker','Conteneurs','docker.|conteneur_ressources.'], ['web','Sites','web.'], ['controle','Contrôles de bout en bout','controle.'],
   ['ssl','Certificats','ssl.'], ['sauvegarde','Sauvegardes','sauvegarde.'], ['prevision','Ce qui va arriver','prevision.'],
   ['flotte','Flotte','fleet.|machine.'], ['config','Config de Cassandra','config.'], ['logiciel','Logiciels','logiciel.'],
   ['reseau','Réseau','interface.|port.'], ['stockage','Stockage','stockage.'], ['securite','Sécurité','security.'],
-  ['maj','Mises à jour','maj.'], ['capteur','Capteurs','capteur.'], ['sante','Santé','health.']
+  ['maj','Mises à jour','maj.'], ['courriel','Courriel','courriel.'], ['acces','Accès et pare-feu','ssh.|cle_ssh.|pare_feu.|fail2ban.'],
+  ['cron','Tâches planifiées','cron.'], ['fastpanel','FastPanel','fastpanel.'], ['erreurs','Erreurs des journaux','erreurs.|journaux.'],
+  ['certbot','Renouvellement des certificats','certbot.'], ['capteur','Capteurs','capteur.'], ['sante','Santé','health.']
 ];
 function _snE(t){ return (typeof flE==='function') ? flE(t) : String(t==null?'':t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function _snFam(wk){ for(const f of SN_FAMILLES){ if(f[2].split('|').some(p=>wk.startsWith(p))) return f[0]; } return 'autre'; }
