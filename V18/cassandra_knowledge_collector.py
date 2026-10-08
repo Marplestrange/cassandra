@@ -229,6 +229,17 @@ def init_all_tables():
         CREATE TABLE IF NOT EXISTS storage_health (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, type TEXT, etat TEXT, detail TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS interfaces (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, etat TEXT, adresses TEXT, route_defaut INTEGER, last_check TEXT);
         CREATE TABLE IF NOT EXISTS hardware_state (id INTEGER PRIMARY KEY AUTOINCREMENT, temp_max REAL, batterie TEXT, heure_synchro TEXT, fuseau TEXT, os TEXT, arch TEXT, virtualisation TEXT, pare_feu TEXT, securite_noyau TEXT, last_check TEXT);
+        CREATE TABLE IF NOT EXISTS sensor_health (famille TEXT PRIMARY KEY, periode_s INTEGER, dernier_ok TEXT, derniere_erreur TEXT, erreur TEXT, n_lignes INTEGER, n_precedent INTEGER, duree_ms INTEGER);
+        CREATE TABLE IF NOT EXISTS mounts_history (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, mountpoint TEXT, used_gb REAL, total_gb REAL);
+        CREATE INDEX IF NOT EXISTS idx_mounts_history ON mounts_history(mountpoint, ts);
+        CREATE TABLE IF NOT EXISTS proc_mem_history (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, nom TEXT, rss_mb REAL);
+        CREATE INDEX IF NOT EXISTS idx_proc_mem_history ON proc_mem_history(nom, ts);
+        CREATE TABLE IF NOT EXISTS projections (cle TEXT PRIMARY KEY, valeur TEXT, severite TEXT, detail TEXT, last_check TEXT);
+        CREATE TABLE IF NOT EXISTS backups_state (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT UNIQUE, type TEXT, dernier TEXT, age_h REAL, taille_mb REAL, taille_prec_mb REAL, hors_machine INTEGER, etat TEXT, detail TEXT, last_check TEXT);
+        CREATE TABLE IF NOT EXISTS config_contenu (path TEXT PRIMARY KEY, texte TEXT);
+        CREATE TABLE IF NOT EXISTS correlations (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, entite TEXT, alerte TEXT, causes TEXT);
+        CREATE TABLE IF NOT EXISTS paquets_curseur (source TEXT PRIMARY KEY, inode INTEGER, position INTEGER);
+        CREATE TABLE IF NOT EXISTS controles (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, ok INTEGER, valeur TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS logiciels (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, installe INTEGER, chemin TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS apt_updates (id INTEGER PRIMARY KEY AUTOINCREMENT, total INTEGER, securite INTEGER, paquets TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS system_state (id INTEGER PRIMARY KEY AUTOINCREMENT, uptime_s INTEGER, reboot_required INTEGER, reboot_pkgs TEXT, tailscale TEXT, tailscale_ip TEXT, last_check TEXT);
@@ -2624,6 +2635,95 @@ def _hash_path(path: str) -> tuple:
     return None, 0, 0.0
 
 
+# CE QUI A CHANGÉ, ET NON « MODIFIÉ (a1b2…) » (08-10). Le journal du collecteur disait « /etc/passwd modifié »
+# plusieurs fois par heure, sans un mot de plus. On garde le texte des petits fichiers : pour ceux qui ne
+# portent jamais de secret, le changement se dit en clair (compte ajouté, shell changé, ligne sudo) ; pour
+# les autres (dovecot, mysql… qui peuvent porter un mot de passe), seulement le NOM des directives touchées.
+# Un dossier se résume par fichier : ajouté, retiré, modifié.
+_DERIVE_EN_CLAIR = ("/etc/passwd", "/etc/group", "/etc/sudoers", "/etc/hosts", "/etc/resolv.conf", "/etc/fstab",
+                    "/etc/crontab", "/etc/sysctl.conf", "/etc/ssh/sshd_config", "/etc/nginx/nginx.conf")
+_DERIVE_TEXTE_MAX = 256 * 1024
+
+
+def _derive_etat(path: str):
+    """Le contenu gardé pour comparer : le texte d'un petit fichier, ou {fichier: sha} d'un dossier."""
+    p = Path(path)
+    try:
+        if p.is_file():
+            if p.stat().st_size > _DERIVE_TEXTE_MAX:
+                return None
+            return p.read_text(errors="replace")
+        if p.is_dir():
+            carte = {}
+            for f in sorted(p.rglob("*")):
+                if f.is_file():
+                    try:
+                        carte[str(f.relative_to(p))] = hashlib.sha256(f.read_bytes()).hexdigest()[:16]
+                    except Exception:
+                        pass
+            return json.dumps(carte, sort_keys=True)
+    except Exception:
+        return None
+    return None
+
+
+def _derive_resume(path: str, ancien, nouveau) -> str:
+    """Une phrase sur ce qui a changé, jamais un secret."""
+    if ancien is None or nouveau is None:
+        return "modifié (contenu précédent inconnu : le détail viendra au prochain changement)"
+    if Path(path).is_dir():
+        try:
+            a, b = json.loads(ancien), json.loads(nouveau)
+        except Exception:
+            return "modifié"
+        aj = sorted(set(b) - set(a)); re_ = sorted(set(a) - set(b)); mo = sorted(k for k in set(a) & set(b) if a[k] != b[k])
+        morceaux = []
+        for lib, l in (("ajouté", aj), ("retiré", re_), ("modifié", mo)):
+            if l:
+                morceaux.append("%s : %s%s" % (lib, ", ".join(l[:5]), " (+%d)" % (len(l) - 5) if len(l) > 5 else ""))
+        return " · ".join(morceaux) or "modifié (métadonnées seules)"
+    la = [l for l in ancien.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    lb = [l for l in nouveau.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    if la == lb:
+        return "réécrit à l'identique (commentaires ou espaces seulement)"
+    if path in ("/etc/passwd", "/etc/group"):
+        def carte(lignes):
+            return {l.split(":", 1)[0]: l for l in lignes if ":" in l}
+        a, b = carte(la), carte(lb)
+        morceaux = []
+        for nom in sorted(set(b) - set(a)):
+            morceaux.append("%s ajouté" % (("compte " if path == "/etc/passwd" else "groupe ") + nom))
+        for nom in sorted(set(a) - set(b)):
+            morceaux.append("%s retiré" % (("compte " if path == "/etc/passwd" else "groupe ") + nom))
+        for nom in sorted(k for k in set(a) & set(b) if a[k] != b[k]):
+            pa, pb = a[nom].split(":"), b[nom].split(":")
+            if path == "/etc/passwd" and len(pa) >= 7 and len(pb) >= 7:
+                ch = []
+                if pa[6] != pb[6]:
+                    ch.append("shell %s → %s" % (pa[6], pb[6]))
+                if pa[5] != pb[5]:
+                    ch.append("dossier %s → %s" % (pa[5], pb[5]))
+                if pa[2:4] != pb[2:4]:
+                    ch.append("uid/gid %s → %s" % (":".join(pa[2:4]), ":".join(pb[2:4])))
+                morceaux.append("compte %s : %s" % (nom, ", ".join(ch) or "champ texte modifié"))
+            elif path == "/etc/group" and len(pa) >= 4 and len(pb) >= 4:
+                ma, mb = set(filter(None, pa[3].split(","))), set(filter(None, pb[3].split(",")))
+                d = ["+" + x for x in sorted(mb - ma)] + ["-" + x for x in sorted(ma - mb)]
+                morceaux.append("groupe %s : %s" % (nom, " ".join(d) or "modifié"))
+        return " · ".join(morceaux[:8]) + (" (+%d)" % (len(morceaux) - 8) if len(morceaux) > 8 else "") or "modifié"
+    import difflib
+    ajout = [l.strip() for l in lb if l not in la]
+    retrait = [l.strip() for l in la if l not in lb]
+    if path in _DERIVE_EN_CLAIR:
+        d = ["+ " + l[:100] for l in ajout[:4]] + ["- " + l[:100] for l in retrait[:4]]
+        reste = len(ajout) + len(retrait) - len(d)
+        return " | ".join(d) + (" (+%d lignes)" % reste if reste > 0 else "")
+    def directive(l):
+        return re.split(r"[\s=:{]", l, 1)[0][:40]
+    noms = sorted({directive(l) for l in ajout + retrait if directive(l)})
+    return "%d ligne(s) ajoutée(s), %d retirée(s) ; directives touchées : %s" % (len(ajout), len(retrait), ", ".join(noms[:8]) or "?")
+
+
 def collect_config_snapshots() -> list:
     """[EVO4] Snapshot SHA-256 des fichiers de config critiques.
     Détecte et logue tout changement dans la table changelog.
@@ -2655,16 +2755,21 @@ def collect_config_snapshots() -> list:
             })
 
             prev = existing.get(path)
+            etat = _derive_etat(path)
             if prev is None:
                 # Première observation — on ne logue pas (baseline initiale)
                 pass
             elif prev != sha256:
-                # DRIFT DÉTECTÉ
-                changelog_rows.append((
-                    now, "config_file", path, "modified",
-                    prev[:16] + "…", sha256[:16] + "…", "warning",
-                ))
-                print(f"[DRIFT] ⚠️  {path} modifié ({sha256[:12]}…)", file=sys.stderr)
+                ancien = conn.execute("SELECT texte FROM config_contenu WHERE path=?", (path,)).fetchone()
+                resume = _derive_resume(path, ancien[0] if ancien else None, etat)
+                if not resume.startswith("réécrit à l'identique"):
+                    sens = path in ("/etc/passwd", "/etc/group", "/etc/sudoers", "/etc/ssh/sshd_config")
+                    changelog_rows.append((now, "config_file", path, "modified", prev[:16] + "…", resume[:500],
+                                           "warning" if sens else "info"))
+                    print(f"[DRIFT] {path} : {resume[:200]}", file=sys.stderr)
+            if etat is not None:
+                conn.execute("INSERT INTO config_contenu (path, texte) VALUES (?,?) ON CONFLICT(path) DO UPDATE SET texte=excluded.texte",
+                             (path, etat))
 
         # Persistance atomique
         conn.execute("BEGIN")
@@ -3341,6 +3446,510 @@ def save_metrics(m):
     conn.close()
 
 
+# ============================================================
+# LE SENSORIUM SE SURVEILLE (08-10)
+# ============================================================
+# Un capteur qui plantait l'écrivait sur stderr, et c'était tout : la table gardait ses vieilles lignes, le
+# modèle du monde les servait comme fraîches. Chaque famille note ici sa dernière réussite, sa dernière
+# erreur, son nombre de lignes et sa période ; build_world_model en fait des entités « capteur.* ».
+# Une famille d'état PERMANENT qui rend soudain zéro ligne alors qu'elle en rendait est suspecte (un capteur
+# qui avale ses erreurs) ; une famille INSTANTANÉE (unités en échec, IP bannies) a le droit d'être vide.
+_CAPTEURS_JAMAIS_VIDES = {"system_services", "web_sites", "open_ports", "interfaces", "system_mounts", "logiciels",
+                          "cassandra_config", "hardware_state", "system_state", "docker_containers", "tailscale_peers",
+                          "sysctl_security", "ssl_certificates", "firewall_rules"}
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def noter_capteur(famille: str, ok: bool, n_lignes=None, duree_ms=None, erreur: str = "", periode_s=None):
+    try:
+        conn = get_conn()
+        try:
+            r = conn.execute("SELECT n_lignes FROM sensor_health WHERE famille=?", (famille,)).fetchone()
+            prec = r[0] if r else None
+            now = _utc_iso()
+            if ok:
+                conn.execute("INSERT INTO sensor_health (famille, periode_s, dernier_ok, n_lignes, n_precedent, duree_ms, erreur) "
+                             "VALUES (?,?,?,?,?,?, '') ON CONFLICT(famille) DO UPDATE SET "
+                             "periode_s=COALESCE(excluded.periode_s, periode_s), dernier_ok=excluded.dernier_ok, "
+                             "n_precedent=n_lignes, n_lignes=excluded.n_lignes, duree_ms=excluded.duree_ms, erreur=''",
+                             (famille, periode_s, now, n_lignes, prec, duree_ms))
+            else:
+                conn.execute("INSERT INTO sensor_health (famille, periode_s, derniere_erreur, erreur, duree_ms) VALUES (?,?,?,?,?) "
+                             "ON CONFLICT(famille) DO UPDATE SET periode_s=COALESCE(excluded.periode_s, periode_s), "
+                             "derniere_erreur=excluded.derniere_erreur, erreur=excluded.erreur, duree_ms=excluded.duree_ms",
+                             (famille, periode_s, now, str(erreur)[:300], duree_ms))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[CAPTEUR] {famille} : {e}", file=sys.stderr)
+
+
+def releve(table: str, fn, periode_s: int, enregistrer: bool = True):
+    """Un relevé mesuré : exécute, chronomètre, enregistre, et note la santé du capteur. Rend les lignes."""
+    t0 = time.time()
+    try:
+        rows = fn()
+    except Exception as e:
+        noter_capteur(table, False, duree_ms=int((time.time() - t0) * 1000), erreur=str(e), periode_s=periode_s)
+        print(f"[CAPTEUR] {table} en échec : {e}", file=sys.stderr)
+        return []
+    if enregistrer:
+        save_many(table, rows if isinstance(rows, list) else [rows] if rows else [])
+    noter_capteur(table, True, n_lignes=len(rows) if isinstance(rows, list) else (1 if rows else 0),
+                  duree_ms=int((time.time() - t0) * 1000), periode_s=periode_s)
+    return rows
+
+
+# ============================================================
+# ANTICIPER (08-10) — la tendance, pas seulement l'instant
+# ============================================================
+# Un disque à 70 % n'alarme personne ; un disque à 70 % qui prend 4 Go par jour sera plein dans onze jours.
+# Les relevés sont gardés : on en tire la pente (moindres carrés), et on ne parle que d'une pente nette —
+# assez de points, assez de jours, et une droite qui explique vraiment la courbe (r² ≥ 0,6).
+PROJ_DISQUE_JOURS_ALERTE = 30
+PROJ_HISTO_JOURS = 30
+
+
+def _pente(points):
+    """(pente par jour, r²) d'une série [(t_jours, y)], ou (None, 0)."""
+    n = len(points)
+    if n < 6:
+        return None, 0.0
+    mx = sum(p[0] for p in points) / n
+    my = sum(p[1] for p in points) / n
+    sxx = sum((p[0] - mx) ** 2 for p in points)
+    if sxx <= 0:
+        return None, 0.0
+    sxy = sum((p[0] - mx) * (p[1] - my) for p in points)
+    a = sxy / sxx
+    syy = sum((p[1] - my) ** 2 for p in points)
+    r2 = (sxy * sxy) / (sxx * syy) if syy > 0 else 0.0
+    return a, r2
+
+
+def noter_historiques(montages: list):
+    """Une ligne par montage et par processus (les 15 plus gros en mémoire, regroupés par nom), toutes les 5 min."""
+    now = _utc_iso()
+    procs = {}
+    for l in (run_cmd(["ps", "-eo", "rss=,comm="], timeout=10) or "").splitlines():
+        p = l.split(None, 1)
+        if len(p) == 2 and p[0].isdigit():
+            procs[p[1].strip()[:40]] = procs.get(p[1].strip()[:40], 0) + int(p[0]) / 1024.0
+    gros = sorted(procs.items(), key=lambda x: -x[1])[:15]
+    conn = get_conn()
+    try:
+        conn.executemany("INSERT INTO mounts_history (ts, mountpoint, used_gb, total_gb) VALUES (?,?,?,?)",
+                         [(now, m["mountpoint"], m["used_gb"], m["total_gb"]) for m in (montages or [])])
+        conn.executemany("INSERT INTO proc_mem_history (ts, nom, rss_mb) VALUES (?,?,?)", [(now, n, round(v, 1)) for n, v in gros])
+        limite = (datetime.now(timezone.utc) - timedelta(days=PROJ_HISTO_JOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute("DELETE FROM mounts_history WHERE ts < ?", (limite,))
+        conn.execute("DELETE FROM proc_mem_history WHERE ts < ?", (limite,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _jours_depuis(ts, t0):
+    try:
+        return (datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S") - t0).total_seconds() / 86400.0
+    except Exception:
+        return None
+
+
+def calculer_projections() -> list:
+    now = datetime.now().isoformat()
+    out = []
+    conn = get_conn()
+    try:
+        t0 = datetime(2026, 1, 1)
+        # Disques : jours avant plein, sur 7 jours d'historique (au moins 1 jour couvert)
+        depuis = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        montages = {r[0] for r in conn.execute("SELECT DISTINCT mountpoint FROM mounts_history").fetchall()} | {"/"}
+        for mp in sorted(montages):
+            rows = conn.execute("SELECT ts, used_gb, total_gb FROM mounts_history WHERE mountpoint=? AND ts >= ? ORDER BY ts",
+                                (mp, depuis)).fetchall()
+            if mp == "/" and (len(rows) < 12 or _jours_depuis(rows[-1][0], t0) - _jours_depuis(rows[0][0], t0) < 1.0):
+                # « / » a sept jours de métriques déjà gardées : la tendance existe dès le premier jour
+                lim_local = (datetime.now() - timedelta(days=7)).isoformat()
+                rows = conn.execute("SELECT ts, disk_used_gb, disk_total_gb FROM metrics_realtime WHERE ts >= ? AND id % 10 = 0 "
+                                    "ORDER BY id", (lim_local,)).fetchall()
+            pts = [(_jours_depuis(r[0], t0), r[1]) for r in rows if r[1] is not None]
+            pts = [p for p in pts if p[0] is not None]
+            if len(pts) < 12 or pts[-1][0] - pts[0][0] < 1.0:
+                continue
+            a, r2 = _pente(pts)
+            libre = (rows[-1][2] or 0) - (rows[-1][1] or 0)
+            if a is None:
+                continue
+            if a > 0.05 and r2 >= 0.6:
+                jours = libre / a
+                sev = "warning" if jours <= PROJ_DISQUE_JOURS_ALERTE else "info"
+                val = "plein dans ~%d jours (+%.1f Go/jour, %.0f Go libres)" % (jours, a, libre)
+            else:
+                sev, val = "info", "stable (%+.2f Go/jour)" % a
+            out.append({"cle": "disque.%s" % mp, "valeur": val, "severite": sev, "detail": "r2=%.2f" % r2, "last_check": now})
+        # Mémoire des processus : une fuite = croissance régulière sur 3 jours, > 10 %/jour et > 50 Mo/jour
+        depuis = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for (nom,) in conn.execute("SELECT DISTINCT nom FROM proc_mem_history WHERE ts >= ?", (depuis,)).fetchall():
+            rows = conn.execute("SELECT ts, rss_mb FROM proc_mem_history WHERE nom=? AND ts >= ? ORDER BY ts", (nom, depuis)).fetchall()
+            pts = [(_jours_depuis(r[0], t0), r[1]) for r in rows]
+            pts = [p for p in pts if p[0] is not None]
+            if len(pts) < 24 or pts[-1][0] - pts[0][0] < 1.0:
+                continue
+            a, r2 = _pente(pts)
+            moy = sum(p[1] for p in pts) / len(pts)
+            if a and a > 50 and moy > 0 and a / moy > 0.10 and r2 >= 0.7:
+                out.append({"cle": "memoire.%s" % nom, "severite": "warning", "detail": "r2=%.2f" % r2, "last_check": now,
+                            "valeur": "grossit de %.0f Mo/jour depuis %.0f jours (%.0f Mo aujourd'hui) : fuite probable"
+                                      % (a, pts[-1][0] - pts[0][0], pts[-1][1])})
+        # Certificats : un renouvellement automatique se fait à 30 jours ; à moins de 21, il a raté
+        for dom, dl, iss in conn.execute("SELECT domain, days_left, issuer FROM ssl_certificates WHERE days_left IS NOT NULL").fetchall():
+            if dl is not None and 0 < dl < 21:
+                auto = "let's encrypt" in (iss or "").lower() or "zerossl" in (iss or "").lower() or "r3" == (iss or "").lower()
+                out.append({"cle": "certificat.%s" % dom, "severite": "warning", "detail": iss or "", "last_check": now,
+                            "valeur": ("expire dans %d j : le renouvellement automatique aurait dû passer à 30 j" % dl) if auto
+                                      else ("expire dans %d j : à renouveler à la main" % dl)})
+    finally:
+        conn.close()
+    return out
+
+
+# ============================================================
+# LES SAUVEGARDES MESURÉES (08-10)
+# ============================================================
+# Une sauvegarde qui échoue ne fait aucun bruit : on l'apprend le jour où on en a besoin. Ici on mesure ce
+# qui existe VRAIMENT, sans rien supposer : dossiers de sauvegarde (le fichier le plus récent, sa taille,
+# celle du précédent), unités systemd de sauvegarde (dernier passage, résultat), FastPanel, rclone. Et la
+# seule question qui compte au jour du sinistre : y a-t-il une copie HORS de cette machine ?
+# (Les copies d'avant-évolution et d'avant-déploiement ne sont pas planifiées : leur âge ne dit rien.)
+SAUVEGARDE_DOSSIERS = ["/var/lib/cassandra/memory_backups", "/backup", "/backups",
+                       "/srv/backup", "/srv/backups", "/var/backups/borg", "/var/backups/restic", "/var/backups/mysql",
+                       "/var/backups/fastpanel", "/var/www/backups", "/home/backup", "/home/backups"]
+SAUVEGARDE_DOSSIERS_ENV = "CASSANDRA_SAUVEGARDES"     # chemins supplémentaires, séparés par « : »
+SAUVEGARDE_AGE_MAX_H = 26
+_FS_RESEAU = ("nfs", "nfs4", "cifs", "smb3", "smbfs", "sshfs", "fuse.sshfs", "fuse.rclone", "davfs", "glusterfs", "ceph", "9p")
+
+
+def _fs_de(chemin: str):
+    """(type de système de fichiers, point de montage) qui porte ce chemin."""
+    meilleur = ("", "")
+    try:
+        with open("/proc/mounts") as f:
+            for l in f:
+                p = l.split()
+                if len(p) >= 3 and (chemin == p[1] or chemin.startswith(p[1].rstrip("/") + "/")) and len(p[1]) >= len(meilleur[1]):
+                    meilleur = (p[2], p[1])
+    except Exception:
+        pass
+    return meilleur
+
+
+def _dernier_fichier(dossier: str):
+    """Les deux fichiers les plus récents (profondeur 3), en ignorant les fichiers en cours d'écriture."""
+    fichiers = []
+    base = Path(dossier)
+    try:
+        for i, f in enumerate(base.rglob("*")):
+            if i > 20000:          # un dépôt de sauvegarde de millions de fichiers ne bloque pas le collecteur
+                break
+            try:
+                if len(f.relative_to(base).parts) > 3 or not f.is_file() or f.name.endswith((".tmp", ".part", ".lock")):
+                    continue
+                st = f.stat()
+                fichiers.append((st.st_mtime, st.st_size, str(f)))
+            except Exception:
+                continue
+    except Exception:
+        return None, None
+    fichiers.sort(reverse=True)
+    return (fichiers[0] if fichiers else None), (fichiers[1] if len(fichiers) > 1 else None)
+
+
+def collect_backups() -> list:
+    now = datetime.now().isoformat()
+    out = []
+    dossiers = list(SAUVEGARDE_DOSSIERS) + [d for d in os.environ.get(SAUVEGARDE_DOSSIERS_ENV, "").split(":") if d]
+    for m in ("/mnt", "/media"):          # un disque ou un partage monté là, avec un dossier de sauvegarde
+        try:
+            for d in Path(m).glob("*/*"):
+                if d.is_dir() and re.search(r"(?i)backup|sauvegarde", d.name):
+                    dossiers.append(str(d))
+        except Exception:
+            pass
+    vus = set()
+    for d in dossiers:
+        if d in vus or not os.path.isdir(d):
+            continue
+        vus.add(d)
+        dernier, prec = _dernier_fichier(d)
+        if not dernier:
+            out.append({"source": d, "type": "dossier", "dernier": "", "age_h": None, "taille_mb": None, "taille_prec_mb": None,
+                        "hors_machine": 0, "etat": "vide", "detail": "aucun fichier", "last_check": now})
+            continue
+        fs, mp = _fs_de(d)
+        age_h = (time.time() - dernier[0]) / 3600.0
+        t, tp = dernier[1] / 1048576.0, (prec[1] / 1048576.0 if prec else None)
+        etat = "ok"
+        if age_h > SAUVEGARDE_AGE_MAX_H:
+            etat = "trop vieille"
+        elif tp and t < 0.5 * tp:
+            etat = "taille anormale"
+        out.append({"source": d, "type": "dossier", "dernier": datetime.fromtimestamp(dernier[0]).isoformat(timespec="minutes"),
+                    "age_h": round(age_h, 1), "taille_mb": round(t, 1), "taille_prec_mb": round(tp, 1) if tp else None,
+                    "hors_machine": 1 if fs in _FS_RESEAU else 0, "etat": etat,
+                    "detail": "%s sur %s (%s)" % (Path(dernier[2]).name, mp or "?", fs or "?"), "last_check": now})
+    # Unités systemd de sauvegarde : dernier passage et résultat
+    if _qui("systemctl"):
+        noms = run_cmd(["systemctl", "list-units", "--all", "--no-legend", "--plain", "--type=service",
+                        "*backup*", "*sauvegarde*", "*borg*", "*restic*", "*duplicity*", "*rsnapshot*", "*bacula*"], timeout=10) or ""
+        for l in noms.splitlines():
+            u = l.split()[0] if l.split() else ""
+            if not u.endswith(".service") or u.startswith(("dpkg-db-backup",)):
+                continue
+            info = dict(x.split("=", 1) for x in (run_cmd(["systemctl", "show", u, "-p", "Result,ExecMainExitTimestamp,ExecMainStatus"], timeout=5) or "").splitlines() if "=" in x)
+            ts = info.get("ExecMainExitTimestamp", "")
+            age_h = None
+            try:
+                age_h = (datetime.now() - datetime.strptime(" ".join(ts.split()[1:3]), "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600.0
+            except Exception:
+                pass
+            ok = info.get("Result") == "success" and info.get("ExecMainStatus", "0") == "0"
+            out.append({"source": u[:-8], "type": "unité systemd", "dernier": ts, "age_h": round(age_h, 1) if age_h is not None else None,
+                        "taille_mb": None, "taille_prec_mb": None,
+                        "hors_machine": 1 if re.search(r"(?i)borg|restic|rclone|duplicity|offsite|distant|s3|b2", u) else 0,
+                        "etat": ("ok" if ok and (age_h is None or age_h <= SAUVEGARDE_AGE_MAX_H) else ("trop vieille" if ok else "échec")),
+                        "detail": "résultat %s" % info.get("Result", "?"), "last_check": now})
+    # FastPanel : sa dernière sauvegarde réussie
+    try:
+        conn = get_conn()
+        try:
+            r = conn.execute("SELECT created_at, status, size_mb FROM fastpanel_backups ORDER BY created_at DESC LIMIT 1").fetchone()
+        finally:
+            conn.close()
+        if r and r[0]:
+            try:
+                age_h = (datetime.now() - datetime.fromisoformat(str(r[0])[:19])).total_seconds() / 3600.0
+            except Exception:
+                age_h = None
+            out.append({"source": "fastpanel", "type": "FastPanel", "dernier": str(r[0])[:16], "age_h": round(age_h, 1) if age_h is not None else None,
+                        "taille_mb": r[2], "taille_prec_mb": None, "hors_machine": 0,
+                        "etat": "ok" if (str(r[1]).lower() in ("success", "ok", "done", "completed") and (age_h or 0) <= SAUVEGARDE_AGE_MAX_H) else "à vérifier",
+                        "detail": "statut %s" % r[1], "last_check": now})
+    except Exception:
+        pass
+    # rclone : une destination distante configurée (le journal dit le reste, dans backup_runs)
+    for conf in (Path("/root/.config/rclone/rclone.conf"), Path("/etc/rclone/rclone.conf")):
+        if conf.exists():
+            try:
+                cp = configparser.ConfigParser()
+                cp.read(conf)
+                for sec in cp.sections():
+                    out.append({"source": "rclone:%s" % sec, "type": "rclone", "dernier": "", "age_h": None, "taille_mb": None,
+                                "taille_prec_mb": None, "hors_machine": 1, "etat": "configuré",
+                                "detail": cp.get(sec, "type", fallback="?"), "last_check": now})
+            except Exception:
+                pass
+    return out
+
+
+# ============================================================
+# CAUSES ET EFFETS (08-10)
+# ============================================================
+# Une alerte seule dit « nginx est tombé ». Avec ce qui a changé juste avant, elle dit « nginx est tombé
+# 2 min après la mise à jour de nginx-common ». Deux pièces : les mouvements de paquets entrent au journal
+# des changements (dpkg, dnf), et toute entité qui PASSE en alerte cherche les changements des 30 minutes
+# précédentes. On dit « cause probable », jamais « cause » : une coïncidence reste possible.
+CAUSES_FENETRE_MIN = 30
+_PAQUETS_JOURNAUX = (("dpkg", "/var/log/dpkg.log", re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (install|upgrade|remove|purge) (\S+) (\S+) (\S+)")),
+                     ("dnf", "/var/log/dnf.rpm.log", re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\S* SUBDEBUG (Upgrade|Installed|Erase|Upgraded|Install): (\S+)")))
+
+
+def collect_paquets_mouvements() -> int:
+    """Les paquets installés, mis à jour ou retirés depuis le dernier passage, au journal des changements."""
+    n = 0
+    conn = get_conn()
+    try:
+        for source, chemin, rx in _PAQUETS_JOURNAUX:
+            try:
+                st = os.stat(chemin)
+            except OSError:
+                continue
+            r = conn.execute("SELECT inode, position FROM paquets_curseur WHERE source=?", (source,)).fetchone()
+            pos = 0 if (r is None or r[0] != st.st_ino or st.st_size < (r[1] or 0)) else (r[1] or 0)
+            if r is None:
+                pos = st.st_size          # premier passage : on part de la fin, on ne date pas un passé qu'on n'a pas vu
+            lignes = []
+            if st.st_size > pos:
+                with open(chemin, "rb") as f:
+                    f.seek(pos)
+                    bloc = f.read(4 * 1024 * 1024)
+                fin = bloc.rfind(b"\n")
+                if fin >= 0:
+                    lignes = bloc[:fin + 1].decode("utf-8", "replace").splitlines()
+                    pos += fin + 1
+            for l in lignes:
+                m = rx.match(l)
+                if not m:
+                    continue
+                if source == "dpkg":
+                    ts, act, pq, avant, apres = m.groups()
+                    verbe = {"install": "installé", "upgrade": "mis à jour", "remove": "retiré", "purge": "purgé"}[act]
+                    txt = "%s %s" % (pq.split(":")[0], verbe) + ((" (%s → %s)" % (avant, apres)) if act == "upgrade" else "")
+                else:
+                    ts, act, pq = m.groups()
+                    verbe = {"Upgrade": "mis à jour", "Upgraded": "remplacé", "Installed": "installé", "Install": "installé", "Erase": "retiré"}.get(act, act)
+                    txt = "%s %s" % (pq, verbe)
+                conn.execute("INSERT INTO changelog (ts, entity_type, entity_name, change_type, old_value, new_value, severity) "
+                             "VALUES (?,?,?,?,?,?,?)", (ts.replace(" ", "T"), "paquet", pq.split(":")[0][:80], "modified", None, txt[:300], "info"))
+                n += 1
+            conn.execute("INSERT INTO paquets_curseur (source, inode, position) VALUES (?,?,?) "
+                         "ON CONFLICT(source) DO UPDATE SET inode=excluded.inode, position=excluded.position", (source, st.st_ino, pos))
+        conn.commit()
+    finally:
+        conn.close()
+    return n
+
+
+_CAUSES_TYPES = ("config_file", "paquet", "service", "docker", "logiciel", "network", "config", "security", "system", "web")
+
+
+def causes_probables(conn, entite: str, maintenant_local: str = None) -> list:
+    """Les changements des 30 minutes qui précèdent, hors bruit (mesures continues, capteurs, prévisions), et hors
+    l'entité elle-même. Les plus proches d'abord."""
+    t = datetime.fromisoformat(maintenant_local) if maintenant_local else datetime.now()
+    depuis = (t - timedelta(minutes=CAUSES_FENETRE_MIN)).isoformat()
+    rows = conn.execute(
+        "SELECT ts, entity_type, entity_name, change_type, new_value FROM changelog WHERE ts >= ? AND ts <= ? "
+        "AND entity_type IN (%s) AND entity_name <> ? ORDER BY ts DESC LIMIT 8" % ",".join("?" * len(_CAUSES_TYPES)),
+        [depuis, t.isoformat()] + list(_CAUSES_TYPES) + [entite]).fetchall()
+    out = []
+    for ts, typ, nom, chg, nv in rows:
+        if typ == "config_file":
+            txt = "%s modifié : %s" % (nom, (nv or "")[:140])
+        elif typ == "paquet":
+            txt = nv or nom
+        else:
+            txt = "%s %s%s" % (nom, {"added": "apparu", "removed": "disparu", "modified": "a changé"}.get(chg, chg),
+                               (" → %s" % nv[:80]) if nv and chg == "modified" else "")
+        out.append("%s · %s" % (str(ts)[11:16], txt))
+    return out
+
+
+# ============================================================
+# CONTRÔLES DE BOUT EN BOUT (08-10)
+# ============================================================
+# Un port ouvert n'est pas un service qui marche. Ici on fait ce que ferait un visiteur : une poignée de main
+# TLS VÉRIFIÉE sur chaque site (chaîne et nom — un mauvais certificat servi se voit, même si le fichier sur
+# disque est bon), la résolution DNS publique de chaque domaine, la bannière des ports de courriel ouverts,
+# et la page de connexion de Cassandra. Rien n'envoie de données : on lit ce que le service dit de lui-même.
+def _tls_verifie(domaine: str, ip: str = "", port: int = 443):
+    import ssl as _ssl
+    ctx = _ssl.create_default_context()
+    try:
+        with socket.create_connection((ip or domaine, port), timeout=6) as sk:
+            with ctx.wrap_socket(sk, server_hostname=domaine) as t:
+                cert = t.getpeercert()
+        fin = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+        return True, "certificat valide, %d j restants" % (fin - datetime.utcnow()).days
+    except _ssl.SSLCertVerificationError as e:
+        return False, "certificat refusé : %s" % (getattr(e, "verify_message", "") or str(e))[:120]
+    except Exception as e:
+        return False, "pas de TLS : %s" % str(e)[:100]
+
+
+def _dns_public(domaine: str) -> list:
+    if _qui("dig"):
+        out = run_cmd(["dig", "+short", "+time=3", "+tries=1", "@1.1.1.1", "A", domaine], timeout=8) or ""
+        ips = [l.strip() for l in out.splitlines() if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", l.strip())]
+        if ips:
+            return ips
+    try:
+        return sorted({a[4][0] for a in socket.getaddrinfo(domaine, 443, socket.AF_INET)})
+    except Exception:
+        return []
+
+
+def _banniere(port: int, tls: bool) -> str:
+    import ssl as _ssl
+    try:
+        sk = socket.create_connection(("127.0.0.1", port), timeout=5)
+        if tls:
+            ctx = _ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
+            sk = ctx.wrap_socket(sk)
+        sk.settimeout(5)
+        b = sk.recv(256).decode("utf-8", "replace").strip()
+        sk.close()
+        return b.splitlines()[0][:80] if b else ""
+    except Exception as e:
+        return "!" + str(e)[:60]
+
+
+_PORTS_COURRIEL = {25: ("SMTP", False, "220"), 465: ("SMTPS", True, "220"), 587: ("submission", False, "220"),
+                   143: ("IMAP", False, "* OK"), 993: ("IMAPS", True, "* OK"), 110: ("POP3", False, "+OK"), 995: ("POP3S", True, "+OK")}
+
+
+def collect_controles() -> list:
+    now = datetime.now().isoformat()
+    out = []
+    conn = get_conn()
+    try:
+        sites = conn.execute("SELECT domain, ssl_enabled, listen_ip FROM web_sites").fetchall() if \
+            "listen_ip" in {r[1] for r in conn.execute("PRAGMA table_info(web_sites)")} else \
+            [(r[0], r[1], "") for r in conn.execute("SELECT domain, ssl_enabled FROM web_sites").fetchall()]
+        ports = {int(r[0]) for r in conn.execute("SELECT port FROM open_ports WHERE protocol LIKE 'tcp%'").fetchall() if r[0] is not None}
+    finally:
+        conn.close()
+    # TLS vérifié et DNS public, en parallèle
+    def _site(r):
+        dom, ssl_on, ip = r[0], r[1], (r[2] or "").strip("[]")
+        res = []
+        if ssl_on:
+            ok, v = _tls_verifie(dom, ip)
+            res.append({"nom": "tls.%s" % dom, "ok": 1 if ok else 0, "valeur": v, "last_check": now})
+        ips = _dns_public(dom)
+        res.append({"nom": "dns.%s" % dom, "ok": 1 if ips else 0, "valeur": ("→ %s" % ", ".join(ips[:3])) if ips else "ne résout pas", "last_check": now})
+        return res
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for res in ex.map(_site, list(sites)):
+            out.extend(res)
+    # Cohérence DNS : un domaine qui pointe ailleurs que la majorité des autres
+    dns = [x for x in out if x["nom"].startswith("dns.") and x["ok"]]
+    compte = {}
+    for x in dns:
+        compte[x["valeur"]] = compte.get(x["valeur"], 0) + 1
+    if len(dns) >= 3:
+        majo = max(compte, key=compte.get)
+        for x in dns:
+            if x["valeur"] != majo and compte[x["valeur"]] == 1:
+                x["valeur"] += " (les autres sites : %s)" % majo[2:]
+    # Courriel : la bannière de chaque port ouvert
+    for port, (nom, tls, attendu) in _PORTS_COURRIEL.items():
+        if port in ports:
+            b = _banniere(port, tls)
+            out.append({"nom": "courriel.%s" % nom, "ok": 1 if b.startswith(attendu) else 0,
+                        "valeur": ("répond : %s" % b) if b.startswith(attendu) else ("ne répond pas comme attendu : %s" % (b or "rien")),
+                        "last_check": now})
+    # L'interface de Cassandra : sa page de connexion
+    try:
+        cfg = json.load(open(CASSANDRA_CONFIG, encoding="utf-8"))
+        url = (cfg.get("app_public_url") or cfg.get("base_url") or "").rstrip("/")
+    except Exception:
+        url = ""
+    if url:
+        corps = run_cmd(["curl", "-skL", "--max-time", "8", url + "/"], timeout=12) or ""
+        ok = "login-username" in corps or 'id="login' in corps
+        out.append({"nom": "cassandra.connexion", "ok": 1 if ok else 0,
+                    "valeur": ("la page de connexion s'affiche (%s)" % url) if ok else ("page de connexion introuvable sur %s" % url),
+                    "last_check": now})
+    return out
+
+
 # PERF[O3]: save_many() — INSERT ligne par ligne → executemany() en batch.
 # Avant : N appels conn.execute() individuels dans une boucle for.
 # Après : 1 appel conn.executemany() avec toutes les valeurs d'un coup.
@@ -3394,6 +4003,7 @@ def save_many(table: str, rows: list):
     except Exception as e:
         conn.rollback()
         print(f"[DB] save_many({table}) erreur: {e}", file=sys.stderr)
+        noter_capteur(table, False, erreur="écriture en base : %s" % e)
     finally:
         conn.close()
 
@@ -3543,7 +4153,7 @@ def detect_diff(entity_type: str, current_names: list):
 # LE JOURNAL DES CHANGEMENTS DIT CE QUI CHANGE D'ÉTAT, PAS CE QUI BOUGE (08-10) : la charge CPU qui passe de
 # 2 % à 3 % écrivait une ligne toutes les 30 s — 7 193 par jour, qui noyaient les vrais changements (un
 # service tombé, un port ouvert). Une mesure continue n'entre au journal que si sa GRAVITÉ change.
-_WORLD_CONTINUS = ("resource",)
+_WORLD_CONTINUS = ("resource", "prevision", "controle")
 _WORLD_CONTINUS_CLES = ("system.uptime",)
 
 
@@ -3564,10 +4174,19 @@ def upsert_world(conn, key, category, value, detail=None, severity="info", vus=N
         value = "" if value is None else str(value)[:500]
         now = _world_maintenant()
         local = datetime.now().isoformat()
-        row = conn.execute("SELECT value, severity FROM world_model WHERE wkey=?", (key,)).fetchone()
+        row = conn.execute("SELECT value, severity, detail FROM world_model WHERE wkey=?", (key,)).fetchone()
         det = json.dumps(detail, ensure_ascii=False) if detail is not None else None
         continu = category in _WORLD_CONTINUS or key in _WORLD_CONTINUS_CLES
         if row is None:
+            if severity == "warning" and category not in ("capteur", "prevision"):
+                try:
+                    causes = causes_probables(conn, key, local)
+                    if causes:
+                        d = dict(detail) if isinstance(detail, dict) else {}
+                        d["causes_probables"] = causes
+                        det = json.dumps(d, ensure_ascii=False)
+                except Exception:
+                    pass
             conn.execute(
                 "INSERT INTO world_model (wkey, category, value, detail, severity, source, observed_at, updated_at) "
                 "VALUES (?,?,?,?,?, 'observed', ?, ?)",
@@ -3577,6 +4196,26 @@ def upsert_world(conn, key, category, value, detail=None, severity="info", vus=N
                     "INSERT INTO changelog (ts, entity_type, entity_name, change_type, old_value, new_value, severity) "
                     "VALUES (?,?,?,?,?,?,?)", (local, category, key, "added", None, value, severity))
         elif row[0] != value or row[1] != severity:
+            if severity == "warning" and row[1] != "warning" and category not in ("capteur", "prevision"):
+                # L'ENTITÉ PASSE EN ALERTE : qu'est-ce qui a changé juste avant ?
+                try:
+                    causes = causes_probables(conn, key, local)
+                    if causes:
+                        d = dict(detail) if isinstance(detail, dict) else ({"valeur": detail} if detail is not None else {})
+                        d["causes_probables"] = causes
+                        det = json.dumps(d, ensure_ascii=False)
+                        conn.execute("INSERT INTO correlations (ts, entite, alerte, causes) VALUES (?,?,?,?)",
+                                     (local, key, value, json.dumps(causes, ensure_ascii=False)))
+                except Exception as _ce:
+                    print(f"[CAUSES] {key} : {_ce}", file=sys.stderr)
+            if severity == "warning" and row[1] == "warning" and row[2] and "causes_probables" in str(row[2]):
+                # toujours en alerte : la cause trouvée au passage en alerte reste attachée
+                try:
+                    d = dict(detail) if isinstance(detail, dict) else {}
+                    d["causes_probables"] = json.loads(row[2]).get("causes_probables")
+                    det = json.dumps(d, ensure_ascii=False)
+                except Exception:
+                    pass
             conn.execute(
                 "UPDATE world_model SET value=?, detail=?, severity=?, observed_at=?, updated_at=? WHERE wkey=?",
                 (value, det, severity, now, now, key))
@@ -3859,6 +4498,67 @@ def build_world_model():
             if r["securite_noyau"]:
                 U("system.protection_noyau", "security", r["securite_noyau"], divers)
 
+        # Contrôles de bout en bout
+        def _controles(lignes, vus):
+            for r in lignes:
+                U("controle.%s" % r["nom"], "controle", r["valeur"], vus, "info" if r["ok"] else "warning")
+        _famille("controle.", _q("SELECT nom, ok, valeur FROM controles"), _controles)
+
+        # Sauvegardes : chacune, et la question du sinistre
+        def _sauvegardes(lignes, vus):
+            hors = False
+            for r in lignes:
+                if r["hors_machine"] and r["etat"] in ("ok", "configuré"):
+                    hors = True
+                morceaux = [r["etat"]]
+                if r["age_h"] is not None:
+                    morceaux.append("dernière il y a %s" % (("%.0f h" % r["age_h"]) if r["age_h"] < 48 else ("%.0f j" % (r["age_h"] / 24))))
+                if r["taille_mb"] is not None:
+                    morceaux.append("%.0f Mo" % r["taille_mb"] + ((" (précédente %.0f Mo)" % r["taille_prec_mb"]) if r["taille_prec_mb"] else ""))
+                if r["hors_machine"]:
+                    morceaux.append("hors machine")
+                if r["detail"]:
+                    morceaux.append(r["detail"])
+                U("sauvegarde.%s" % r["source"], "sauvegarde", " · ".join(morceaux), vus,
+                  "info" if r["etat"] in ("ok", "configuré") else "warning")
+            U("sauvegarde.hors_machine", "sauvegarde",
+              "oui" if hors else "AUCUNE copie hors de cette machine : un disque mort emporte tout", vus,
+              "info" if hors else "warning")
+        _famille("sauvegarde.", _q("SELECT * FROM backups_state"), _sauvegardes)
+
+        # Ce qui VA arriver : disque plein, fuite de mémoire, certificat non renouvelé
+        def _previsions(lignes, vus):
+            for r in lignes:
+                U("prevision.%s" % r["cle"], "prevision", r["valeur"], vus, r["severite"] or "info")
+        _famille("prevision.", _q("SELECT cle, valeur, severite FROM projections"), _previsions)
+
+        # LE SENSORIUM LUI-MÊME : chaque capteur, sa dernière réussite, son silence ou sa panne
+        def _capteurs(lignes, vus):
+            maint = datetime.now(timezone.utc)
+            for r in lignes:
+                fam, per = r["famille"], r["periode_s"] or 300
+                ok_ts = r["dernier_ok"]
+                age = None
+                if ok_ts:
+                    try:
+                        age = (maint - datetime.strptime(ok_ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)).total_seconds()
+                    except Exception:
+                        age = None
+                en_erreur = bool(r["erreur"]) and (not ok_ts or (r["derniere_erreur"] or "") > ok_ts)
+                muet = age is None or age > 3 * per + 60
+                vide_suspect = (fam in _CAPTEURS_JAMAIS_VIDES and (r["n_lignes"] or 0) == 0 and (r["n_precedent"] or 0) > 0)
+                if en_erreur:
+                    val, sev = "en panne depuis %s : %s" % ((r["derniere_erreur"] or "?")[11:16] + " UTC", (r["erreur"] or "")[:160]), "warning"
+                elif muet:
+                    val, sev = ("muet depuis %s UTC" % ok_ts[11:16]) if ok_ts else "jamais relevé", "warning"
+                elif vide_suspect:
+                    val, sev = "vide (rendait %d lignes au relevé précédent)" % (r["n_precedent"] or 0), "warning"
+                else:
+                    val, sev = "ok · toutes les %s" % (("%d s" % per) if per < 60 else ("%d min" % (per // 60))), "info"
+                U("capteur.%s" % fam, "capteur", val, vus, sev,
+                  detail={"dernier_ok": ok_ts, "lignes": r["n_lignes"], "duree_ms": r["duree_ms"]})
+        _famille("capteur.", _q("SELECT * FROM sensor_health"), _capteurs)
+
         # Santé globale
         h, _ok = _q("SELECT score, status FROM health_scores ORDER BY id DESC LIMIT 1")
         if h:
@@ -3991,11 +4691,11 @@ class SharedMemorySocket:
                     conn = get_conn()
                     if prefix:
                         rows = conn.execute(
-                            "SELECT wkey, category, value, severity, observed_at FROM world_model "
+                            "SELECT wkey, category, value, severity, observed_at, detail FROM world_model "
                             "WHERE wkey LIKE ? ORDER BY wkey LIMIT 500", (prefix + "%",)).fetchall()
                     else:
                         rows = conn.execute(
-                            "SELECT wkey, category, value, severity, observed_at FROM world_model "
+                            "SELECT wkey, category, value, severity, observed_at, detail FROM world_model "
                             "ORDER BY wkey LIMIT 3000").fetchall()
                     conn.close()
                     client.sendall(json.dumps([dict(r) for r in rows]).encode())
@@ -4102,25 +4802,32 @@ class KnowledgeCollector:
     # Note  : _fp_load_params() est protégé par _fp_load_lock (double-checked locking).
     #         Les collecteurs sont I/O-bound → threads idéaux (pas de GIL penalty réel).
     @staticmethod
-    def _run_parallel(tasks: list, max_workers: int = 8) -> dict:
+    def _run_parallel(tasks: list, max_workers: int = 8, periode_s: int = None) -> dict:
         """
         Exécute une liste de (table, fn) en parallèle.
         Retourne {table: result_list}.
         """
         results = {}
         errors  = []
+        def _chrono(fn):
+            t0 = time.time()
+            r = fn()
+            return r, int((time.time() - t0) * 1000)
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_table = {
-                executor.submit(fn): table
+                executor.submit(_chrono, fn): table
                 for table, fn in tasks
             }
             for future in as_completed(future_to_table):
                 table = future_to_table[future]
                 try:
-                    results[table] = future.result(timeout=30)
+                    results[table], duree = future.result(timeout=30)
+                    noter_capteur(table, True, n_lignes=len(results[table] or []), duree_ms=duree, periode_s=periode_s)
                 except Exception as e:
                     errors.append(f"{table}: {e}")
                     results[table] = []
+                    noter_capteur(table, False, erreur=str(e), periode_s=periode_s)
         if errors:
             print(f"[COLLECTOR] Erreurs parallèles: {'; '.join(errors)}", file=sys.stderr)
         return results
@@ -4139,7 +4846,7 @@ class KnowledgeCollector:
                 ("fastpanel_crons",        collect_fastpanel_crons),
                 ("backup_runs",            collect_backup_runs),
             ]
-            for table, data in self._run_parallel(lents, max_workers=4).items():
+            for table, data in self._run_parallel(lents, max_workers=4, periode_s=900).items():
                 save_many(table, data)
             dns, _ = collect_dns_servers()
             save_many("dns_servers", dns)
@@ -4203,12 +4910,13 @@ class KnowledgeCollector:
             ("storage_health",         collect_storage_health),
             ("interfaces",             collect_interfaces),
             ("hardware_state",         collect_hardware_state),
+            ("backups_state",          collect_backups),
         ]
 
         # Métriques en parallèle aussi (le sleep(0.3) de get_cpu sera chevauchant)
         with ThreadPoolExecutor(max_workers=1) as m_exec:
             metrics_future = m_exec.submit(collect_metrics)
-            collected = self._run_parallel(init_tasks, max_workers=8)
+            collected = self._run_parallel(init_tasks, max_workers=8, periode_s=300)
             _init_metrics = metrics_future.result(timeout=15)
 
         # Sauvegarde séquentielle (SQLite WAL gère la concurrence en lecture)
@@ -4265,7 +4973,11 @@ class KnowledgeCollector:
                 # lecteur : le direct passe par le socket (GET_METRICS mesure à la demande), les
                 # autres prennent la dernière ligne. 21,6 Mo pour 7 jours au lieu de 122.
                 if now - self.last_metrics >= 30:
-                    save_metrics(collect_metrics())
+                    try:
+                        save_metrics(collect_metrics())
+                        noter_capteur("metrics_realtime", True, n_lignes=1, periode_s=30)
+                    except Exception as _me:
+                        noter_capteur("metrics_realtime", False, erreur=str(_me), periode_s=30)
                     self.last_metrics = now
 
                 # [SENSORIUM] Reconstruit le modèle du monde (état grounded) toutes les 30s
@@ -4288,7 +5000,7 @@ class KnowledgeCollector:
                         ("fail2ban_banned_ips", collect_fail2ban_banned),
                         ("tailscale_peers", collect_tailscale_peers),
                     ]
-                    for table, data in self._run_parallel(quick_tasks, max_workers=5).items():
+                    for table, data in self._run_parallel(quick_tasks, max_workers=5, periode_s=30).items():
                         save_many(table, data)
                     self.last_quick = now
 
@@ -4314,8 +5026,10 @@ class KnowledgeCollector:
                         ("system_mounts",          collect_mounts),
                         ("storage_health",         collect_storage_health),
                         ("hardware_state",         collect_hardware_state),
+                        ("backups_state",          collect_backups),
+                        ("controles",              collect_controles),
                     ]
-                    full_results = self._run_parallel(full_tasks, max_workers=8)
+                    full_results = self._run_parallel(full_tasks, max_workers=8, periode_s=300)
                     for table, data in full_results.items():
                         save_many(table, data)
 
@@ -4330,6 +5044,12 @@ class KnowledgeCollector:
                     self._last_ssl   = full_results.get("ssl_certificates", [])
                     self._last_smart = full_results.get("disk_smart", [])
                     self._last_sysctl = full_results.get("sysctl_security", []) or self._last_sysctl
+                    try:
+                        noter_historiques(full_results.get("system_mounts", []))
+                    except Exception as _he:
+                        print(f"[PROJECTION] historiques : {_he}", file=sys.stderr)
+                    releve("projections", calculer_projections, 300)
+                    releve("paquets_mouvements", lambda: [None] * collect_paquets_mouvements(), 300, enregistrer=False)
                     _oom_now   = full_results.get("oom_events", [])
                     _fail_now  = full_results.get("failed_units", [])
                     _met_now   = collect_metrics()
@@ -4352,8 +5072,8 @@ class KnowledgeCollector:
                     threading.Thread(target=self._relire_lents, daemon=True).start()
                     self.last_slow = now
                 if now - self.last_hourly >= 3600:
-                    threading.Thread(target=lambda: save_many("apt_updates", collect_apt_updates()), daemon=True).start()
-                    threading.Thread(target=lambda: save_many("logiciels", collect_installed_software()), daemon=True).start()
+                    threading.Thread(target=lambda: releve("apt_updates", collect_apt_updates, 3600), daemon=True).start()
+                    threading.Thread(target=lambda: releve("logiciels", collect_installed_software, 3600), daemon=True).start()
                     self.last_hourly = now
 
                 time.sleep(1)

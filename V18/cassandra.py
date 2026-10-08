@@ -18725,7 +18725,7 @@ PERCEPTION_TTL = {"service": 1800, "machine_hors_ligne": 900, "machine_en_ligne"
                   "disque": 86400, "ram": 300, "charge": 300, "certificat": 604800,
                   # 08-10 : le sensorium élargi (collecteur) — relu toutes les 30 s, 5 min, 15 min ou 1 h selon la famille
                   "config": 1800, "logiciel": 10800, "maj": 10800, "montage": 1800, "interface": 600,
-                  "stockage": 1800, "systeme": 1800, "port": 600}
+                  "stockage": 1800, "systeme": 1800, "port": 600, "machine_flotte": 2700}
 
 
 def _memoire_age(ts):
@@ -18822,7 +18822,16 @@ def _perception_monde(q: str, deja: set, limite: int = 12, stricte: bool = False
 
     for r in rows:
         wk, cat, val, ts = str(r.get("wkey") or ""), str(r.get("category") or ""), str(r.get("value") or ""), r.get("observed_at")
-        if stricte and not any(_cite(p) for p in (wk.split(".", 1)[1] if "." in wk else wk,)):
+        # 08-10 : une alerte porte la cause probable trouvée par le collecteur (ce qui a changé juste avant)
+        if r.get("severity") == "warning" and r.get("detail"):
+            try:
+                _causes = (json.loads(r["detail"]) or {}).get("causes_probables") if isinstance(r["detail"], str) else None
+                if _causes:
+                    val += " — cause probable : %s" % _causes[0]
+            except Exception:
+                pass
+        _sujet = wk.split(".")[1] if wk.startswith("machine.") and wk.count(".") >= 2 else (wk.split(".", 1)[1] if "." in wk else wk)
+        if stricte and not _cite(_sujet):
             continue
         if wk.startswith("fleet.") and cat == "fleet":
             nom = wk[6:]
@@ -18872,6 +18881,11 @@ def _perception_monde(q: str, deja: set, limite: int = 12, stricte: bool = False
         elif wk.startswith("port."):
             if _cite(wk[5:]) and ("port" in q) or _mot("ports ouverts", "port ouvert", "écoute sur", "ports à l'écoute"):
                 _ajouter("port %s" % wk[5:], "à l'écoute (%s)" % val, ts, PERCEPTION_TTL["port"])
+        elif wk.startswith("machine.") and wk.count(".") >= 2:
+            # 08-10 : le sensorium de la flotte — les relevés d'une machine quand on la nomme
+            _m, _cle = wk.split(".", 2)[1], wk.split(".", 2)[2]
+            if _cite(_m):
+                _ajouter("%s · %s" % (_m, _cle.replace("_", " ")), val, ts, PERCEPTION_TTL["machine_flotte"])
         elif wk in _SYS:
             libelle, mots = _SYS[wk]
             if _mot(*mots):
@@ -77091,6 +77105,152 @@ def _sonde_version(texte: str, cles) -> str:
     return ""
 
 
+# ── Remonter du site à ce qui l'exécute (08-10) ─────────────────────────────────────
+# Les sondes HTTP ne connaissent qu'une douzaine d'applications, et un site protégé par le portier de
+# Cassandra se présente… comme Cassandra (auth.cassandra.center). La vérité est dans la configuration :
+# le vhost renvoie vers un port local, directement ou par un « upstream » (FastPanel nomme les siens
+# d'après le domaine : `proxy_pass http://auth.cassandra.center6;`), et ce port est publié par un
+# conteneur — dont l'IMAGE dit le nom et la version — ou ouvert par un processus.
+_NGINX_DOSSIERS = ("/etc/nginx/fastpanel2-sites", "/etc/nginx/sites-enabled", "/etc/nginx/conf.d", "/etc/nginx/vhosts.d")
+_IMAGES_NOMS = {"goauthentik": "Authentik", "authentik": "Authentik", "vaultwarden": "Vaultwarden", "searxng": "SearXNG",
+                "gitea": "Gitea", "forgejo": "Forgejo", "nextcloud": "Nextcloud", "grafana": "Grafana", "portainer": "Portainer",
+                "jellyfin": "Jellyfin", "immich": "Immich", "n8n": "n8n", "open-webui": "Open WebUI", "uptime-kuma": "Uptime Kuma",
+                "homeassistant": "Home Assistant", "home-assistant": "Home Assistant", "paperless-ngx": "Paperless-ngx",
+                "keycloak": "Keycloak", "gitlab": "GitLab", "mattermost": "Mattermost", "minio": "MinIO", "plex": "Plex",
+                "bookstack": "BookStack", "wikijs": "Wiki.js", "outline": "Outline", "syncthing": "Syncthing",
+                "adguardhome": "AdGuard Home", "pihole": "Pi-hole", "traefik": "Traefik", "metabase": "Metabase",
+                "mealie": "Mealie", "vikunja": "Vikunja", "odoo": "Odoo", "wordpress": "WordPress", "ghost": "Ghost",
+                "matomo": "Matomo", "kimai": "Kimai", "freshrss": "FreshRSS", "linkwarden": "Linkwarden", "ollama": "Ollama"}
+_IMAGES_GENERIQUES = ("server", "app", "web", "api", "core", "backend", "frontend", "latest", "main")
+_PROCESSUS_GENERIQUES = ("python", "python3", "node", "java", "php", "php-fpm", "ruby", "dotnet", "docker-proxy", "uwsgi",
+                         "gunicorn", "deno", "bun", "beam.smp")
+# Un serveur web derrière un proxy n'est pas l'APPLICATION : on ne s'arrête pas à lui (le disque ou la sonde HTTP la diront).
+_SERVEURS_WEB = ("apache2", "httpd", "nginx", "caddy", "lighttpd", "openresty")
+
+
+def _nom_application(brut: str) -> str:
+    b = (brut or "").strip().lower()
+    if b in _IMAGES_NOMS:
+        return _IMAGES_NOMS[b]
+    return b[:1].upper() + b[1:] if b else ""
+
+
+def _image_vers_application(image: str):
+    """« ghcr.io/goauthentik/server:2026.8.3 » → ("Authentik", "2026.8.3")."""
+    nom, _, tag = (image or "").partition(":")
+    morceaux = [m for m in nom.split("/") if m and "." not in m]           # sans le registre
+    if not morceaux:
+        return "", ""
+    for m in reversed(morceaux):
+        if m.lower() in _IMAGES_NOMS:
+            return _IMAGES_NOMS[m.lower()], ("" if tag in ("", "latest", "stable", "main") else tag)
+    dernier = morceaux[-1]
+    if dernier.lower() in _IMAGES_GENERIQUES and len(morceaux) > 1:
+        dernier = morceaux[-2]
+    return _nom_application(dernier), ("" if tag in ("", "latest", "stable", "main") else tag)
+
+
+def _vhost_textes(domain: str) -> list:
+    """Le texte des fichiers nginx qui servent ce domaine (et ce qu'ils incluent à côté)."""
+    out = []
+    for d in _NGINX_DOSSIERS:
+        base = Path(d)
+        if not base.is_dir():
+            continue
+        for f in base.rglob("*"):
+            try:
+                if not f.is_file() or f.suffix in (".bak", ".bak2") or ".avant" in f.name or f.stat().st_size > 512 * 1024:
+                    continue
+                if f.name.startswith(domain + ".") or re.search(r"server_name[^;]*\b%s\b" % re.escape(domain), f.read_text(errors="replace")):
+                    out.append(f.read_text(errors="replace"))
+            except Exception:
+                continue
+    return out
+
+
+def _ports_du_vhost(domain: str) -> list:
+    textes = _vhost_textes(domain)
+    tout = "\n".join(textes)
+    ports = []
+    for cible in re.findall(r"proxy_pass\s+https?://([^/;\s]+)", tout):
+        m = re.match(r"^(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\]|[\d.]+):(\d+)$", cible)
+        if m:
+            ports.append(int(m.group(1)))
+            continue
+        bloc = re.search(r"upstream\s+%s\s*\{([^}]*)\}" % re.escape(cible), tout)
+        if bloc:
+            ports += [int(x) for x in re.findall(r"server\s+[^;:\s]+:(\d+)", bloc.group(1))]
+    # Le premier proxy_pass du vhost est l'application ; les suivants (« /outpost… », avant-postes) viennent après.
+    vus, ordre = set(), []
+    for p_ in ports:
+        if p_ not in vus:
+            vus.add(p_)
+            ordre.append(p_)
+    return ordre
+
+
+def _cms_par_proxy(domain: str) -> dict:
+    dn = _norm_domain(domain)
+    if not dn:
+        return {}
+    try:
+        ports = _ports_du_vhost(dn)
+    except Exception:
+        ports = []
+    if not ports:
+        return {}
+    import shutil as _sh
+    moteur = "docker" if _sh.which("docker") else ("podman" if _sh.which("podman") else "")
+    conteneurs = []
+    if moteur:
+        try:
+            sortie = subprocess.run([moteur, "ps", "--format", "{{.Image}}|{{.Ports}}"], capture_output=True, text=True, timeout=10).stdout
+            conteneurs = [l.split("|", 1) for l in sortie.splitlines() if "|" in l]
+        except Exception:
+            conteneurs = []
+    try:
+        ss = subprocess.run(["ss", "-ltnpH"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        ss = ""
+    for port in ports:
+        for image, publies in conteneurs:
+            if re.search(r"(?:^|[\s,])(?:[\d.]+|\[?::\]?):%d->" % port, publies):
+                nom, version = _image_vers_application(image)
+                if nom:
+                    return {"type": nom, "version": version, "theme": "", "plugins": 0,
+                            "path": "conteneur %s (port %d)" % (image, port)}
+        for l in ss.splitlines():
+            if re.search(r":%d\s" % port, l):
+                m = re.search(r'users:\(\("([^"]+)"', l)
+                proc = (m.group(1) if m else "").split(" (")[0].strip()
+                if proc.lower() in _SERVEURS_WEB:
+                    continue
+                if not proc or proc.lower() in _PROCESSUS_GENERIQUES:
+                    # « python », « node » ne disent pas quelle application : le titre de sa page, si elle en a un
+                    titre = ""
+                    try:
+                        page = _http_get("http://127.0.0.1:%d/" % port, timeout=4)
+                        mt = _TITRE_RE.search(page or "")
+                        titre = re.split(r"\s+[—|·:-]\s+", mt.group(1).strip())[0] if mt else ""
+                    except Exception:
+                        titre = ""
+                    if titre:
+                        return {"type": titre[:40], "version": "", "theme": "", "plugins": 0,
+                                "path": "processus %s (port %d, titre de la page)" % (proc or "?", port)}
+                    continue
+                nom = _nom_application(proc)
+                try:      # la casse que l'application se donne (« OmniRoute ») si son titre la contient
+                    mt = _TITRE_RE.search(_http_get("http://127.0.0.1:%d/" % port, timeout=4) or "")
+                    mt2 = re.search(re.escape(proc), mt.group(1), re.I) if mt else None
+                    if mt2:
+                        nom = mt2.group(0)
+                except Exception:
+                    pass
+                return {"type": nom, "version": "", "theme": "", "plugins": 0,
+                        "path": "processus %s (port %d)" % (proc, port)}
+    return {}
+
+
 def _cms_sonde_http(domain: str) -> dict:
     """Interroge le site pour qu'il se nomme lui-même.
 
@@ -77318,6 +77478,15 @@ def cms_scan(force: bool = False, http: bool = True) -> dict:
             # derrière un reverse_proxy, auquel cas la racine déclarée est un
             # répertoire vide. On lui demande alors de se nommer elle-même.
             info = _cms_sonde_http(dom)
+        if not info or not info.get("version"):
+            # 08-10 : CE QUI ÉCOUTE DERRIÈRE. Le site est un reverse_proxy : on suit son proxy_pass jusqu'au port,
+            # et le port jusqu'au conteneur (son image) ou au processus. Local, sans réseau. Il nomme ce que les
+            # sondes HTTP ne connaissent pas (Authentik, OmniRoute…), et complète la version quand elles l'ignorent.
+            par_proxy = _cms_par_proxy(dom)
+            if par_proxy and not info:
+                info = par_proxy
+            elif par_proxy and info and par_proxy["type"].lower() == str(info.get("type", "")).lower() and par_proxy.get("version"):
+                info["version"] = par_proxy["version"]
         if info:
             info["domain"] = dom
             trouves.append(info)
@@ -78246,6 +78415,207 @@ def _flotte_sonde_pass(live: dict, etats: dict) -> list:
     return transitions
 
 
+# ── LE SENSORIUM DE LA FLOTTE (08-10) ──────────────────────────────────────────────────────
+# Les autres machines n'étaient vues que « en ligne / hors ligne » (et CPU, RAM, disque C: à la demande).
+# Toutes les 15 minutes, une sonde SSH par machine — la même porte que le module multi-serveurs (clé,
+# mot de passe, Tailscale) — relève ce qui compte, sous Linux (NAS compris) comme sous Windows, et l'écrit
+# dans le modèle du monde du collecteur sous `machine.<nom>.*`, daté en UTC. Une machine injoignable le dit,
+# ses anciens relevés restent avec leur âge (la perception dira « je ne sais plus »).
+FLOTTE_SENSORIUM_PERIODE = 900
+_FLOTTE_SONDE_LINUX = r"""
+df -P -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null | awk 'NR>1 && $6 !~ /^\/(snap|run|boot\/efi)/ {print "DISK " $6 " " $5 " " int($4/1048576)}'
+awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{if(t) printf "RAM %.0f\n", (t-a)/t*100}' /proc/meminfo 2>/dev/null
+echo "UP $(cut -d. -f1 /proc/uptime 2>/dev/null)"
+echo "LOAD $(cut -d' ' -f1 /proc/loadavg 2>/dev/null) $(nproc 2>/dev/null)"
+[ -f /var/run/reboot-required ] && echo "REBOOT oui" || echo "REBOOT non"
+command -v systemctl >/dev/null 2>&1 && echo "FAILED $(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+grep -h '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' | sed 's/^/OS /'
+[ -f /etc.defaults/VERSION ] && . /etc.defaults/VERSION 2>/dev/null && echo "OS DSM $productversion"
+grep -E '^md[0-9]+' -A1 /proc/mdstat 2>/dev/null | grep -o '\[[U_]*\]' | tr '\n' ' ' | sed 's/^/RAID /'; echo
+for f in /sys/class/thermal/thermal_zone*/temp; do [ -r "$f" ] && cat "$f"; done 2>/dev/null | sort -n | tail -1 | sed 's/^/TEMP /'
+"""
+_FLOTTE_SONDE_WINDOWS = r"""
+$ErrorActionPreference='SilentlyContinue'
+Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object { if($_.Size){ 'DISK {0} {1}% {2}' -f $_.DeviceID, [math]::Round(100-100*$_.FreeSpace/$_.Size), [math]::Round($_.FreeSpace/1GB) } }
+$os=Get-CimInstance Win32_OperatingSystem
+'RAM {0}' -f [math]::Round(100*($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/$os.TotalVisibleMemorySize)
+'UP {0}' -f [int]((Get-Date)-$os.LastBootUpTime).TotalSeconds
+'OS {0} {1}' -f $os.Caption, $os.Version
+$r = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
+'REBOOT {0}' -f $(if($r){'oui'}else{'non'})
+$s = Get-CimInstance Win32_Service -Filter "StartMode='Auto' AND State<>'Running'" | Where-Object { $_.Name -notmatch 'gupdate|edgeupdate|sppsvc|RemoteRegistry|MapsBroker|TrustedInstaller|GoogleUpdater|BITS|wuauserv|CDPSvc|tiledatamodelsvc|ShellHWDetection|WbioSrvc|dmwappushservice|sedsvc|uhssvc|DoSvc|AppXSvc|gpsvc|ClipSVC|InstallService|UsoSvc|WaaSMedicSvc' }
+'FAILED {0}' -f (($s | Select-Object -First 8 -ExpandProperty Name) -join ' ')
+$m = Get-MpComputerStatus
+if($m){ 'DEFENDER {0} {1}' -f $m.RealTimeProtectionEnabled, $m.AntivirusSignatureAge }
+$av = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | Where-Object { $_.displayName -notmatch 'Windows Defender|Microsoft Defender' } | Select-Object -ExpandProperty displayName
+if($av){ 'AV {0}' -f ($av -join ', ') }
+$h = Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 1
+if($h.InstalledOn){ 'WU {0}' -f [int]((Get-Date)-$h.InstalledOn).TotalDays }
+"""
+
+
+def _flotte_sonde_commande(est_windows: bool) -> str:
+    if est_windows:
+        import base64 as _b64
+        return "powershell -NoProfile -EncodedCommand " + _b64.b64encode(_FLOTTE_SONDE_WINDOWS.encode("utf-16-le")).decode()
+    import shlex as _shlex
+    return "sh -c " + _shlex.quote(_FLOTTE_SONDE_LINUX)
+
+
+def _flotte_sonde_lire_sortie(nom: str, sortie: str) -> list:
+    """Sortie de sonde → [(clé, valeur, gravité)] pour machine.<nom>.*"""
+    out = []
+    for l in (sortie or "").replace("\r", "").splitlines():
+        p = l.strip().split()
+        if not p:
+            continue
+        k = p[0]
+        try:
+            if k == "DISK" and len(p) >= 4:
+                pct = int(p[2].rstrip("%"))
+                out.append(("disque.%s" % p[1], "%d%% utilisé, %s Go libres" % (pct, p[3]), "warning" if pct >= 90 else "info"))
+            elif k == "RAM" and len(p) >= 2:
+                v = int(float(p[1]))
+                out.append(("ram", "%d%% utilisée" % v, "warning" if v >= 95 else "info"))
+            elif k == "UP" and len(p) >= 2 and p[1].isdigit():
+                sec = int(p[1])
+                out.append(("uptime", ("%d j %d h" % (sec // 86400, sec % 86400 // 3600)) if sec >= 86400 else ("%d h %d min" % (sec // 3600, sec % 3600 // 60)), "info"))
+            elif k == "LOAD" and len(p) >= 2:
+                c = float(p[1]); n = int(p[2]) if len(p) > 2 and p[2].isdigit() else 1
+                out.append(("charge", "%.2f sur %d cœur%s" % (c, n, "s" if n > 1 else ""), "warning" if c > 2 * n else "info"))
+            elif k == "REBOOT" and len(p) >= 2:
+                out.append(("redemarrage_requis", p[1], "warning" if p[1] == "oui" else "info"))
+            elif k == "FAILED":
+                noms = p[1:]
+                out.append(("services_en_echec", ("%d : %s" % (len(noms), " ".join(noms))) if noms else "0", "warning" if noms else "info"))
+            elif k == "OS" and len(p) >= 2:
+                out.append(("os", " ".join(p[1:])[:80], "info"))
+            elif k == "RAID" and len(p) >= 2:
+                motif = " ".join(p[1:])
+                out.append(("raid", motif, "warning" if "_" in motif else "info"))
+            elif k == "TEMP" and len(p) >= 2:
+                t = int(p[1]) / 1000.0
+                out.append(("temperature", "%.0f °C" % t, "warning" if t >= 85 else "info"))
+            elif k == "DEFENDER" and len(p) >= 3:
+                actif = p[1].lower() == "true"
+                age = int(p[2]) if p[2].isdigit() else 0
+                out.append(("antivirus", ("Defender actif, signatures de %d j" % age) if actif else "Defender inactif",
+                            "warning" if (actif and age > 7) or not actif else "info"))
+            elif k == "AV" and len(p) >= 2:
+                # Un antivirus tiers déclaré au Centre de sécurité : Defender inactif est alors normal.
+                tiers = " ".join(p[1:])[:80]
+                out = [x for x in out if x[0] != "antivirus"]
+                out.append(("antivirus", "%s (Defender en retrait)" % tiers, "info"))
+            elif k == "WU" and len(p) >= 2 and p[1].lstrip("-").isdigit():
+                j = int(p[1])
+                out.append(("mises_a_jour", "dernière mise à jour il y a %d j" % j, "warning" if j > 45 else "info"))
+        except Exception:
+            continue
+    return out
+
+
+def flotte_sensorium_passe() -> dict:
+    """Une passe sur toutes les machines SSH activées du module multi-serveurs (sauf retirées)."""
+    try:
+        machines = [m for m in (_ms_load() or []) if m.get("enabled", True) and m.get("type") == "ssh"]
+    except Exception as e:
+        return {"ok": False, "erreur": str(e)}
+    etats = _fleet_etats()
+    machines = [m for m in machines if etats.get(str(m.get("name", "")).lower()) != "retiree"]
+    resultats = {}
+
+    def _une(m):
+        nom = str(m.get("name") or "")
+        est_win = str(m.get("os", "")).lower() == "windows"
+        try:
+            out, err, rc = _ms_ssh_exec(m, _flotte_sonde_commande(est_win), timeout=40)
+        except Exception as e:
+            out, err, rc = "", str(e), 255
+        return nom, (_flotte_sonde_lire_sortie(nom, out) if out else []), (err or "").strip()[:160], rc
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    with _TPE(max_workers=4) as ex:
+        for nom, lignes, err, rc in ex.map(_une, machines):
+            resultats[nom] = {"releves": len(lignes), "erreur": "" if lignes else (err or "rc=%s" % rc)}
+            _flotte_sensorium_ecrire(nom, lignes, "" if lignes else (err or "aucune réponse"))
+    return {"ok": True, "machines": resultats}
+
+
+def _flotte_sensorium_ecrire(nom: str, lignes: list, erreur: str) -> None:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    local = datetime.now().isoformat()
+    base = "machine.%s." % _flotte_nom(nom)
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS world_model (wkey TEXT PRIMARY KEY, category TEXT, value TEXT, detail TEXT, "
+                         "severity TEXT DEFAULT 'info', source TEXT DEFAULT 'observed', observed_at TEXT, updated_at TEXT)")
+            vus = set()
+            ecrits = list(lignes) + [("sonde", "ok" if lignes else "injoignable : %s" % erreur[:120], "info" if lignes else "warning")]
+            for cle, val, sev in ecrits:
+                wk = base + cle
+                vus.add(wk)
+                ancien = conn.execute("SELECT value, severity FROM world_model WHERE wkey=?", (wk,)).fetchone()
+                if ancien is None:
+                    conn.execute("INSERT INTO world_model (wkey, category, value, severity, source, observed_at, updated_at) "
+                                 "VALUES (?,?,?,?, 'flotte', ?, ?)", (wk, "machine", val, sev, now, now))
+                elif ancien[0] != val or ancien[1] != sev:
+                    conn.execute("UPDATE world_model SET value=?, severity=?, observed_at=?, updated_at=? WHERE wkey=?", (val, sev, now, now, wk))
+                    if ancien[1] != sev or not re.match(r"(ram|charge|uptime|disque\.)", cle):
+                        conn.execute("INSERT INTO changelog (ts, entity_type, entity_name, change_type, old_value, new_value, severity) "
+                                     "VALUES (?,?,?,?,?,?,?)", (local, "machine", wk, "modified", str(ancien[0])[:300], val[:300], sev))
+                else:
+                    conn.execute("UPDATE world_model SET observed_at=? WHERE wkey=?", (now, wk))
+            if lignes:      # une machine qui a répondu : ce qu'elle ne rapporte plus a disparu (disque démonté…)
+                for (wk,) in conn.execute("SELECT wkey FROM world_model WHERE wkey LIKE ?", (base + "%",)).fetchall():
+                    if wk not in vus:
+                        conn.execute("DELETE FROM world_model WHERE wkey=?", (wk,))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logging.warning("[FLOTTE] sensorium %s : %s", nom, e)
+
+
+def _flotte_sensorium_boucle() -> None:
+    time.sleep(120)
+    while True:
+        try:
+            r = flotte_sensorium_passe()
+            logging.info("[FLOTTE] sensorium : %s", r.get("machines") or r.get("erreur"))
+        except Exception as e:
+            logging.warning("[FLOTTE] sensorium : %s", e)
+        time.sleep(FLOTTE_SENSORIUM_PERIODE)
+
+
+def sensorium_etat() -> dict:
+    """L'état complet pour la page Sensorium : le modèle du monde (filtré par l'engagement de la flotte), les
+    changements récents, les corrélations, et la santé du lien avec le collecteur."""
+    rows = world_model_from_socket() or []
+    source = "collecteur"
+    if not rows:
+        source = "base (collecteur muet)"
+        rows = query_db("SELECT wkey, category, value, severity, observed_at, detail FROM world_model ORDER BY wkey") or []
+        rows = [dict(r) if not isinstance(r, dict) else r for r in rows]
+    # machine.* est écrit par Cassandra elle-même dans la base : le socket le rend aussi (même table)
+    try:
+        rows = _flotte_filtrer_rows(rows)
+    except Exception:
+        pass
+    try:
+        changes = world_changes_from_socket() or []
+    except Exception:
+        changes = []
+    try:
+        corr = [dict(r) if not isinstance(r, dict) else r for r in
+                (query_db("SELECT ts, entite, alerte, causes FROM correlations ORDER BY id DESC LIMIT 30") or [])]
+    except Exception:
+        corr = []
+    return {"ok": True, "source": source, "rows": rows, "changes": changes, "correlations": corr,
+            "collecteur_erreur": _SOCKET_DERNIERE_ERREUR.get("message") or "",
+            "maintenant": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+
 def _sensorium_heure_locale(ts) -> str:
     """Le collecteur date ses relevés en UTC (« …Z », depuis le 08-10) ; l'écran les montre à l'heure locale.
     Une date sans « Z » est d'avant : déjà locale, rendue telle quelle."""
@@ -78592,11 +78962,13 @@ def _flotte_filtrer_rows(rows: list) -> list:
         out = []
         for r in rows:
             wk = str(r.get("wkey") or "") if isinstance(r, dict) else ""
-            if wk.startswith("fleet."):
-                st = etats.get(_flotte_nom(wk[6:]), "attendue")
+            if wk.startswith("fleet.") or wk.startswith("machine."):
+                # machine.<nom>.<relevé> (sensorium de la flotte, 08-10) suit le même engagement que fleet.<nom>
+                nom_m = wk[6:] if wk.startswith("fleet.") else wk.split(".")[1]
+                st = etats.get(_flotte_nom(nom_m), "attendue")
                 if st == "retiree":
                     continue
-                if st == "intermittente" and r.get("severity") == "warning":
+                if st == "intermittente" and r.get("severity") == "warning" and (wk.startswith("fleet.") or wk.endswith(".sonde")):
                     r = dict(r); r["severity"] = "info"; r["value"] = str(r.get("value") or "") + " (absence volontaire)"
             out.append(r)
         return out
@@ -94675,6 +95047,26 @@ class CassandraHandler(BaseHTTPRequestHandler):
             self.send_json(ms_aggregate_metrics())
             return
 
+        # ── LA PAGE SENSORIUM (08-10) : tout ce que les capteurs disent, réservé à l'administrateur ──
+        if path.startswith("/api/sensorium/"):
+            _ssid = self.headers.get("X-Session-Token", "") or data.get("session", "")
+            if not validate_session(_ssid):
+                self.send_json({"error": "Non autorisé"}, 401)
+                return
+            if not is_admin(get_session_user(_ssid)):
+                self.send_json({"ok": False}, 404)
+                return
+            try:
+                if path == "/api/sensorium/etat":
+                    self.send_json(sensorium_etat()); return
+                if path == "/api/sensorium/flotte":
+                    threading.Thread(target=flotte_sensorium_passe, daemon=True, name="flotte-sensorium-demande").start()
+                    self.send_json({"ok": True, "lance": True}); return
+                self.send_json({"ok": False, "error": "route inconnue"}, 404); return
+            except Exception as e:
+                logging.warning("[SENSORIUM] %s : %s", path, e)
+                self.send_json({"ok": False, "error": str(e)[:200]}, 500); return
+
         # ── Flotte : historique, actions réelles, rattachements ──
         # Toutes enveloppées : une exception ici tuait le fil de la requête et
         # le navigateur n'affichait qu'un « NetworkError » qui ne désigne rien.
@@ -104137,6 +104529,7 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
         <!-- L'entrée d'origine du chat : cachée pour tout le monde (applyRoleGating), le chat vit dans Le Salon. -->
         <div class="sb-item" data-tab="dashboard" onclick="switchTab('dashboard')"><span class="sb-dot"></span>Cassandra</div>
         <div class="sb-item" data-tab="history" onclick="switchTab('history')"><span class="sb-dot"></span>Historique</div>
+        <div class="sb-item" data-tab="sensorium" onclick="switchTab('sensorium')"><span class="sb-dot"></span>Sensorium<span id="sn-badge" style="display:none;background:var(--warn);color:var(--on-accent);border-radius:8px;padding:0 5px;font-size:9px;margin-left:6px"></span></div>
         <div class="sb-item" data-tab="journal" onclick="switchTab('journal')"><span class="sb-dot"></span>Journaux</div>
         <!-- Les tâches planifiées étaient rangées dans « Outils », comme un
              utilitaire de création. C'est d'abord une surface de surveillance :
@@ -105097,6 +105490,30 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
       </div>
     </aside>
 </div>
+
+<div id="tab-sensorium" class="tab-content mx-app">
+    <!-- LE SENSORIUM (08-10) : ce que les capteurs disent MAINTENANT, avec l'âge de chaque relevé, ce qui va arriver,
+         ce qui a changé et pourquoi — et l'état des capteurs eux-mêmes. -->
+    <header class="mx-head">
+      <div><h1>Sensorium</h1><p class="mx-lede">Ce que Cassandra perçoit de ses machines, mesuré — jamais rappelé. Chaque relevé dit son âge.</p></div>
+      <nav class="mx-scenes" aria-label="Vues">
+        <span class="mx-scenes-lab">Vue</span>
+        <button class="mx-scene" data-vue="maintenant" onclick="snVue('maintenant')">Maintenant</button>
+        <button class="mx-scene" data-vue="changements" onclick="snVue('changements')">Ce qui a changé</button>
+        <button class="mx-scene" data-vue="capteurs" onclick="snVue('capteurs')">Les capteurs</button>
+        <button class="mx-scene" onclick="snRelever()">Relever la flotte</button>
+      </nav>
+    </header>
+    <div class="mx-body">
+      <aside class="mx-rail" aria-label="Familles">
+        <div class="mx-rail-h"><b>Familles</b><span id="sn-rail-sous">Un clic ouvre la famille</span></div>
+        <div id="sn-list" class="mx-list"></div>
+      </aside>
+      <main id="sn-page" class="mx-main">
+        <div class="empty-state" style="padding:40px">Chargement…</div>
+      </main>
+    </div>
+  </div>
 
 <div id="tab-history" class="tab-content mx-app">
     <header class="mx-head">
@@ -108962,7 +109379,7 @@ async function applyRoleGating() {
 // Un onglet absent de cette liste ne reçoit jamais la classe `active` : sa
 // page reste vide sans la moindre erreur. C'est exactement ce qui est arrivé à
 // « Vue d'ensemble » — le balisage était bon, personne ne l'affichait.
-const ALL_TABS = ['dashboard','overview','history','fleet','securite','fastpanel','memory','journal','crons','evolution','proactive','salon','mysites','bureau','vault','settings'];
+const ALL_TABS = ['dashboard','overview','history','sensorium','fleet','securite','fastpanel','memory','journal','crons','evolution','proactive','salon','mysites','bureau','vault','settings'];
 
 /* ═══ L'ÉCRAN DE L'ÉVOLUTION ═══════════════════════════════════════════════════
    Refait le 18 septembre dans la grammaire commune (maquette v1 validée par l'administrateur : « go applique tout ») :
@@ -110277,6 +110694,7 @@ function switchTab(name, sansHistorique) {
         if(el) el.classList.toggle('active', n===name);
     });
     if(name==='history')   mxEntrer();
+    if(name==='sensorium') snEntrer();
     if(name==='fleet')     fl2Charger();
     if(name==='securite')  scEntrer();
     // Le résumé n'est plus rafraîchi en tâche de fond hors de ces deux
@@ -114463,6 +114881,96 @@ const _MX_JOURS=['dim.','lun.','mar.','mer.','jeu.','ven.','sam.'];
 // L'ouverture : la liste des sources, puis la vue demandée (une courbe si un autre écran l'a
 // demandée, le verdict sinon). Un jeton de séquence par chargement : la réponse d'un clic
 // précédent, arrivée en retard, n'écrase plus celle du dernier clic.
+/* ═══ LE SENSORIUM (08-10) ═══════════════════════════════════════════════════════════════ */
+const SN = {etat:null, vue:'maintenant', fam:null};
+const SN_FAMILLES = [
+  ['system','Système','system.'], ['ressources','Ressources','cpu.|ram.|swap.|load.|disk.|montage.'], ['service','Services','service.|systemd.'],
+  ['docker','Conteneurs','docker.'], ['web','Sites','web.'], ['controle','Contrôles de bout en bout','controle.'],
+  ['ssl','Certificats','ssl.'], ['sauvegarde','Sauvegardes','sauvegarde.'], ['prevision','Ce qui va arriver','prevision.'],
+  ['flotte','Flotte','fleet.|machine.'], ['config','Config de Cassandra','config.'], ['logiciel','Logiciels','logiciel.'],
+  ['reseau','Réseau','interface.|port.'], ['stockage','Stockage','stockage.'], ['securite','Sécurité','security.'],
+  ['maj','Mises à jour','maj.'], ['capteur','Capteurs','capteur.'], ['sante','Santé','health.']
+];
+function _snE(t){ return (typeof flE==='function') ? flE(t) : String(t==null?'':t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function _snFam(wk){ for(const f of SN_FAMILLES){ if(f[2].split('|').some(p=>wk.startsWith(p))) return f[0]; } return 'autre'; }
+function _snAge(ts){
+  if(!ts) return '?';
+  let t = String(ts); if(!/[zZ]$|[+-]\d\d:?\d\d$/.test(t)) t = t.replace(' ','T');   // sans « Z » : heure locale (ancien format)
+  const d = new Date(t); if(isNaN(d)) return '?';
+  const s = Math.max(0, (Date.now() - d.getTime())/1000);
+  return s<60 ? Math.round(s)+' s' : s<3600 ? Math.round(s/60)+' min' : s<86400 ? Math.round(s/3600)+' h' : Math.round(s/86400)+' j';
+}
+function _snCauses(r){ try{ const d = r.detail ? JSON.parse(r.detail) : null; return (d && d.causes_probables) || []; }catch(e){ return []; } }
+function _snNom(wk){ const i = wk.indexOf('.'); return i>=0 ? wk.slice(i+1) : wk; }
+async function snEntrer(){
+  try{ SN.etat = await apiPost('/api/sensorium/etat', {}); }catch(e){ SN.etat = {ok:false, error:String(e)}; }
+  snRail(); snRendre();
+}
+function snVue(v){ SN.vue = v; SN.fam = null; document.querySelectorAll('#tab-sensorium .mx-scene').forEach(b=>b.classList.toggle('on', b.dataset.vue===v)); snRendre(); }
+async function snRelever(){
+  try{ await apiPost('/api/sensorium/flotte', {}); }catch(e){}
+  const p = document.getElementById('sn-page'); if(p) p.insertAdjacentHTML('afterbegin','<div class="mx-sec"><div class="mx-vsub">Relevé de la flotte lancé : les machines répondent en moins d\'une minute. Rouvrez la page pour voir leurs mesures.</div></div>');
+}
+function snRail(){
+  const el = document.getElementById('sn-list'); if(!el) return;
+  const rows = (SN.etat && SN.etat.rows) || [];
+  const par = {}; rows.forEach(r=>{ const f=_snFam(String(r.wkey||'')); (par[f]=par[f]||{n:0,w:0}); par[f].n++; if(r.severity==='warning') par[f].w++; });
+  let h = '';
+  SN_FAMILLES.forEach(([k,lib])=>{ const c = par[k]; if(!c) return;
+    h += `<button class="mx-item${SN.fam===k?' on':''}" onclick="SN.fam='${k}';SN.vue='famille';snRail();snRendre()"><span class="mx-dot ${c.w?'warn':'ok'}"></span><span class="nm">${_snE(lib)}</span><span class="mx-st${c.w?' off':''}">${c.w?c.w+' ⚠':c.n}</span></button>`; });
+  el.innerHTML = h || '<div class="mx-fam">rien de relevé</div>';
+  const nW = rows.filter(r=>r.severity==='warning').length;
+  const b = document.getElementById('sn-badge'); if(b){ b.style.display = nW?'':'none'; b.textContent = nW; }
+}
+function _snLigne(r, avecFam){
+  const wk = String(r.wkey||''), w = r.severity==='warning', causes = _snCauses(r);
+  return `<div class="mx-row"><span class="mx-dot ${w?'warn':'ok'}"></span>
+    <div class="mx-rt"><b>${_snE(_snNom(wk))}${avecFam?` <span class="mx-pill">${_snE(wk.split('.')[0])}</span>`:''}</b><span>${_snE(r.value)}</span>
+    ${causes.length?`<span style="color:var(--warn)">cause probable : ${_snE(causes[0])}${causes.length>1?` <span class="mx-st">(+${causes.length-1})</span>`:''}</span>`:''}</div>
+    <span class="mx-st" title="${_snE(r.observed_at||'')}">il y a ${_snAge(r.observed_at)}</span></div>`;
+}
+function snRendre(){
+  const page = document.getElementById('sn-page'); if(!page) return;
+  const E = SN.etat;
+  if(!E || !E.ok){ page.innerHTML = `<div class="mx-sec"><div class="mx-verdict"><span class="mx-vmark panne"></span><div><p class="mx-vtitle">Le sensorium ne répond pas</p><p class="mx-vsub">${_snE((E&&E.error)||'')}</p></div></div></div>`; return; }
+  const rows = E.rows||[];
+  if(SN.vue==='famille' && SN.fam){
+    const lib = (SN_FAMILLES.find(f=>f[0]===SN.fam)||[])[1]||SN.fam;
+    const sel = rows.filter(r=>_snFam(String(r.wkey||''))===SN.fam).sort((a,b)=>(b.severity==='warning')-(a.severity==='warning') || String(a.wkey).localeCompare(String(b.wkey)));
+    page.innerHTML = `<section class="mx-sec"><div class="mx-eyebrow">${_snE(lib)} · ${sel.length} relevé${sel.length>1?'s':''}</div><div class="mx-rows">${sel.map(r=>_snLigne(r,false)).join('')}</div></section>`;
+    return;
+  }
+  if(SN.vue==='changements'){
+    const ch = E.changes||[], co = E.correlations||[];
+    page.innerHTML = (co.length?`<section class="mx-sec"><div class="mx-eyebrow">Alertes et leur cause probable</div><div class="mx-rows">${co.map(c=>{ let cs=[]; try{cs=JSON.parse(c.causes||'[]');}catch(e){}
+        return `<div class="mx-row"><span class="mx-dot warn"></span><div class="mx-rt"><b>${_snE(_snNom(String(c.entite||'')))}</b><span>${_snE(c.alerte)}</span>${cs.map(x=>`<span>↳ ${_snE(x)}</span>`).join('')}</div><span class="mx-st">${_snE(String(c.ts||'').slice(0,16).replace('T',' '))}</span></div>`; }).join('')}</div></section>`:'')
+      + `<section class="mx-sec"><div class="mx-eyebrow">Derniers changements</div><div class="mx-rows">${ch.map(c=>`<div class="mx-row"><span class="mx-dot ${c.severity==='warning'?'warn':''}"></span><div class="mx-rt"><b>${_snE(c.entity_name)} <span class="mx-pill">${_snE({added:'apparu',removed:'disparu',modified:'changé'}[c.change_type]||c.change_type)}</span></b><span>${_snE(c.new_value||c.old_value||'')}</span></div><span class="mx-st">${_snE(String(c.ts||'').slice(5,16).replace('T',' '))}</span></div>`).join('') || '<div class="mx-vsub">Aucun changement relevé.</div>'}</div></section>`;
+    return;
+  }
+  if(SN.vue==='capteurs'){
+    const cap = rows.filter(r=>String(r.wkey||'').startsWith('capteur.'));
+    page.innerHTML = `<section class="mx-sec"><div class="mx-eyebrow">Les capteurs eux-mêmes · ${cap.filter(r=>r.severity==='warning').length} en défaut</div><p class="mx-vsub" style="margin:0">Un capteur en panne ou muet ne mesure plus : ce qu'il avait relevé vieillit sans le dire. On le dit ici.</p><div class="mx-rows">${cap.map(r=>_snLigne(r,false)).join('') || '<div class="mx-vsub">Pas encore de santé des capteurs (premier cycle en cours).</div>'}</div></section>`;
+    return;
+  }
+  // MAINTENANT : le verdict, ce qui demande un geste, ce qui va arriver, les chiffres clés
+  const alertes = rows.filter(r=>r.severity==='warning' && !String(r.wkey).startsWith('capteur.'));
+  const capKO = rows.filter(r=>r.severity==='warning' && String(r.wkey).startsWith('capteur.'));
+  const prev = rows.filter(r=>String(r.wkey).startsWith('prevision.'));
+  const get = k => (rows.find(r=>r.wkey===k)||{}).value;
+  const titre = alertes.length ? `${alertes.length} point${alertes.length>1?'s':''} demande${alertes.length>1?'nt':''} un regard` : 'Tout ce qui est mesuré va bien';
+  const kpi = (lib, v, em) => v ? `<div class="mx-kpi"><span>${_snE(lib)}</span><b>${_snE(v)}</b>${em?`<em>${_snE(em)}</em>`:''}</div>` : '';
+  page.innerHTML =
+    `<section class="mx-sec"><div class="mx-verdict"><span class="mx-vmark ${alertes.length?'':'stable'}"></span><div><p class="mx-vtitle">${titre}</p>
+      <p class="mx-vsub">${_snE(get('system.hostname')||'')} · ${_snE(get('system.os')||'')} · allumée depuis ${_snE(get('system.uptime')||'?')} · ${rows.length} relevés${E.source!=='collecteur'?' · <b>'+_snE(E.source)+'</b>':''}${capKO.length?` · <a style="color:var(--warn);cursor:pointer" onclick="snVue('capteurs')">${capKO.length} capteur${capKO.length>1?'s':''} en défaut</a>`:''}</p></div></div>
+      <div class="mx-kpis">${kpi('Santé', get('health.score'))}${kpi('Disque /', get('disk./.usage'))}${kpi('RAM', get('ram.usage'))}${kpi('Charge', get('load.1m'), get('cpu.load')?'CPU '+get('cpu.load'):'')}${kpi('Température', get('system.temperature'))}${kpi('Mises à jour', (get('maj.paquets')||'').split(',')[0])}</div></section>`
+    + (alertes.length?`<section class="mx-sec"><div class="mx-eyebrow">Ce qui demande un regard</div><div class="mx-rows">${alertes.map(r=>_snLigne(r,true)).join('')}</div></section>`:'')
+    + (prev.length?`<section class="mx-sec"><div class="mx-eyebrow">Ce qui va arriver</div><div class="mx-rows">${prev.map(r=>_snLigne(r,false)).join('')}</div></section>`:'')
+    + `<section class="mx-sec"><div class="mx-eyebrow">La flotte</div><div class="mx-rows">${rows.filter(r=>String(r.wkey).startsWith('fleet.')).map(r=>{
+          const m = String(r.wkey).slice(6), det = rows.filter(x=>String(x.wkey).startsWith('machine.'+m+'.') && !String(x.wkey).endsWith('.sonde'));
+          const w = r.severity==='warning' || det.some(x=>x.severity==='warning');
+          return `<div class="mx-row"><span class="mx-dot ${w?'warn':'ok'}"></span><div class="mx-rt"><b>${_snE(m)}</b><span>${_snE(r.value)}${det.length?' · '+det.slice(0,4).map(x=>_snE(String(x.wkey).split('.').slice(2).join('.').replace(/_/g,' '))+' '+_snE(x.value)).join(' · '):''}</span></div><span class="mx-st">il y a ${_snAge(r.observed_at)}</span></div>`; }).join('') || '<div class="mx-vsub">Aucune machine relevée.</div>'}</div></section>`;
+}
+
 async function mxEntrer(){
     const box=document.getElementById('mx-list'); if(!box) return;
     if(!MX.list.length) box.innerHTML='<div style="padding:10px;font-size:11px;color:var(--txt-faint)">Chargement…</div>';
@@ -147189,7 +147697,8 @@ if __name__ == "__main__":
         except Exception as _e:
             logging.info("[MEM] veille non armee : %s" % str(_e)[:120])
         start_proactive()             # [PROACTIVE] veille Sensorium → détection → action sous garde
-        threading.Thread(target=_memoire_sauvegarde_boucle, daemon=True, name="memoire-sauvegarde").start()  # [MEMORY] une copie par jour (lot 0, 21-09)
+        threading.Thread(target=_memoire_sauvegarde_boucle, daemon=True, name="memoire-sauvegarde").start()
+        threading.Thread(target=_flotte_sensorium_boucle, daemon=True, name="flotte-sensorium").start()  # [SENSORIUM] la flotte, toutes les 15 min (08-10)  # [MEMORY] une copie par jour (lot 0, 21-09)
         salon_presence_demarrer()     # [SALON] les résidents répondent à ce qui leur est adressé
         start_itare_autonome()        # [ITARE] étage autonome local (OFF par défaut, toggle: itare_autonome_enabled)
         start_vault_seed()            # [VAULT] rapatrie les secrets dans le coffre (filet : fichiers conservés)
