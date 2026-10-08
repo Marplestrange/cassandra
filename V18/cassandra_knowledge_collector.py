@@ -34,12 +34,13 @@ import socket
 import time
 import hashlib
 import configparser
+import shlex
 import threading
 import atexit
 import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed   # PERF[O6]
 from functools import lru_cache                                    # PERF[O1]
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Any, Optional, Tuple
@@ -224,6 +225,13 @@ def init_all_tables():
             swap_avg REAL,
             la1_avg REAL, la1_max REAL
         );
+        CREATE TABLE IF NOT EXISTS cassandra_config (id INTEGER PRIMARY KEY AUTOINCREMENT, cle TEXT UNIQUE, etat TEXT, valeur TEXT, last_check TEXT);
+        CREATE TABLE IF NOT EXISTS storage_health (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, type TEXT, etat TEXT, detail TEXT, last_check TEXT);
+        CREATE TABLE IF NOT EXISTS interfaces (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, etat TEXT, adresses TEXT, route_defaut INTEGER, last_check TEXT);
+        CREATE TABLE IF NOT EXISTS hardware_state (id INTEGER PRIMARY KEY AUTOINCREMENT, temp_max REAL, batterie TEXT, heure_synchro TEXT, fuseau TEXT, os TEXT, arch TEXT, virtualisation TEXT, pare_feu TEXT, securite_noyau TEXT, last_check TEXT);
+        CREATE TABLE IF NOT EXISTS logiciels (id INTEGER PRIMARY KEY AUTOINCREMENT, nom TEXT UNIQUE, installe INTEGER, chemin TEXT, last_check TEXT);
+        CREATE TABLE IF NOT EXISTS apt_updates (id INTEGER PRIMARY KEY AUTOINCREMENT, total INTEGER, securite INTEGER, paquets TEXT, last_check TEXT);
+        CREATE TABLE IF NOT EXISTS system_state (id INTEGER PRIMARY KEY AUTOINCREMENT, uptime_s INTEGER, reboot_required INTEGER, reboot_pkgs TEXT, tailscale TEXT, tailscale_ip TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS config_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             path TEXT UNIQUE,
@@ -321,7 +329,10 @@ def get_disk():
         total = stat.f_blocks * stat.f_frsize
         free  = stat.f_bfree  * stat.f_frsize
         used  = total - free
-        return {"percent": round(100.0 * used / total, 1),
+        # Le pourcentage de `df` : utilisé / (utilisé + disponible POUR LES UTILISATEURS). Avec la réserve
+        # root comptée comme libre, le disque paraissait moins plein que ce que df affiche (08-10).
+        dispo = stat.f_bavail * stat.f_frsize
+        return {"percent": round(100.0 * used / max(used + dispo, 1), 1),
                 "total_gb": round(total / 1024**3, 1),
                 "used_gb":  round(used  / 1024**3, 1)}
     except Exception:
@@ -673,7 +684,7 @@ def collect_fastpanel_users() -> list:
                 continue
             seen.add(d.name)
             try:
-                out = run_cmd(f"du -sb {data_dir} 2>/dev/null")
+                out = run_cmd(f"du -sb {shlex.quote(str(data_dir))} 2>/dev/null")
                 used_gb = round(int(out.split()[0]) / 1024**3, 2) if out else 0
             except Exception:
                 used_gb = 0
@@ -776,7 +787,7 @@ def _collect_fastpanel_domains_brut() -> list:
         ssl_days    = 0
         cert = f"/etc/letsencrypt/live/{name}/cert.pem"
         if ssl_enabled and Path(cert).exists():
-            out_ssl = run_cmd(f"openssl x509 -in {cert} -noout -enddate 2>/dev/null")
+            out_ssl = run_cmd(f"openssl x509 -in {shlex.quote(str(cert))} -noout -enddate 2>/dev/null")
             dm = re.search(r"notAfter=(.+)", out_ssl)
             if dm:
                 try:
@@ -1688,18 +1699,22 @@ def collect_web_sites():
     now   = datetime.now().isoformat()
     seen  = set()
 
-    def add_site(domain, ssl, server_type, doc_root="", php=""):
-        domain = domain.strip()
-        if not domain or domain.startswith("_") or domain in seen:
+    def add_site(domain, ssl, server_type, doc_root="", php="", ip=""):
+        domain = domain.strip().lower().rstrip(".")
+        # « server_name --; » ou « _ » : des attrape-tout, pas des sites (le faux site « -- » d'Orion, 08-10)
+        if not domain or domain in seen or not _nom_de_site_valide(domain):
             return
         seen.add(domain)
         sites.append({"domain": domain, "ssl_enabled": 1 if ssl else 0,
                       "server_type": server_type, "php_version": php,
-                      "document_root": doc_root, "status": "active",
+                      "document_root": doc_root, "status": "active", "listen_ip": ip,
                       "last_check": now})
 
+    # /etc/nginx/fastpanel2-sites : les sites ACTIFS de FastPanel 2 (un dossier par utilisateur). Il manquait :
+    # coffre, app, search… n'existaient pas pour le sensorium (08-10). Les « .includes » et leurs copies
+    # (.bak, .avant-…) ne déclarent pas de site : seuls les .conf sont lus là-dedans.
     nginx_dirs = ["/etc/nginx/sites-enabled", "/etc/nginx/conf.d",
-                  "/etc/nginx/vhosts.d", "/usr/local/fastpanel2/etc/nginx"]
+                  "/etc/nginx/vhosts.d", "/usr/local/fastpanel2/etc/nginx", "/etc/nginx/fastpanel2-sites"]
     for ndir in nginx_dirs:
         p = Path(ndir)
         if not p.exists():
@@ -1707,15 +1722,18 @@ def collect_web_sites():
         for conf in p.rglob("*"):
             if not conf.is_file():
                 continue
+            if ndir.endswith("fastpanel2-sites") and conf.suffix != ".conf":
+                continue
             try:
                 content = conf.read_text(errors="replace")
                 ssl = bool(re.search(r"ssl_certificate", content))
                 root_m = re.search(r"root\s+([^;]+);", content)
                 root = root_m.group(1).strip() if root_m else ""
+                ip_m = re.search(r"^\s*listen\s+(\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-fA-F:]+\]):\d+", content, re.M)
                 for sn in re.findall(r"server_name\s+([^;]+);", content):
                     for domain in sn.strip().split():
                         if domain and not domain.startswith(("_", "*", "#")):
-                            add_site(domain, ssl, "nginx", root)
+                            add_site(domain, ssl, "nginx", root, ip=ip_m.group(1) if ip_m else "")
             except Exception:
                 pass
 
@@ -1739,6 +1757,14 @@ def collect_web_sites():
             except Exception:
                 pass
 
+    # LE SITE RÉPOND-IL ? Le statut était « active » par principe, jamais mesuré. Sondé ici, en parallèle.
+    if sites:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for site, code in zip(sites, ex.map(lambda s: _sonde_http(s["domain"], s.get("listen_ip") or ""), sites)):
+                site["http_code"] = code
+                # `status` reste « active » (le site est déclaré) : l'écran Sites et le tableau de bord le lisent
+                # ainsi. La MESURE va dans sa propre colonne.
+                site["reponse"] = "répond" if code != "000" and int(code) < 500 else ("erreur %s" % code if code != "000" else "ne répond pas")
     return sorted(sites, key=lambda x: x["domain"])
 
 
@@ -1754,7 +1780,7 @@ def collect_ssl_certificates():
         if not Path(cert_path).exists():
             return None
         seen_paths.add(cert_path)
-        out = run_cmd(f"openssl x509 -in {cert_path} -noout -enddate -subject -issuer -ext subjectAltName 2>/dev/null")
+        out = run_cmd(f"openssl x509 -in {shlex.quote(cert_path)} -noout -enddate -subject -issuer -ext subjectAltName 2>/dev/null")
         if not out:
             return None
         date_m = re.search(r"notAfter=(.+)", out)
@@ -1867,7 +1893,7 @@ def collect_fail2ban_banned():
         return []
     jails = [j.strip() for j in jail_m.group(1).split(",") if j.strip()]
     for jail in jails:
-        status = run_cmd(f"fail2ban-client status {jail} 2>/dev/null")
+        status = run_cmd(f"fail2ban-client status {shlex.quote(jail)} 2>/dev/null")
         if not status:
             continue
         ips_m = re.search(r"Banned IP list:\s*(.*)", status)
@@ -1921,13 +1947,25 @@ def collect_oom_events():
         if not mem_mb:
             mem_match2 = re.search(r'anon-rss:(\d+)kB', line)
             mem_mb = round(int(mem_match2.group(1)) / 1024) if mem_match2 else 0
+        # dmesg garde ses OOM jusqu'au redémarrage : sans leur date, un OOM d'il y a trois semaines pénalisait
+        # encore le score de santé (08-10). « recent » = dans les dernières 24 h.
+        recent = 0
+        try:
+            quand = datetime.strptime(" ".join(str(ts).split()), "%a %b %d %H:%M:%S %Y")
+            recent = 1 if datetime.now() - quand < timedelta(hours=24) else 0
+        except Exception:
+            recent = 0 if ts_match else 1
         events.append({"ts": ts, "killed_process": process[:80],
-                       "memory_used_mb": mem_mb, "last_check": now})
+                       "memory_used_mb": mem_mb, "recent": recent, "last_check": now})
     return events
 
 
 def collect_docker_containers():
-    out = run_cmd("docker ps -a --format '{{.Names}}|{{.Status}}|{{.Image}}' 2>/dev/null")
+    # Docker, ou Podman là où Docker n'est pas (RHEL, Fedora) : même format de sortie (08-10).
+    moteur = "docker" if _qui("docker") else ("podman" if _qui("podman") else "")
+    if not moteur:
+        return []
+    out = run_cmd(moteur + " ps -a --format '{{.Names}}|{{.Status}}|{{.Image}}' 2>/dev/null")
     containers = []
     for line in out.splitlines():
         parts = line.split("|")
@@ -1963,7 +2001,12 @@ def collect_network_hosts():
             data = json.loads(neigh_out)
             for entry in data:
                 state = entry.get("state", "")
-                if isinstance(state, str) and state.lower() in ("reachable","stale","delay","probe","noarp"):
+                # `ip -j neigh` rend l'état en LISTE (["REACHABLE"]) : comparé comme une chaîne, aucun voisin
+                # n'était jamais retenu et la table restait vide (08-10).
+                if isinstance(state, list):
+                    state = state[0] if state else ""
+                state = str(state).lower()
+                if state in ("reachable", "stale", "delay", "probe", "noarp", "permanent"):
                     ip = entry.get("dst")
                     if ip and ip not in seen:
                         seen.add(ip)
@@ -2258,6 +2301,8 @@ def save_fp_stats(server, processes, disk, net):
     except Exception as e:
         conn.rollback()
         print(f"[FP] save_fp_stats error: {e}", file=sys.stderr)
+    finally:
+        conn.close()
 
 # ============================================================
 # RÉTENTION 3 NIVEAUX — Evo 2
@@ -2711,7 +2756,7 @@ def collect_disk_smart():
         parts = line.split()
         if len(parts) >= 2 and parts[1] == "disk":
             dev = f"/dev/{parts[0]}"
-            out = run_cmd(f"smartctl -H {dev}")
+            out = run_cmd(f"smartctl -H {shlex.quote(dev)}")
             health = "PASSED" if "PASSED" in out else "FAILED" if "FAILED" in out else "unknown"
             smart_data.append({"device": dev, "health": health,
                                 "reallocated_sectors": 0, "pending_sectors": 0,
@@ -2767,7 +2812,7 @@ def collect_backup_runs():
                 log_status = "unknown"
                 log_path = Path(f"/var/log/rclone/{section}.log")
                 if log_path.exists():
-                    last_line = run_cmd(f"tail -1 {log_path}")
+                    last_line = run_cmd(f"tail -1 {shlex.quote(str(log_path))}")
                     if "Transferred" in last_line:
                         log_status = "success"
                     elif "ERROR" in last_line:
@@ -2900,6 +2945,378 @@ def collect_firewall_rules():
                           "action": "ALLOW" if "ACCEPT" in line else "DENY",
                           "raw": line[:200], "last_check": now})
     return rules
+
+
+# ============================================================
+# LE SENSORIUM ÉLARGI (08-10) — ce que la mémoire notait faute de capteur
+# ============================================================
+# « config.json est vide », « omniroute n'est pas installé », « faststat.service existe » : ces
+# souvenirs sont nés parce qu'aucun capteur ne relevait ces états, et ils sont restés faux des jours
+# après la réparation. Un état se MESURE : services, config de Cassandra, logiciels, mises à jour.
+
+def collect_system_services() -> list:
+    """Tous les services systemd chargés, en UN appel : état, sous-état, activation au démarrage, type.
+    La table system_services existait sans écrivain : le modèle du monde ne connaissait aucun service."""
+    now = datetime.now().isoformat()
+    if not _qui("systemctl"):
+        return collect_services_sans_systemd()
+    out = run_cmd(["systemctl", "show", "*.service", "--no-pager",
+                   "-p", "Id,LoadState,ActiveState,SubState,UnitFileState,Type,Description"], timeout=20)
+    services, cur = [], {}
+
+    def _pousser(u):
+        nom = (u.get("Id") or "").strip()
+        if not nom.endswith(".service") or u.get("LoadState") != "loaded":
+            return
+        services.append({"name": nom[:-8], "status": u.get("ActiveState") or "?",
+                         "sub_state": u.get("SubState") or "", "unit_file_state": u.get("UnitFileState") or "",
+                         "unit_type": u.get("Type") or "", "description": (u.get("Description") or "")[:120],
+                         "enabled": 1 if u.get("UnitFileState") == "enabled" else 0,
+                         "active": 1 if u.get("ActiveState") == "active" else 0, "last_check": now})
+
+    for ligne in (out or "").splitlines():
+        if not ligne.strip():
+            _pousser(cur)
+            cur = {}
+            continue
+        if "=" in ligne:
+            k, v = ligne.split("=", 1)
+            cur[k.strip()] = v.strip()
+    _pousser(cur)
+    return sorted(services, key=lambda s: s["name"])
+
+
+# Les clés dont on peut dire la VALEUR : adresses, modèles, fournisseurs, interrupteurs. Tout ce qui ressemble
+# à un secret n'est jamais lu au-delà de « posé / vide ».
+_CONFIG_SECRET_RE = re.compile(r"(?i)(key|token|secret|pass|pwd|cred|auth|cookie|session|salt|cle|mdp)")
+_CONFIG_SURE_RE = re.compile(r"(?i)(_url$|^url$|model$|provider$|_enabled$|^enabled$|_paused$|_hour$|_day$|^lang)")
+CASSANDRA_CONFIG = "/etc/cassandra/config.json"
+
+
+def _config_valeur_sure(cle: str, v) -> str:
+    if isinstance(v, bool):
+        return "oui" if v else "non"
+    if isinstance(v, (int, float)):
+        return str(v)
+    s = str(v)
+    if re.match(r"(?i)^[a-z][a-z0-9+.-]*://", s):
+        s = re.sub(r"(?i)^([a-z][a-z0-9+.-]*://)[^/@]*@", r"\1", s)    # jamais d'identifiants d'URL
+        s = s.split("?", 1)[0]
+    return s[:120]
+
+
+def collect_cassandra_config() -> list:
+    """La config de Cassandra, clé par clé : posée ou vide, et la valeur des seules clés sans secret.
+    Le fichier lui-même est un relevé : absent, vide (0 octet) ou illisible se dit tel quel."""
+    now = datetime.now().isoformat()
+    lignes = []
+    try:
+        st = os.stat(CASSANDRA_CONFIG)
+    except OSError:
+        return [{"cle": "__fichier__", "etat": "absent", "valeur": "", "last_check": now}]
+    if st.st_size == 0:
+        return [{"cle": "__fichier__", "etat": "vide", "valeur": "0 octet", "last_check": now}]
+    try:
+        with open(CASSANDRA_CONFIG, encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            raise ValueError("pas un objet JSON")
+    except Exception as e:
+        return [{"cle": "__fichier__", "etat": "illisible", "valeur": str(e)[:120], "last_check": now}]
+    lignes.append({"cle": "__fichier__", "etat": "ok", "valeur": "%d clés, %d octets" % (len(d), st.st_size), "last_check": now})
+    for cle in sorted(d):
+        v = d[cle]
+        vide = v is None or v == "" or v == [] or v == {}
+        sure = bool(_CONFIG_SURE_RE.search(cle)) and not _CONFIG_SECRET_RE.search(cle) and not isinstance(v, (dict, list))
+        lignes.append({"cle": str(cle)[:80], "etat": "vide" if vide else "posé",
+                       "valeur": "" if (vide or not sure) else _config_valeur_sure(cle, v), "last_check": now})
+    return lignes
+
+
+# Les logiciels dont l'absence ou la présence change une réponse. On relève aussi l'ABSENCE : « omniroute
+# n'est pas installé » doit pouvoir se lire, pas se supposer.
+LOGICIELS_SUIVIS = ("nginx", "apache2", "docker", "tailscale", "ollama", "omniroute", "fail2ban-client", "mysql",
+                    "mariadb", "psql", "redis-server", "php", "certbot", "rclone", "node", "npm", "python3", "git",
+                    "ufw", "nft", "iptables", "smartctl", "postfix", "dovecot", "proftpd", "mogwai", "caddy",
+                    "claude", "sqlite3", "curl", "wg")
+
+
+def collect_installed_software() -> list:
+    import shutil as _sh
+    now = datetime.now().isoformat()
+    chemin = os.environ.get("PATH", "") + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+    out = []
+    for nom in LOGICIELS_SUIVIS:
+        p = _sh.which(nom, path=chemin)
+        out.append({"nom": nom, "installe": 1 if p else 0, "chemin": p or "", "last_check": now})
+    return out
+
+
+def _qui(nom: str) -> str:
+    import shutil as _sh
+    return _sh.which(nom, path=os.environ.get("PATH", "") + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") or ""
+
+
+def collect_apt_updates() -> list:
+    """Mises à jour en attente, QUEL QUE SOIT le gestionnaire (08-10 : Cassandra n'est pas faite pour la seule
+    Debian d'Orion). Lecture seule partout : simulation apt, `check-update` dnf/yum, `checkupdates` pacman (base
+    temporaire, jamais la vraie), `zypper list-updates`, `apk version`. Une passe par heure suffit."""
+    now = datetime.now().isoformat()
+    total, secu, noms, gest = None, 0, [], ""
+    if _qui("apt-get"):
+        gest = "apt"
+        sortie = run_cmd(["apt-get", "-s", "-o", "Debug::NoLocking=1", "upgrade"], timeout=120)
+        inst = [l for l in (sortie or "").splitlines() if l.startswith("Inst ")]
+        s_l = [l for l in inst if "-security" in l or "Debian-Security" in l]
+        total, secu, noms = len(inst), len(s_l), [l.split()[1] for l in s_l[:12]]
+    elif _qui("dnf") or _qui("yum"):
+        gest = "dnf" if _qui("dnf") else "yum"
+        sortie = run_cmd([gest, "-q", "check-update"], timeout=180)
+        lignes = [l for l in (sortie or "").splitlines() if l and not l.startswith((" ", "Last", "Obsoleting")) and len(l.split()) == 3]
+        total = len(lignes)
+        sec = run_cmd([gest, "-q", "updateinfo", "list", "--security"], timeout=180)
+        s_l = [l for l in (sec or "").splitlines() if l.strip() and len(l.split()) >= 3]
+        secu, noms = len(s_l), [l.split()[-1] for l in s_l[:12]]
+    elif _qui("checkupdates"):
+        gest = "pacman"
+        sortie = run_cmd(["checkupdates"], timeout=180)
+        total = len([l for l in (sortie or "").splitlines() if "->" in l])
+    elif _qui("zypper"):
+        gest = "zypper"
+        sortie = run_cmd(["zypper", "-q", "--non-interactive", "list-updates"], timeout=180)
+        total = len([l for l in (sortie or "").splitlines() if l.startswith("v ")])
+        sec = run_cmd(["zypper", "-q", "--non-interactive", "list-patches", "--category", "security"], timeout=180)
+        secu = len([l for l in (sec or "").splitlines() if "| security" in l])
+    elif _qui("apk"):
+        gest = "apk"
+        sortie = run_cmd(["apk", "version", "-l", "<"], timeout=120)
+        total = len([l for l in (sortie or "").splitlines() if "<" in l])
+    if total is None:
+        return []
+    return [{"total": total, "securite": secu, "paquets": ", ".join(noms), "gestionnaire": gest, "last_check": now}]
+
+
+def collect_mounts() -> list:
+    """TOUS les systèmes de fichiers réels (08-10) : le relevé ne regardait que « / ». Une machine qui sert
+    /var ou /home sur un autre disque, un NAS monté, un volume de sauvegarde — leur remplissage, et celui des
+    inodes (un disque à 40 % peut être plein d'inodes)."""
+    now = datetime.now().isoformat()
+    types_exclus = ("tmpfs", "devtmpfs", "overlay", "squashfs", "proc", "sysfs", "cgroup", "cgroup2", "efivarfs",
+                    "ramfs", "autofs", "fuse.lxcfs", "nsfs", "tracefs", "debugfs")
+    cmd = ["df", "-P", "-T", "-k"]
+    for t in types_exclus:
+        cmd += ["-x", t]
+    out = run_cmd(cmd, timeout=15)
+    inodes = {}
+    out_i = run_cmd(["df", "-P", "-i"] + [a for t in types_exclus for a in ("-x", t)], timeout=15)
+    for l in (out_i or "").splitlines()[1:]:
+        p = l.split()
+        if len(p) >= 6 and p[4].endswith("%"):
+            try:
+                inodes[p[5]] = float(p[4].rstrip("%"))
+            except ValueError:
+                pass
+    montages, vus = [], set()
+    for l in (out or "").splitlines()[1:]:
+        p = l.split()
+        if len(p) < 7 or not p[5].endswith("%"):
+            continue
+        dev, fstype, mp = p[0], p[1], " ".join(p[6:])
+        if mp in vus or mp.startswith(("/snap/", "/var/lib/docker/", "/run/")):
+            continue
+        vus.add(mp)
+        try:
+            total_gb, used_gb = int(p[2]) / 1024 ** 2, int(p[3]) / 1024 ** 2
+            pct = float(p[5].rstrip("%"))
+        except ValueError:
+            continue
+        montages.append({"device": dev, "mountpoint": mp, "fstype": fstype, "total_gb": round(total_gb, 1),
+                         "used_gb": round(used_gb, 1), "percent": pct, "inode_pct": inodes.get(mp), "last_check": now})
+    return montages
+
+
+def collect_storage_health() -> list:
+    """RAID logiciel (mdadm) et pools ZFS : un miroir dégradé ne se voit pas dans le remplissage du disque."""
+    now = datetime.now().isoformat()
+    out = []
+    try:
+        md = Path("/proc/mdstat").read_text(errors="replace")
+        nom = None
+        for l in md.splitlines():
+            m = re.match(r"^(md\d+)\s*:\s*(\w+)\s+(\w+)", l)
+            if m:
+                nom = m.group(1)
+                out.append({"nom": nom, "type": m.group(3), "etat": m.group(2), "detail": "", "last_check": now})
+            elif nom and re.search(r"\[[U_]+\]", l):
+                motif = re.search(r"\[([U_]+)\]", l).group(1)
+                out[-1]["detail"] = motif
+                if "_" in motif:
+                    out[-1]["etat"] = "dégradé"
+            if re.search(r"(recovery|resync)\s*=", l) and out:
+                out[-1]["detail"] += " · reconstruction en cours"
+    except Exception:
+        pass
+    if _qui("zpool"):
+        for l in (run_cmd(["zpool", "list", "-H", "-o", "name,health,capacity"], timeout=15) or "").splitlines():
+            p = l.split("\t")
+            if len(p) >= 3:
+                out.append({"nom": p[0], "type": "zfs", "etat": p[1].lower(), "detail": "rempli à %s" % p[2], "last_check": now})
+    return out
+
+
+def collect_interfaces() -> list:
+    """Les interfaces réseau, leur état et leurs adresses, et laquelle porte la route par défaut."""
+    now = datetime.now().isoformat()
+    out = []
+    try:
+        adr = json.loads(run_cmd(["ip", "-j", "addr"], timeout=5) or "[]")
+    except Exception:
+        adr = []
+    defaut = ""
+    try:
+        rt = json.loads(run_cmd(["ip", "-j", "route", "show", "default"], timeout=5) or "[]")
+        if rt:
+            defaut = rt[0].get("dev") or ""
+    except Exception:
+        pass
+    for itf in adr:
+        nom = itf.get("ifname") or ""
+        if not nom or nom == "lo" or nom.startswith(("veth", "br-", "docker")):
+            continue
+        infos = [a for a in (itf.get("addr_info") or []) if a.get("local") and a.get("scope") == "global"]
+        v4 = [a["local"] for a in infos if a.get("family") == "inet"]
+        v6 = [a["local"] for a in infos if a.get("family") == "inet6"]
+        ips = v4[:3] + v6[:1] + (["+%d IPv6" % (len(v6) - 1)] if len(v6) > 1 else [])
+        out.append({"nom": nom, "etat": (itf.get("operstate") or "?").lower(), "adresses": ", ".join(ips),
+                    "route_defaut": 1 if nom == defaut else 0, "last_check": now})
+    return out
+
+
+def collect_hardware_state() -> list:
+    """Températures (zones thermiques et hwmon), batterie (portables), heure synchronisée, OS, virtualisation,
+    pare-feu actif, AppArmor / SELinux. Chaque mesure absente reste vide : rien n'est inventé."""
+    now = datetime.now().isoformat()
+    e = {"last_check": now}
+    temps = []
+    for f in list(Path("/sys/class/thermal").glob("thermal_zone*/temp")) + list(Path("/sys/class/hwmon").glob("hwmon*/temp*_input")):
+        try:
+            v = int(f.read_text().strip()) / 1000.0
+            if 0 < v < 150:
+                temps.append(v)
+        except Exception:
+            pass
+    e["temp_max"] = round(max(temps), 1) if temps else None
+    bat = sorted(Path("/sys/class/power_supply").glob("BAT*"))
+    if bat:
+        try:
+            e["batterie"] = "%s%% · %s" % ((bat[0] / "capacity").read_text().strip(), (bat[0] / "status").read_text().strip().lower())
+        except Exception:
+            e["batterie"] = ""
+    else:
+        e["batterie"] = ""
+    td = run_cmd(["timedatectl", "show", "-p", "NTPSynchronized", "-p", "Timezone"], timeout=5) if _qui("timedatectl") else ""
+    e["heure_synchro"] = "oui" if "NTPSynchronized=yes" in (td or "") else ("non" if "NTPSynchronized=no" in (td or "") else "")
+    m = re.search(r"Timezone=(\S+)", td or "")
+    e["fuseau"] = m.group(1) if m else ""
+    try:
+        osr = dict(l.split("=", 1) for l in Path("/etc/os-release").read_text().splitlines() if "=" in l)
+        e["os"] = osr.get("PRETTY_NAME", "").strip('"')
+    except Exception:
+        e["os"] = ""
+    e["arch"] = os.uname().machine
+    e["virtualisation"] = (run_cmd(["systemd-detect-virt"], timeout=5) or "").strip() if _qui("systemd-detect-virt") else ""
+    # Le pare-feu RÉELLEMENT actif : on demande à chacun, dans l'ordre où ils se superposent.
+    fw = ""
+    if _qui("ufw"):
+        s = run_cmd(["ufw", "status"], timeout=8) or ""
+        if "Status: active" in s or "État : actif" in s:
+            fw = "ufw actif"
+    if not fw and _qui("firewall-cmd"):
+        if (run_cmd(["firewall-cmd", "--state"], timeout=8) or "").strip() == "running":
+            fw = "firewalld actif"
+    if not fw and _qui("nft"):
+        n = len([l for l in (run_cmd(["nft", "list", "ruleset"], timeout=8) or "").splitlines() if l.strip().startswith(("ip ", "tcp ", "udp ", "ct ", "iif", "oif", "counter", "drop", "accept", "reject"))])
+        if n:
+            fw = "nftables (%d règles)" % n
+    if not fw and _qui("iptables"):
+        n = len([l for l in (run_cmd(["iptables", "-S"], timeout=8) or "").splitlines() if l.startswith("-A ")])
+        fw = ("iptables (%d règles)" % n) if n else "aucune règle"
+    e["pare_feu"] = fw
+    mac = []
+    try:
+        if Path("/sys/module/apparmor/parameters/enabled").read_text().strip() == "Y":
+            mac.append("AppArmor")
+    except Exception:
+        pass
+    if _qui("getenforce"):
+        mac.append("SELinux " + (run_cmd(["getenforce"], timeout=5) or "?").strip().lower())
+    e["securite_noyau"] = ", ".join(mac)
+    return [e]
+
+
+def collect_services_sans_systemd() -> list:
+    """Une machine sans systemd (Alpine, conteneur, vieille Devuan) : `service --status-all` ou `rc-status`."""
+    now = datetime.now().isoformat()
+    out = []
+    if _qui("rc-status"):
+        for l in (run_cmd(["rc-status", "-a"], timeout=15) or "").splitlines():
+            m = re.match(r"^\s*(\S+)\s+\[\s*(\w+)\s*\]", l)
+            if m:
+                out.append({"name": m.group(1), "status": "active" if m.group(2) == "started" else m.group(2),
+                            "sub_state": m.group(2), "unit_file_state": "", "unit_type": "", "description": "",
+                            "enabled": 0, "active": 1 if m.group(2) == "started" else 0, "last_check": now})
+    elif _qui("service"):
+        for l in (run_cmd(["service", "--status-all"], timeout=20) or "").splitlines():
+            m = re.match(r"^\s*\[\s*([+\-?])\s*\]\s+(\S+)", l)
+            if m:
+                act = {"+": "active", "-": "inactive"}.get(m.group(1), "?")
+                out.append({"name": m.group(2), "status": act, "sub_state": "", "unit_file_state": "", "unit_type": "",
+                            "description": "", "enabled": 0, "active": 1 if act == "active" else 0, "last_check": now})
+    return out
+
+
+def collect_system_state() -> list:
+    """Uptime, redémarrage requis, état de Tailscale sur cette machine : les petits faits qu'on cite souvent."""
+    now = datetime.now().isoformat()
+    etat = {"last_check": now}
+    try:
+        with open("/proc/uptime") as f:
+            etat["uptime_s"] = int(float(f.read().split()[0]))
+    except Exception:
+        etat["uptime_s"] = None
+    etat["reboot_required"] = 1 if Path("/var/run/reboot-required").exists() else 0
+    try:
+        etat["reboot_pkgs"] = Path("/var/run/reboot-required.pkgs").read_text(errors="replace").replace("\n", " ").strip()[:200]
+    except Exception:
+        etat["reboot_pkgs"] = ""
+    ts = run_cmd(["tailscale", "status", "--json"], timeout=8)
+    try:
+        d = json.loads(ts) if ts else {}
+        etat["tailscale"] = d.get("BackendState") or ""
+        etat["tailscale_ip"] = ((d.get("Self") or {}).get("TailscaleIPs") or [""])[0]
+    except Exception:
+        etat["tailscale"], etat["tailscale_ip"] = "", ""
+    return [etat]
+
+
+def _sonde_http(domaine: str, ip: str = "") -> str:
+    """Le site répond-il, ICI, par le serveur web ? Sur l'adresse où le site ÉCOUTE (FastPanel lie ses sites à
+    l'IP du réseau local, pas à 127.0.0.1 : sondés sur 127.0.0.1, tous « ne répondaient pas »), puis par le DNS
+    public. HTTPS d'abord (certificat non vérifié : le certificat a son propre relevé), HTTP sinon. Rend le
+    code, ou « 000 » si rien ne répond."""
+    cibles = []
+    for adr in ([ip] if ip else []) + ["127.0.0.1", ""]:
+        if adr not in cibles:
+            cibles.append(adr)
+    for adr in cibles:
+        for schema, port in (("https", 443), ("http", 80)):
+            cmd = ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "4"]
+            if adr:
+                cmd += ["--resolve", "%s:%d:%s" % (domaine, port, adr.strip("[]"))]
+            code = (run_cmd(cmd + ["%s://%s/" % (schema, domaine)], timeout=6) or "").strip()[-3:]
+            if code.isdigit() and code != "000":
+                return code
+    return "000"
 
 
 # ============================================================
@@ -3123,131 +3540,333 @@ def detect_diff(entity_type: str, current_names: list):
 # ============================================================
 # SENSORIUM — MODÈLE DU MONDE (état courant grounded + changements de valeur)
 # ============================================================
-def upsert_world(conn, key, category, value, detail=None, severity="info"):
-    """Upsert une entrée du world model sur la connexion fournie. Si la VALEUR change,
-    journalise le changement (old→new) dans changelog. Robuste : n'élève jamais."""
+# LE JOURNAL DES CHANGEMENTS DIT CE QUI CHANGE D'ÉTAT, PAS CE QUI BOUGE (08-10) : la charge CPU qui passe de
+# 2 % à 3 % écrivait une ligne toutes les 30 s — 7 193 par jour, qui noyaient les vrais changements (un
+# service tombé, un port ouvert). Une mesure continue n'entre au journal que si sa GRAVITÉ change.
+_WORLD_CONTINUS = ("resource",)
+_WORLD_CONTINUS_CLES = ("system.uptime",)
+
+
+def _world_maintenant() -> str:
+    """L'heure du relevé, en UTC (08-10). Écrite en heure locale, elle était lue comme de l'UTC par la perception
+    de Cassandra : à Paris, tout relevé paraissait deux heures plus jeune, et un état figé depuis 1 h 50
+    s'affichait « relevé il y a 0 s »."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def upsert_world(conn, key, category, value, detail=None, severity="info", vus=None):
+    """Upsert une entrée du world model sur la connexion fournie. Un changement d'état (valeur, ou gravité pour
+    une mesure continue) va au journal des changements, une apparition aussi. `vus` reçoit la clé : ce qui n'y
+    est pas à la fin d'une construction a disparu. Robuste : n'élève jamais."""
     try:
+        if vus is not None:
+            vus.add(key)
         value = "" if value is None else str(value)[:500]
-        now = datetime.now().isoformat()
-        row = conn.execute("SELECT value FROM world_model WHERE wkey=?", (key,)).fetchone()
-        det = json.dumps(detail) if detail is not None else None
+        now = _world_maintenant()
+        local = datetime.now().isoformat()
+        row = conn.execute("SELECT value, severity FROM world_model WHERE wkey=?", (key,)).fetchone()
+        det = json.dumps(detail, ensure_ascii=False) if detail is not None else None
+        continu = category in _WORLD_CONTINUS or key in _WORLD_CONTINUS_CLES
         if row is None:
             conn.execute(
                 "INSERT INTO world_model (wkey, category, value, detail, severity, source, observed_at, updated_at) "
                 "VALUES (?,?,?,?,?, 'observed', ?, ?)",
                 (key, category, value, det, severity, now, now))
-        elif row[0] != value:
+            if not continu:
+                conn.execute(
+                    "INSERT INTO changelog (ts, entity_type, entity_name, change_type, old_value, new_value, severity) "
+                    "VALUES (?,?,?,?,?,?,?)", (local, category, key, "added", None, value, severity))
+        elif row[0] != value or row[1] != severity:
             conn.execute(
                 "UPDATE world_model SET value=?, detail=?, severity=?, observed_at=?, updated_at=? WHERE wkey=?",
                 (value, det, severity, now, now, key))
-            conn.execute(
-                "INSERT INTO changelog (ts, entity_type, entity_name, change_type, old_value, new_value, severity) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (now, category, key, "modified", str(row[0])[:500], value, severity))
+            if not continu or row[1] != severity:
+                conn.execute(
+                    "INSERT INTO changelog (ts, entity_type, entity_name, change_type, old_value, new_value, severity) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (local, category, key, "modified", str(row[0])[:500], value, severity))
         else:
-            conn.execute("UPDATE world_model SET severity=?, observed_at=? WHERE wkey=?", (severity, now, key))
+            conn.execute("UPDATE world_model SET observed_at=? WHERE wkey=?", (now, key))
     except Exception as e:
         print(f"[WORLD] upsert {key}: {e}", file=sys.stderr)
 
 
+def _world_elaguer(conn, prefixe: str, vus: set) -> int:
+    """Ce que la source ne rapporte plus a disparu : on le retire, et on le dit au journal. Sans cela, le modèle
+    gardait 551 ports pour 39 ouverts, et un site retiré le 1er octobre y vivait encore (08-10)."""
+    n = 0
+    local = datetime.now().isoformat()
+    for wk, cat, val in conn.execute("SELECT wkey, category, value FROM world_model WHERE wkey LIKE ?",
+                                     (prefixe + "%",)).fetchall():
+        if wk not in vus:
+            conn.execute("DELETE FROM world_model WHERE wkey=?", (wk,))
+            if cat not in _WORLD_CONTINUS and not (prefixe == "port." and n > 50):
+                conn.execute(
+                    "INSERT INTO changelog (ts, entity_type, entity_name, change_type, old_value, new_value, severity) "
+                    "VALUES (?,?,?,?,?,?,?)", (local, cat, wk, "removed", str(val)[:500], None, "info"))
+            n += 1
+    return n
+
+
+def _duree_txt(sec) -> str:
+    try:
+        sec = int(sec)
+    except Exception:
+        return "?"
+    j, r = divmod(sec, 86400)
+    h, r = divmod(r, 3600)
+    return ("%d j %d h" % (j, h)) if j else ("%d h %d min" % (h, r // 60))
+
+
 def build_world_model():
-    """Dérive l'état courant compact (clé→valeur) depuis les tables déjà collectées,
-    en UNE transaction. Chaque source est isolée : un échec n'empêche jamais les autres,
-    et ne casse jamais le collector. C'est le socle 'vérité-terrain' de la mémoire."""
+    """Dérive l'état courant compact (clé→valeur) depuis les tables collectées, en UNE transaction. Chaque
+    famille est isolée : un échec n'empêche jamais les autres. Une famille relue sans erreur est ÉLAGUÉE : ce
+    qu'elle ne rapporte plus disparaît du modèle. C'est le socle « vérité-terrain » de la perception."""
     try:
         conn = get_conn()
     except Exception:
         return
+    familles_ok = []          # (préfixe, clés vues) des familles relues sans erreur
+
     def _q(sql, *p):
+        """Rend (lignes, ok) : une table absente n'est pas une famille vide."""
         try:
-            return conn.execute(sql, p).fetchall()
+            return conn.execute(sql, p).fetchall(), True
         except Exception:
-            return []
+            return [], False
+
+    def _famille(prefixe, lignes_ok, remplir):
+        lignes, ok = lignes_ok
+        vus = set()
+        try:
+            remplir(lignes, vus)
+        except Exception as e:
+            print(f"[WORLD] {prefixe} : {e}", file=sys.stderr)
+            return
+        if ok:
+            familles_ok.append((prefixe, vus))
+
+    def U(key, cat, val, vus, sev="info", detail=None):
+        upsert_world(conn, key, cat, val, detail=detail, severity=sev, vus=vus)
+
     try:
+        divers = set()
         # Identité système
         try:
             u = os.uname()
-            upsert_world(conn, "system.hostname", "system", u.nodename)
-            upsert_world(conn, "system.kernel", "system", u.release)
+            U("system.hostname", "system", u.nodename, divers)
+            U("system.kernel", "system", u.release, divers)
         except Exception:
             pass
+        st, _ok = _q("SELECT uptime_s, reboot_required, reboot_pkgs, tailscale, tailscale_ip FROM system_state LIMIT 1")
+        if st:
+            r = st[0]
+            if r["uptime_s"] is not None:
+                U("system.uptime", "system", _duree_txt(r["uptime_s"]), divers)
+            U("system.redemarrage_requis", "system",
+              ("oui (%s)" % r["reboot_pkgs"]) if r["reboot_required"] and r["reboot_pkgs"] else ("oui" if r["reboot_required"] else "non"),
+              divers, sev="warning" if r["reboot_required"] else "info")
+            if r["tailscale"]:
+                U("system.tailscale", "system", "%s · %s" % (r["tailscale"], r["tailscale_ip"] or "?"), divers,
+                  sev="info" if r["tailscale"] == "Running" else "warning")
         # Ressources (dernière métrique)
-        m = _q("SELECT cpu_pct, ram_pct, disk_pct, swap_pct, load_1m, ram_used_gb, ram_total_gb, "
-               "disk_used_gb, disk_total_gb FROM metrics_realtime ORDER BY id DESC LIMIT 1")
+        m, _ok = _q("SELECT cpu_pct, ram_pct, disk_pct, swap_pct, load_1m, ram_used_gb, ram_total_gb, "
+                    "disk_used_gb, disk_total_gb FROM metrics_realtime ORDER BY id DESC LIMIT 1")
         if m:
             r = m[0]
             def _sev(p, thr=90):
                 return "warning" if (isinstance(p, (int, float)) and p >= thr) else "info"
-            upsert_world(conn, "cpu.load", "resource", "%.0f%%" % (r["cpu_pct"] or 0), severity=_sev(r["cpu_pct"]))
-            upsert_world(conn, "ram.usage", "resource",
-                         "%.0f%% (%.1f/%.1f Go)" % (r["ram_pct"] or 0, r["ram_used_gb"] or 0, r["ram_total_gb"] or 0),
-                         severity=_sev(r["ram_pct"]))
-            upsert_world(conn, "disk./.usage", "resource",
-                         "%.0f%% (%.0f/%.0f Go)" % (r["disk_pct"] or 0, r["disk_used_gb"] or 0, r["disk_total_gb"] or 0),
-                         severity=_sev(r["disk_pct"]))
-            upsert_world(conn, "swap.usage", "resource", "%.0f%%" % (r["swap_pct"] or 0), severity=_sev(r["swap_pct"], 50))
-            upsert_world(conn, "load.1m", "resource", str(r["load_1m"] or 0))
-        # Services système
-        for r in _q("SELECT name, status FROM system_services LIMIT 120"):
-            nm = (r["name"] or "").strip()
-            if nm:
-                st = (r["status"] or "?")
-                upsert_world(conn, "service.%s" % nm, "service", st,
-                             severity="warning" if st not in ("active", "running", "listening") else "info")
-        # Sites web
-        for r in _q("SELECT domain, php_version, ssl_enabled, status FROM web_sites LIMIT 120"):
-            d = (r["domain"] or "").strip()
-            if d:
-                upsert_world(conn, "web.%s" % d, "web",
-                             "php %s · ssl %s · %s" % (r["php_version"] or "?",
-                             "oui" if r["ssl_enabled"] else "non", r["status"] or "?"))
-        # Certificats SSL (expiration)
-        for r in _q("SELECT domain, days_left FROM ssl_certificates WHERE days_left IS NOT NULL ORDER BY days_left ASC LIMIT 60"):
-            d = (r["domain"] or "").strip()
-            if d:
-                dl = r["days_left"]
-                upsert_world(conn, "ssl.%s" % d, "security", "%s jours" % dl,
-                             severity="warning" if (isinstance(dl, (int, float)) and dl <= 14) else "info")
-        # Ports ouverts
-        for r in _q("SELECT port, process FROM open_ports LIMIT 120"):
-            if r["port"] is not None:
-                upsert_world(conn, "port.%s" % r["port"], "network", r["process"] or "?")
-        # Sysctl sécurité
-        for r in _q("SELECT param, value, status FROM sysctl_security LIMIT 60"):
-            pr = (r["param"] or "").strip()
-            if pr:
-                upsert_world(conn, "security.%s" % pr, "security", "%s (%s)" % (r["value"], r["status"]),
-                             severity="warning" if r["status"] == "critical" else "info")
-        # Flotte (Tailscale)
-        vivants = set()
-        for r in _q("SELECT name, online FROM tailscale_peers LIMIT 60"):
-            nm = (r["name"] or "").strip()
-            if nm:
-                vivants.add("fleet.%s" % nm)
-                upsert_world(conn, "fleet.%s" % nm, "fleet", "en ligne" if r["online"] else "hors ligne",
-                             severity="info" if r["online"] else "warning")
-        # une entité que Tailscale ne liste plus (renommée, retirée) ne survit pas : elle mentait « en ligne »
-        if vivants:
-            for (wk,) in conn.execute("SELECT wkey FROM world_model WHERE wkey LIKE 'fleet.%'").fetchall():
-                if wk not in vivants:
-                    conn.execute("DELETE FROM world_model WHERE wkey=?", (wk,))
+            U("cpu.load", "resource", "%.0f%%" % (r["cpu_pct"] or 0), divers, _sev(r["cpu_pct"]))
+            U("ram.usage", "resource", "%.0f%% (%.1f/%.1f Go)" % (r["ram_pct"] or 0, r["ram_used_gb"] or 0, r["ram_total_gb"] or 0),
+              divers, _sev(r["ram_pct"]))
+            U("disk./.usage", "resource", "%.0f%% (%.0f/%.0f Go)" % (r["disk_pct"] or 0, r["disk_used_gb"] or 0, r["disk_total_gb"] or 0),
+              divers, _sev(r["disk_pct"]))
+            U("swap.usage", "resource", "%.0f%%" % (r["swap_pct"] or 0), divers, _sev(r["swap_pct"], 50))
+            U("load.1m", "resource", str(r["load_1m"] or 0), divers)
+
+        # Services systemd — TOUS, avec leur activation au démarrage. Un service activé mais arrêté (hors
+        # tâches ponctuelles) est un signal ; un service en échec, une alerte.
+        def _services(lignes, vus):
+            for r in lignes:
+                nm = (r["name"] or "").strip()
+                if not nm:
+                    continue
+                act, sub, ufs, typ = r["status"] or "?", r["sub_state"] or "", r["unit_file_state"] or "", r["unit_type"] or ""
+                val = act + (" (%s)" % sub if sub and sub != act else "") + (" · %s au démarrage" % {
+                    "enabled": "activé", "disabled": "désactivé", "static": "statique", "masked": "masqué"}.get(ufs, ufs) if ufs else "")
+                grave = act == "failed" or (ufs == "enabled" and act == "inactive" and typ not in ("oneshot", ""))
+                U("service.%s" % nm, "service", val, vus, "warning" if grave else "info",
+                  detail={"description": r["description"] or ""} if r["description"] else None)
+        _famille("service.", _q("SELECT name, status, sub_state, unit_file_state, unit_type, description FROM system_services"), _services)
+
+        # Unités en échec : le compte ET les noms
+        def _echecs(lignes, vus):
+            noms = [r["unit"] for r in lignes]
+            U("systemd.failed_units", "system", ("%d : %s" % (len(noms), ", ".join(noms[:8]))) if noms else "0",
+              vus, "warning" if noms else "info")
+        _famille("systemd.", _q("SELECT unit FROM failed_units WHERE active_state='failed'"), _echecs)
+
         # Conteneurs docker
-        for r in _q("SELECT name, status FROM docker_containers LIMIT 60"):
-            nm = (r["name"] or "").strip()
-            if nm:
-                upsert_world(conn, "docker.%s" % nm, "service", r["status"] or "?")
-        # Unités en échec
-        try:
-            n_failed = conn.execute("SELECT COUNT(*) FROM failed_units WHERE active_state='failed'").fetchone()[0]
-            upsert_world(conn, "systemd.failed_units", "system", str(n_failed),
-                         severity="warning" if n_failed else "info")
-        except Exception:
-            pass
+        def _docker(lignes, vus):
+            for r in lignes:
+                nm = (r["name"] or "").strip()
+                if nm:
+                    stt = r["status"] or "?"
+                    grave = not stt.startswith("Up") or "unhealthy" in stt
+                    U("docker.%s" % nm, "service", stt + (" · %s" % r["image"] if r["image"] else ""), vus,
+                      "warning" if grave else "info")
+        _famille("docker.", _q("SELECT name, status, image FROM docker_containers"), _docker)
+
+        # Certificats (expiration), indexés pour les sites
+        jours_ssl = {}
+        def _ssl(lignes, vus):
+            for r in lignes:
+                d = (r["domain"] or "").strip().lower()
+                if d and d not in jours_ssl:
+                    dl = r["days_left"]
+                    jours_ssl[d] = dl
+                    U("ssl.%s" % d, "security", "%s jours" % dl, vus,
+                      "warning" if (isinstance(dl, (int, float)) and dl <= 14) else "info")
+        _famille("ssl.", _q("SELECT domain, days_left FROM ssl_certificates WHERE days_left IS NOT NULL ORDER BY days_left ASC"), _ssl)
+
+        # Sites web : la réponse HTTP mesurée, le certificat, le serveur
+        def _web(lignes, vus):
+            for r in lignes:
+                d = (r["domain"] or "").strip()
+                if not d:
+                    continue
+                code = r["http_code"] if "http_code" in r.keys() else None
+                stt = (r["reponse"] if "reponse" in r.keys() and r["reponse"] else None) or "déclaré (non sondé)"
+                morceaux = [("%s (HTTP %s)" % (stt, code)) if code and code != "000" else stt]
+                if r["ssl_enabled"]:
+                    dl = jours_ssl.get(d.lower())
+                    morceaux.append("ssl oui" + (" · %s j" % dl if dl is not None else ""))
+                else:
+                    morceaux.append("ssl non")
+                if r["php_version"]:
+                    morceaux.append("php %s" % r["php_version"])
+                grave = stt.startswith("ne répond") or stt.startswith("erreur")
+                U("web.%s" % d, "web", " · ".join(morceaux), vus, "warning" if grave else "info")
+        _famille("web.", _q("SELECT * FROM web_sites"), _web)
+
+        # Ports à l'écoute — TCP, et UDP hors plage éphémère (un port UDP tiré au hasard à chaque redémarrage
+        # de tailscaled n'est pas un fait sur la machine)
+        def _ports(lignes, vus):
+            par_port = {}
+            for r in lignes:
+                if r["port"] is None:
+                    continue
+                proto = (r["protocol"] or "").lower()
+                if proto.startswith("udp") and int(r["port"]) >= 32768:
+                    continue
+                par_port.setdefault(int(r["port"]), set()).add("%s %s" % (r["process"] or "?", "udp" if proto.startswith("udp") else "tcp"))
+            for port, quoi in par_port.items():
+                U("port.%s" % port, "network", ", ".join(sorted(quoi)), vus)
+        _famille("port.", _q("SELECT port, protocol, process FROM open_ports"), _ports)
+
+        # Sysctl sécurité
+        def _sysctl(lignes, vus):
+            for r in lignes:
+                pr = (r["param"] or "").strip()
+                if pr:
+                    U("security.%s" % pr, "security", "%s (%s)" % (r["value"], r["status"]), vus,
+                      "warning" if r["status"] == "critical" else "info")
+        _famille("security.", _q("SELECT param, value, status FROM sysctl_security"), _sysctl)
+
+        # Flotte (Tailscale)
+        def _flotte(lignes, vus):
+            for r in lignes:
+                nm = (r["name"] or "").strip()
+                if nm:
+                    U("fleet.%s" % nm, "fleet", "en ligne" if r["online"] else "hors ligne", vus,
+                      "info" if r["online"] else "warning")
+        lignes_flotte = _q("SELECT name, online FROM tailscale_peers")
+        if lignes_flotte[0]:      # Tailscale muet : on n'efface pas la flotte sur un silence
+            _famille("fleet.", lignes_flotte, _flotte)
+
+        # Config de Cassandra : posée / vide, valeur des seules clés sans secret
+        def _config(lignes, vus):
+            for r in lignes:
+                cle = r["cle"]
+                if cle == "__fichier__":
+                    U("config.fichier", "config", "%s%s" % (r["etat"], (" · " + r["valeur"]) if r["valeur"] else ""), vus,
+                      "info" if r["etat"] == "ok" else "warning")
+                else:
+                    U("config.%s" % cle, "config", (r["valeur"] if r["valeur"] else r["etat"]), vus)
+        _famille("config.", _q("SELECT cle, etat, valeur FROM cassandra_config"), _config)
+
+        # Logiciels : installés OU absents (l'absence est un fait qu'on cite)
+        def _logiciels(lignes, vus):
+            for r in lignes:
+                U("logiciel.%s" % r["nom"], "logiciel", ("installé (%s)" % r["chemin"]) if r["installe"] else "absent", vus)
+        _famille("logiciel.", _q("SELECT nom, installe, chemin FROM logiciels"), _logiciels)
+
+        # Mises à jour en attente (tout gestionnaire)
+        maj, _ok = _q("SELECT * FROM apt_updates LIMIT 1")
+        if maj:
+            r = maj[0]
+            gest = r["gestionnaire"] if "gestionnaire" in r.keys() and r["gestionnaire"] else "apt"
+            U("maj.paquets", "system", "%d en attente (%s), dont %d de sécurité%s" % (
+                r["total"] or 0, gest, r["securite"] or 0, (" : %s" % r["paquets"]) if r["paquets"] else ""),
+              divers, "warning" if (r["securite"] or 0) else "info")
+
+        # Systèmes de fichiers : remplissage et inodes, chacun
+        def _montages(lignes, vus):
+            for r in lignes:
+                mp = r["mountpoint"]
+                ino = r["inode_pct"] if "inode_pct" in r.keys() else None
+                val = "%.0f%% (%.0f/%.0f Go, %s)" % (r["percent"] or 0, r["used_gb"] or 0, r["total_gb"] or 0, r["fstype"] or "?")
+                if ino is not None:
+                    val += " · inodes %.0f%%" % ino
+                grave = (r["percent"] or 0) >= 90 or (ino or 0) >= 90
+                U("montage.%s" % mp, "resource", val, vus, "warning" if grave else "info")
+        _famille("montage.", _q("SELECT * FROM system_mounts"), _montages)
+
+        # RAID et pools ZFS
+        def _stockage(lignes, vus):
+            for r in lignes:
+                sain = r["etat"] in ("active", "online", "clean")
+                U("stockage.%s" % r["nom"], "storage", "%s · %s%s" % (r["type"], r["etat"], (" · " + r["detail"]) if r["detail"] else ""),
+                  vus, "info" if sain else "warning")
+        _famille("stockage.", _q("SELECT nom, type, etat, detail FROM storage_health"), _stockage)
+
+        # Interfaces réseau
+        def _interfaces(lignes, vus):
+            for r in lignes:
+                U("interface.%s" % r["nom"], "network", "%s%s%s" % (r["etat"], (" · " + r["adresses"]) if r["adresses"] else "",
+                  " · route par défaut" if r["route_defaut"] else ""), vus,
+                  "warning" if (r["route_defaut"] and r["etat"] not in ("up", "unknown")) else "info")
+        _famille("interface.", _q("SELECT nom, etat, adresses, route_defaut FROM interfaces"), _interfaces)
+
+        # Matériel, heure, OS, pare-feu, protections du noyau
+        hw, _ok = _q("SELECT * FROM hardware_state LIMIT 1")
+        if hw:
+            r = hw[0]
+            if r["os"]:
+                U("system.os", "system", "%s · %s%s" % (r["os"], r["arch"] or "?", (" · " + r["virtualisation"]) if r["virtualisation"] and r["virtualisation"] != "none" else ""), divers)
+            if r["temp_max"] is not None:
+                U("system.temperature", "resource", "%.0f °C au plus chaud" % r["temp_max"], divers,
+                  "warning" if r["temp_max"] >= 85 else "info")
+            if r["batterie"]:
+                U("system.batterie", "resource", r["batterie"], divers)
+            if r["heure_synchro"]:
+                U("system.heure", "system", "synchronisée" if r["heure_synchro"] == "oui" else "NON synchronisée",
+                  divers, "info" if r["heure_synchro"] == "oui" else "warning")
+            if r["fuseau"]:
+                U("system.fuseau", "system", r["fuseau"], divers)
+            if r["pare_feu"]:
+                U("system.pare_feu", "security", r["pare_feu"], divers, "warning" if r["pare_feu"] == "aucune règle" else "info")
+            if r["securite_noyau"]:
+                U("system.protection_noyau", "security", r["securite_noyau"], divers)
+
         # Santé globale
-        h = _q("SELECT score, status FROM health_scores ORDER BY id DESC LIMIT 1")
+        h, _ok = _q("SELECT score, status FROM health_scores ORDER BY id DESC LIMIT 1")
         if h:
-            upsert_world(conn, "health.score", "system", "%s/100 (%s)" % (h[0]["score"], h[0]["status"]),
-                         severity="warning" if (h[0]["status"] in ("degraded", "critical")) else "info")
+            U("health.score", "system", "%s/100 (%s)" % (h[0]["score"], h[0]["status"]), divers,
+              "warning" if (h[0]["status"] in ("degraded", "critical", "warning")) else "info")
+
+        for prefixe, vus in familles_ok:
+            _world_elaguer(conn, prefixe, vus)
         conn.commit()
     except Exception as e:
         print(f"[WORLD] build: {e}", file=sys.stderr)
@@ -3305,7 +3924,7 @@ class SharedMemorySocket:
                     "tailscale_peers":conn.execute("SELECT COUNT(*) FROM tailscale_peers WHERE online=1").fetchone()[0],
                     # FIX: WHERE active_state='failed' — ne pas compter les unités historiques
                     "failed_units":   conn.execute("SELECT COUNT(*) FROM failed_units WHERE active_state='failed'").fetchone()[0],
-                    "oom_events_24h": conn.execute("SELECT COUNT(*) FROM oom_events WHERE ts > datetime('now', '-24 hours')").fetchone()[0],
+                    "oom_events_24h": self._oom_24h(conn),
                     "remotes":        remotes_count,
                     # FIX CRITIQUE: health_score + health_status inclus dans le cache socket
                     "health_score":   hs_row[0] if hs_row else 0,
@@ -3315,6 +3934,15 @@ class SharedMemorySocket:
         except Exception as e:
             print(f"[CACHE] Erreur update_cache: {e}")
 
+    @staticmethod
+    def _oom_24h(conn) -> int:
+        # La colonne ts porte la date de dmesg (« Thu Oct  8 04:08:16 2026 ») : comparée à datetime('now')
+        # comme du texte, elle ne voulait rien dire. Le collecteur pose « recent » lui-même.
+        try:
+            return conn.execute("SELECT COUNT(*) FROM oom_events WHERE recent=1").fetchone()[0]
+        except Exception:
+            return 0
+
     def handle_client(self, client):
         try:
             data = client.recv(4096).decode().strip()
@@ -3322,7 +3950,7 @@ class SharedMemorySocket:
                 return
 
             if data == "PING":
-                client.send(b"PONG")
+                client.sendall(b"PONG")
             elif data == "GET_METRICS":
                 mi   = _read_meminfo()          # PERF[O2]: une seule lecture
                 _cpu = get_cpu()
@@ -3330,7 +3958,7 @@ class SharedMemorySocket:
                 _disk = get_disk()
                 _swap = get_swap(mi)
                 _l1, _l5, _l15 = get_load()
-                client.send(json.dumps({
+                client.sendall(json.dumps({
                     "cpu":  _cpu, "ram": _ram["percent"],
                     "disk": _disk["percent"], "swap": _swap["percent"],
                     "load_1m": _l1, "load_5m": _l5, "load_15m": _l15,
@@ -3344,7 +3972,7 @@ class SharedMemorySocket:
             elif data == "GET_DASHBOARD":
                 self.update_cache()
                 with self._cache_lock:
-                    client.send(json.dumps(self.cache).encode())
+                    client.sendall(json.dumps(self.cache).encode())
             elif data.startswith("GET_ENTITY:"):
                 entity = data.split(":", 1)[1]
                 if entity in SOCKET_ALLOWED_ENTITIES:
@@ -3352,11 +3980,11 @@ class SharedMemorySocket:
                         conn = get_conn()
                         rows = conn.execute(f"SELECT * FROM {entity} LIMIT 100").fetchall()
                         conn.close()
-                        client.send(json.dumps([dict(r) for r in rows]).encode())
+                        client.sendall(json.dumps([dict(r) for r in rows]).encode())
                     except Exception:
-                        client.send(b"[]")
+                        client.sendall(b"[]")
                 else:
-                    client.send(b"[]")
+                    client.sendall(b"[]")
             elif data == "GET_WORLD" or data.startswith("GET_WORLD:"):
                 prefix = data.split(":", 1)[1].strip() if ":" in data else ""
                 try:
@@ -3368,11 +3996,11 @@ class SharedMemorySocket:
                     else:
                         rows = conn.execute(
                             "SELECT wkey, category, value, severity, observed_at FROM world_model "
-                            "ORDER BY wkey LIMIT 800").fetchall()
+                            "ORDER BY wkey LIMIT 3000").fetchall()
                     conn.close()
-                    client.send(json.dumps([dict(r) for r in rows]).encode())
+                    client.sendall(json.dumps([dict(r) for r in rows]).encode())
                 except Exception:
-                    client.send(b"[]")
+                    client.sendall(b"[]")
             elif data.startswith("QUERY_WORLD:"):
                 term = data.split(":", 1)[1].strip()
                 try:
@@ -3383,9 +4011,9 @@ class SharedMemorySocket:
                         "WHERE wkey LIKE ? OR value LIKE ? ORDER BY (severity='warning') DESC, wkey LIMIT 60",
                         (like, like)).fetchall()
                     conn.close()
-                    client.send(json.dumps([dict(r) for r in rows]).encode())
+                    client.sendall(json.dumps([dict(r) for r in rows]).encode())
                 except Exception:
-                    client.send(b"[]")
+                    client.sendall(b"[]")
             elif data == "GET_CHANGES" or data.startswith("GET_CHANGES:"):
                 since = data.split(":", 1)[1].strip() if ":" in data else ""
                 try:
@@ -3399,11 +4027,11 @@ class SharedMemorySocket:
                             "SELECT ts, entity_type, entity_name, change_type, old_value, new_value, severity "
                             "FROM changelog ORDER BY id DESC LIMIT 50").fetchall()
                     conn.close()
-                    client.send(json.dumps([dict(r) for r in rows]).encode())
+                    client.sendall(json.dumps([dict(r) for r in rows]).encode())
                 except Exception:
-                    client.send(b"[]")
+                    client.sendall(b"[]")
             else:
-                client.send(b"ERROR")
+                client.sendall(b"ERROR")
         except Exception as e:
             print(f"[SOCKET] Erreur: {e}")
         finally:
@@ -3464,6 +4092,8 @@ class KnowledgeCollector:
         self.last_vacuum       = 0    # [EVO2] dernier run retention vacuum
         self.last_config_check = 0    # [EVO4] dernier snapshot config
         self.last_world        = 0    # [SENSORIUM] dernière construction du world model
+        self.last_slow         = time.time()   # 08-10 : les relevés lents, relus toutes les 15 min
+        self.last_hourly       = 0             # 08-10 : mises à jour de paquets (lent : jusqu'à 2 min), à part, toutes les heures
 
     # PERF[O6]: _run_parallel() — collecteurs indépendants exécutés en parallèle.
     # Avant : 25+ collecteurs séquentiels = somme de toutes les latences (subprocess, réseau).
@@ -3494,6 +4124,31 @@ class KnowledgeCollector:
         if errors:
             print(f"[COLLECTOR] Erreurs parallèles: {'; '.join(errors)}", file=sys.stderr)
         return results
+
+    def _relire_lents(self):
+        try:
+            lents = [
+                ("cron_jobs",              collect_cron_jobs),
+                ("ssh_authorized_keys",    collect_ssh_authorized_keys),
+                ("firewall_rules",         collect_firewall_rules),
+                ("vpn_connections",        collect_vpn_connections),
+                ("fastpanel_users",        collect_fastpanel_users),
+                ("fastpanel_php_versions", collect_fastpanel_php_versions),
+                ("fastpanel_ftp_accounts", collect_fastpanel_ftp),
+                ("fastpanel_dns_records",  collect_fastpanel_dns),
+                ("fastpanel_crons",        collect_fastpanel_crons),
+                ("backup_runs",            collect_backup_runs),
+            ]
+            for table, data in self._run_parallel(lents, max_workers=4).items():
+                save_many(table, data)
+            dns, _ = collect_dns_servers()
+            save_many("dns_servers", dns)
+            self._last_dns_servers = dns
+            redis = collect_redis_stats()
+            if redis:
+                save_many("redis_stats", [redis])
+        except Exception as e:
+            print(f"[COLLECTOR] relevés lents : {e}", file=sys.stderr)
 
     def run(self):
         init_all_tables()
@@ -3540,6 +4195,14 @@ class KnowledgeCollector:
             ("ssh_authorized_keys",    collect_ssh_authorized_keys),
             ("firewall_rules",         collect_firewall_rules),
             ("network_hosts",          collect_network_hosts),
+            ("system_services",        collect_system_services),
+            ("cassandra_config",       collect_cassandra_config),
+            ("logiciels",              collect_installed_software),
+            ("system_state",           collect_system_state),
+            ("system_mounts",          collect_mounts),
+            ("storage_health",         collect_storage_health),
+            ("interfaces",             collect_interfaces),
+            ("hardware_state",         collect_hardware_state),
         ]
 
         # Métriques en parallèle aussi (le sleep(0.3) de get_cpu sera chevauchant)
@@ -3564,6 +4227,8 @@ class KnowledgeCollector:
         # DNS (retourne un tuple)
         dns_servers, _ = collect_dns_servers()
         save_many("dns_servers", dns_servers)
+        self._last_dns_servers = dns_servers
+        self._last_sysctl = collected.get("sysctl_security", [])
 
         # Redis
         redis = collect_redis_stats()
@@ -3579,7 +4244,7 @@ class KnowledgeCollector:
         _init_fail = collected.get("failed_units", [])
         health = compute_health_score(
             _init_metrics, _init_ssl, {}, [], [], [], [],
-            len(_init_oom), len(_init_fail)
+            sum(1 for e in _init_oom if e.get("recent")), len(_init_fail)
         )
         save_health_score(health)
 
@@ -3615,6 +4280,8 @@ class KnowledgeCollector:
 
                 if now - self.last_quick >= 30:
                     quick_tasks = [
+                        ("system_services", collect_system_services),
+                        ("interfaces",      collect_interfaces),
                         ("active_sessions", collect_active_sessions),
                         ("open_ports",      collect_open_ports),
                         ("network_hosts",   collect_network_hosts),
@@ -3642,6 +4309,11 @@ class KnowledgeCollector:
                         ("sysctl_security",        collect_sysctl_security),
                         ("disk_smart",             collect_disk_smart),
                         ("config_snapshots",       collect_config_snapshots),  # [EVO4]
+                        ("cassandra_config",       collect_cassandra_config),
+                        ("system_state",           collect_system_state),
+                        ("system_mounts",          collect_mounts),
+                        ("storage_health",         collect_storage_health),
+                        ("hardware_state",         collect_hardware_state),
                     ]
                     full_results = self._run_parallel(full_tasks, max_workers=8)
                     for table, data in full_results.items():
@@ -3657,13 +4329,14 @@ class KnowledgeCollector:
 
                     self._last_ssl   = full_results.get("ssl_certificates", [])
                     self._last_smart = full_results.get("disk_smart", [])
+                    self._last_sysctl = full_results.get("sysctl_security", []) or self._last_sysctl
                     _oom_now   = full_results.get("oom_events", [])
                     _fail_now  = full_results.get("failed_units", [])
                     _met_now   = collect_metrics()
                     health = compute_health_score(
                         _met_now, self._last_ssl, {}, [],
                         self._last_smart, self._last_sysctl, self._last_dns_servers,
-                        len(_oom_now), len(_fail_now)
+                        sum(1 for e in _oom_now if e.get("recent")), len(_fail_now)
                     )
                     save_health_score(health)
                     try:
@@ -3671,6 +4344,17 @@ class KnowledgeCollector:
                     except Exception as _le:
                         print(f"[LOG-ERRORS] {_le}", file=sys.stderr)
                     self.last_full = now
+
+                # 08-10 : CE QUI N'ÉTAIT LU QU'AU DÉMARRAGE. Clés SSH, règles du pare-feu, crons, comptes et DNS de
+                # FastPanel restaient figés jusqu'au prochain redémarrage du collecteur : une clé SSH ajoutée
+                # ce matin n'existait pas pour le sensorium. Relus toutes les 15 minutes.
+                if now - self.last_slow >= 900:
+                    threading.Thread(target=self._relire_lents, daemon=True).start()
+                    self.last_slow = now
+                if now - self.last_hourly >= 3600:
+                    threading.Thread(target=lambda: save_many("apt_updates", collect_apt_updates()), daemon=True).start()
+                    threading.Thread(target=lambda: save_many("logiciels", collect_installed_software()), daemon=True).start()
+                    self.last_hourly = now
 
                 time.sleep(1)
 
@@ -3690,6 +4374,14 @@ if __name__ == "__main__":
     if os.environ.get("CASSANDRA_SELFTEST") == "1":
         print("SELFTEST_OK")
         sys.exit(0)
+
+    # 08-10 : la sortie va dans un fichier (StandardOutput=append:…) ; mise en tampon par blocs, le journal
+    # du collecteur n'avait rien reçu depuis le 3 octobre alors que le collecteur tournait.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
     print("=" * 70)
     print("CASSANDRA — Knowledge Collector v6.0 OPTIMISÉ")

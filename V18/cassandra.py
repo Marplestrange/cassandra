@@ -17398,7 +17398,11 @@ _MEMOIRE_ROUTES = (
     ("personne", re.compile(r"(?i)\b(?:je suis|je pr[ée]f[èe]re|mon pr[ée]nom|tutoie|vouvoie|mes horaires|je m'appelle|qui suis-je|tu sais sur moi)\b")),
     ("lecon", re.compile(r"(?i)\b(?:le[çc]ons?|qu'as-tu appris|as-tu appris|erreurs? pass[ée]es?|retour d'exp[ée]rience)\b")),
     ("perception", re.compile(r"(?i)\b(?:disque|espace (?:libre|disque)|joignable|en ligne|hors ligne|hors-ligne|\bram\b|charge|cpu|certificat|ssl|sauvegardes?|"
-                              r"tourne(?:nt)?|up\b|down\b|[ée]tat (?:de|du|des)|ça va|ca va|vivant|r[ée]pond)")),
+                              r"tourne(?:nt)?|up\b|down\b|[ée]tat (?:de|du|des)|ça va|ca va|vivant|r[ée]pond|"
+                              # 08-10 : ce que le sensorium mesure désormais — jamais lu dans un souvenir
+                              r"(?:est|sont)[- ](?:il|elle|ils|elles) install[ée]e?s?|install[ée]e?s? \?|mises? [àa] jour|conteneurs?|"
+                              r"temp[ée]rature|uptime|red[ée]marrage requis|pare-feu actif|inodes?|raid|synchronis[ée]e?|"
+                              r"interfaces? r[ée]seau|ports? ouverts?|[ée]coute sur)")),
 )
 _MEMOIRE_DECL_ECRITURE_RE = _MEMOIRE_ROUTES[0][1]
 _MEMOIRE_DECL_CORRECTION_RE = re.compile(
@@ -18430,6 +18434,15 @@ def memoire_rappeler(question: str = "", portee: list = None, limite: int = 12, 
             except Exception as e:
                 logging.debug("[MEMOIRE] perception : %s", e)
         else:
+            # 08-10 : une question qui NOMME une chose que le sensorium mesure (« le searxng_url est-il posé ? »,
+            # « omniroute ? ») reçoit la mesure à côté des souvenirs, même si ce n'est pas une question d'état :
+            # sinon un vieux souvenir répondait seul, là où un relevé de la minute existait.
+            try:
+                _pm = _perception_monde((question or "").lower(), set(), 6, stricte=True) if question else []
+                if _pm:
+                    out["perception"] = "— perception (mesurée à l'instant, prime sur tout souvenir) —\n" + "\n".join(_pm)
+            except Exception as e:
+                logging.debug("[MEMOIRE] perception stricte : %s", e)
             termes = _memoire_termes(question, 8)
             if termes:
                 seuil = _memoire_seuil(route, question)
@@ -18709,7 +18722,10 @@ def memoire_pied_html(cites: list = None, ms=None) -> str:
 # ── La perception : les capteurs, jamais des souvenirs ─────────────────────────────
 # Durée de validité par nature de relevé (secondes). Au-delà : « je ne sais plus ».
 PERCEPTION_TTL = {"service": 1800, "machine_hors_ligne": 900, "machine_en_ligne": 14400, "site": 7200,
-                  "disque": 86400, "ram": 300, "charge": 300, "certificat": 604800}
+                  "disque": 86400, "ram": 300, "charge": 300, "certificat": 604800,
+                  # 08-10 : le sensorium élargi (collecteur) — relu toutes les 30 s, 5 min, 15 min ou 1 h selon la famille
+                  "config": 1800, "logiciel": 10800, "maj": 10800, "montage": 1800, "interface": 600,
+                  "stockage": 1800, "systeme": 1800, "port": 600}
 
 
 def _memoire_age(ts):
@@ -18750,7 +18766,7 @@ def _perception_ligne(nom: str, etat: str, ts, ttl: int) -> str:
     return "· %s : %s (relevé il y a %s, valable %s)" % (nom, etat, _memoire_duree_txt(age), _memoire_duree_txt(ttl))
 
 
-def _perception_monde(q: str, deja: set, limite: int = 12) -> list:
+def _perception_monde(q: str, deja: set, limite: int = 12, stricte: bool = False) -> list:
     """LA JONCTION (20-09) : les relevés du collecteur (`world_model`, par son socket), rendus comme ceux de
     la vigie — machines de la flotte, sites, certificats, services et conteneurs, ressources —, chacun avec
     son âge et sa validité. Le collecteur n'est pas obligatoire : sans lui, rien, sans erreur. Une entité que
@@ -18772,7 +18788,16 @@ def _perception_monde(q: str, deja: set, limite: int = 12) -> list:
     out = []
 
     def _cite(nom):
-        return bool(nom) and nom.lower() in q
+        nom = (nom or "").lower()
+        if not nom:
+            return False
+        # Un nom court (« git », « php ») ne se cite que comme mot entier ; un nom à tiret ou à point
+        # (« searxng_url », « cassandra-collector ») se reconnaît aussi écrit avec des espaces.
+        variantes = {nom, nom.replace("_", " "), nom.replace("-", " "), nom.replace(".", " ")}
+        return any(re.search(r"(?<![\w.-])%s(?![\w-])" % re.escape(v), q) for v in variantes if len(v) >= 3)
+
+    def _mot(*mots):
+        return (not stricte) and any(m in q for m in mots)
 
     def _ajouter(libelle, etat, ts, ttl):
         if libelle in deja or len(out) >= limite:
@@ -18780,8 +18805,25 @@ def _perception_monde(q: str, deja: set, limite: int = 12) -> list:
         deja.add(libelle)
         out.append(_perception_ligne(libelle, etat, ts, ttl))
 
+    # LE SENSORIUM ÉLARGI (08-10) : config de Cassandra, logiciels, mises à jour, montages, interfaces, RAID,
+    # état du système. Chaque famille répond à son nom cité, ou à ses mots (sauf en mode strict, où seul un
+    # nom cité compte : c'est le mode des questions qui ne sont pas des questions d'état).
+    _SYS = {"system.os": ("système", ("os ", "distribution", "debian", "ubuntu", "version du système")),
+            "system.uptime": ("uptime", ("uptime", "depuis quand", "allumé depuis", "redémarré")),
+            "system.redemarrage_requis": ("redémarrage requis", ("redémarr", "redemarr", "reboot")),
+            "system.heure": ("heure système", ("heure", "ntp", "synchronis")),
+            "system.temperature": ("température", ("températ", "chauffe", "chaud")),
+            "system.batterie": ("batterie", ("batterie",)),
+            "system.pare_feu": ("pare-feu", ("pare-feu", "firewall", "parefeu")),
+            "system.protection_noyau": ("protection du noyau", ("apparmor", "selinux")),
+            "system.tailscale": ("tailscale de cette machine", ("tailscale",)),
+            "maj.paquets": ("mises à jour", ("mise à jour", "mises à jour", "mise a jour", "paquet", "apt ", "upgrade")),
+            "systemd.failed_units": ("services en échec", ("échec", "echec", "failed", "planté"))}
+
     for r in rows:
         wk, cat, val, ts = str(r.get("wkey") or ""), str(r.get("category") or ""), str(r.get("value") or ""), r.get("observed_at")
+        if stricte and not any(_cite(p) for p in (wk.split(".", 1)[1] if "." in wk else wk,)):
+            continue
         if wk.startswith("fleet.") and cat == "fleet":
             nom = wk[6:]
             if not q or _cite(nom) or "machine" in q or "flotte" in q or "en ligne" in q:
@@ -18808,6 +18850,32 @@ def _perception_monde(q: str, deja: set, limite: int = 12) -> list:
         elif wk in ("cpu.load", "load.1m"):
             if "charge" in q or "cpu" in q or "load" in q:
                 _ajouter("charge" if wk == "load.1m" else "processeur", ("load1 %s" % val) if wk == "load.1m" else val, ts, PERCEPTION_TTL["charge"])
+        elif wk.startswith("config."):
+            cle = wk[7:]
+            if _cite(cle) or (cle == "fichier" and _mot("config.json", "configuration de cassandra", "fichier de config")):
+                _ajouter("réglage %s" % cle if cle != "fichier" else "fichier de config de Cassandra", val, ts, PERCEPTION_TTL["config"])
+        elif wk.startswith("logiciel."):
+            nom = wk[9:]
+            if _cite(nom):
+                _ajouter("logiciel %s" % nom, val, ts, PERCEPTION_TTL["logiciel"])
+        elif wk.startswith("montage."):
+            mp = wk[8:]
+            if (mp != "/" and _cite(mp)) or _mot("montage", "monté", "partition", "inode", "systèmes de fichiers", "disques"):
+                _ajouter("système de fichiers %s" % mp, val, ts, PERCEPTION_TTL["montage"])
+        elif wk.startswith("interface."):
+            nom = wk[10:]
+            if _cite(nom) or _mot("interface", "réseau local", "adresse ip", "wifi", "wi-fi", "ethernet"):
+                _ajouter("interface %s" % nom, val, ts, PERCEPTION_TTL["interface"])
+        elif wk.startswith("stockage."):
+            if _cite(wk[9:]) or _mot("raid", "zfs", "pool", "miroir", "mdadm"):
+                _ajouter("stockage %s" % wk[9:], val, ts, PERCEPTION_TTL["stockage"])
+        elif wk.startswith("port."):
+            if _cite(wk[5:]) and ("port" in q) or _mot("ports ouverts", "port ouvert", "écoute sur", "ports à l'écoute"):
+                _ajouter("port %s" % wk[5:], "à l'écoute (%s)" % val, ts, PERCEPTION_TTL["port"])
+        elif wk in _SYS:
+            libelle, mots = _SYS[wk]
+            if _mot(*mots):
+                _ajouter(libelle, val, ts, PERCEPTION_TTL["systeme"])
     return out
 
 
@@ -78178,6 +78246,19 @@ def _flotte_sonde_pass(live: dict, etats: dict) -> list:
     return transitions
 
 
+def _sensorium_heure_locale(ts) -> str:
+    """Le collecteur date ses relevés en UTC (« …Z », depuis le 08-10) ; l'écran les montre à l'heure locale.
+    Une date sans « Z » est d'avant : déjà locale, rendue telle quelle."""
+    t = str(ts or "")
+    if not t.endswith("Z"):
+        return t[:19]
+    try:
+        d = datetime.strptime(t[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        return d.astimezone().strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return t[:19]
+
+
 def _flotte_sensorium() -> dict:
     """Les entités fleet.* du modèle du monde (collecteur), nom → {valeur, severite, observe}."""
     out = {}
@@ -78188,7 +78269,7 @@ def _flotte_sensorium() -> dict:
             nom = _flotte_nom(wk.split(".", 1)[1] if "." in wk else wk)
             if nom:
                 out[nom] = {"valeur": str(g("value") or ""), "severite": str(g("severity") or ""),
-                            "observe": str(g("observed_at") or "")[:19]}
+                            "observe": _sensorium_heure_locale(g("observed_at"))}
     except Exception as e:
         logging.info("[FLOTTE] sensorium illisible : %s", e)
     return out
