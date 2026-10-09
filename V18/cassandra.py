@@ -87747,6 +87747,12 @@ def _pf_lisible(j: list) -> dict:
         conds.append("%s %s" % ((p or "tcp/udp").upper(), ", ".join(("%d" % a) if a == b else "%d-%d" % (a, b) for a, b in ports)))
     elif p:
         conds.append(p.upper())
+    sp, _nsp = _pf_val(j, "--sport", "--source-port")
+    if sp:
+        conds.append("depuis le port %s" % sp.replace(":", "-"))
+    ic, _ni = _pf_val(j, "--icmp-type", "--icmpv6-type")
+    if ic:
+        conds.append({"8": "ping", "echo-request": "ping", "0": "réponse de ping", "echo-reply": "réponse de ping"}.get(ic, "ICMP " + ic))
     etat, _ne = _pf_val(j, "--ctstate", "--state")
     if etat:
         conds.append("connexions déjà établies" if set(etat.split(",")) <= {"RELATED", "ESTABLISHED"} else "état " + etat)
@@ -87755,7 +87761,8 @@ def _pf_lisible(j: list) -> dict:
         conds.append("« %s »" % com[:60])
     # Toute autre option (-m set, --match-set, -d…) est une condition : la règle ne vaut pas pour tout.
     connues = {"-p", "--protocol", "-s", "--source", "-i", "--in-interface", "--dport", "--dports", "--ctstate",
-               "--state", "--comment", "-j", "-g", "-m", "!", "--destination-port", "--destination-ports"}
+               "--state", "--comment", "-j", "-g", "-m", "!", "--destination-port", "--destination-ports",
+               "--sport", "--source-port", "--icmp-type", "--icmpv6-type"}
     autres = [x for k, x in enumerate(j) if x.startswith("-") and x not in connues]
     if autres:
         conds.append(" ".join(autres)[:60])

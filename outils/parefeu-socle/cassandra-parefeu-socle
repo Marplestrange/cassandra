@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# LE SOCLE DU PARE-FEU (09-10) — ce que FastPanel ne sait pas dire, et sans quoi « refuser par défaut » casse :
+#   - les réponses aux connexions qu'ouvre la machine (avant toute autre règle : DNS, mises à jour, courriel) ;
+#   - la boucle locale, Tailscale (tout le parc), les réseaux Docker vers la machine ;
+#   - les adresses locales du parc (le témoin d'Athena interroge Orion par son adresse locale) ;
+#   - les réponses DHCP de la box ; le ping depuis le réseau local ;
+#   - en IPv6 : ICMPv6 entier (sans lui, voisinage et annonces de routeur tombent, et IPv6 avec), DHCPv6.
+# Les sites (80/443) et la politique IPv4 vivent dans FastPanel : visibles et réglables dans son écran et dans
+# l'onglet Sécurité de Cassandra. La politique IPv6, que FastPanel ne règle pas, se règle ici.
+# Idempotent : relancé toutes les deux minutes, il remet le socle si Docker, Tailscale ou FastPanel réécrivent INPUT.
+set -u
+CONF=/etc/cassandra/parefeu-socle.conf
+PARC4=""; RESEAU4=""; BOX4=""; POLITIQUE6=ACCEPT
+[ -r "$CONF" ] && . "$CONF"
+
+socle() {   # $1 = iptables | ip6tables
+    local T=$1 C=cassandra_socle
+    $T -w -N $C 2>/dev/null || true
+    $T -w -F $C
+    $T -w -A $C -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    $T -w -A $C -i lo -j ACCEPT
+    $T -w -A $C -i tailscale0 -j ACCEPT
+    $T -w -A $C -i docker0 -j ACCEPT
+    $T -w -A $C -i br-+ -j ACCEPT
+    if [ "$T" = iptables ]; then
+        for a in $PARC4; do $T -w -A $C -s "$a" -j ACCEPT; done
+        [ -n "$BOX4" ] && $T -w -A $C -s "$BOX4" -p udp --sport 67 --dport 68 -j ACCEPT
+        [ -n "$RESEAU4" ] && $T -w -A $C -s "$RESEAU4" -p icmp --icmp-type echo-request -j ACCEPT
+        # Les réponses SSDP (découverte des appareils : pont Hue…) : elles viennent d'une autre adresse que
+        # celle interrogée (multidiffusion), le suivi de connexion ne les reconnaît pas comme des réponses.
+        [ -n "$RESEAU4" ] && $T -w -A $C -s "$RESEAU4" -p udp --sport 1900 -j ACCEPT
+    else
+        $T -w -A $C -p ipv6-icmp -j ACCEPT
+        $T -w -A $C -s fe80::/10 -p udp --dport 546 -j ACCEPT
+    fi
+    $T -w -A $C -j RETURN
+    # Le saut, une seule fois, APRÈS Tailscale et fail2ban : une adresse bannie ne doit pas garder sa connexion
+    # ouverte grâce à « déjà établie ».
+    while $T -w -C INPUT -j $C 2>/dev/null; do $T -w -D INPUT -j $C; done
+    local der
+    der=$($T -w -S INPUT | grep '^-A INPUT' | grep -n -E -- '-j (ts-input|f2b-[^ ]+)$' | tail -1 | cut -d: -f1)
+    $T -w -I INPUT $(( ${der:-0} + 1 )) -j $C
+}
+
+socle iptables
+socle ip6tables
+case "$POLITIQUE6" in DROP|ACCEPT) ip6tables -w -P INPUT "$POLITIQUE6" ;; esac
+exit 0

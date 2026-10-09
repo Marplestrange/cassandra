@@ -1,0 +1,11 @@
+[Unit]
+Description=Cassandra — socle du pare-feu (réponses, parc, Docker, ICMPv6)
+After=network-online.target docker.service tailscaled.service fastpanel2.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cassandra-parefeu-socle
+
+[Install]
+WantedBy=multi-user.target

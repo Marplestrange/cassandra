@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# LE FILET : si personne ne l'arrête, il remet tout en « accepter » (IPv4, IPv6, FastPanel). Posé avant toute
+# bascule en « refuser par défaut », arrêté seulement une fois que tout a été vérifié.
+set -u
+T=$(cat /etc/cassandra/fastpanel-api.token 2>/dev/null)
+[ -n "$T" ] && curl -sk -m 20 -X PUT -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
+    -d '{"policy":"ACCEPT"}' https://127.0.0.1:8888/api/firewall/policy >/dev/null
+iptables -w -P INPUT ACCEPT
+ip6tables -w -P INPUT ACCEPT
+sed -i 's/^POLITIQUE6=.*/POLITIQUE6=ACCEPT/' /etc/cassandra/parefeu-socle.conf 2>/dev/null
+logger -t cassandra-parefeu "filet déclenché : tout est revenu en ACCEPT"

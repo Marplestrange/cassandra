@@ -1,0 +1,10 @@
+[Unit]
+Description=Cassandra — le socle du pare-feu se réapplique (Docker, Tailscale et FastPanel réécrivent INPUT)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
