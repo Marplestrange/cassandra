@@ -78586,7 +78586,7 @@ awk '/^MemTotal/{t=$2} /^MemAvailable/{a=$2} /^MemFree/{f=$2} /^Buffers/{b=$2} /
 echo "UP $(cut -d. -f1 /proc/uptime 2>/dev/null)"
 echo "LOAD $(cut -d' ' -f1 /proc/loadavg 2>/dev/null) $(nproc 2>/dev/null)"
 [ -f /var/run/reboot-required ] && echo "REBOOT oui" || echo "REBOOT non"
-command -v systemctl >/dev/null 2>&1 && echo "FAILED $(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+command -v systemctl >/dev/null 2>&1 && { f=""; b=""; for u in $(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}'); do y=$(systemctl show -p StateChangeTimestamp "$u" 2>/dev/null | grep -o ' [12][0-9][0-9][0-9]-' | head -1 | tr -d ' -'); if [ -n "$y" ] && [ "$y" -lt 2016 ]; then b="$b $u"; else f="$f $u"; fi; done; echo "FAILED$f"; echo "FAILEDBOOT$b"; }
 grep -h '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' | sed 's/^/OS /'
 [ -f /etc.defaults/VERSION ] && . /etc.defaults/VERSION 2>/dev/null && echo "OS DSM $productversion"
 grep -E '^md[0-9]+' -A1 /proc/mdstat 2>/dev/null | grep -o '\[[U_]*\]' | tr '\n' ' ' | sed 's/^/RAID /'; echo
@@ -78644,6 +78644,10 @@ def _flotte_sonde_lire_sortie(nom: str, sortie: str) -> list:
                 out.append(("charge", "%.2f sur %d cœur%s" % (c, n, "s" if n > 1 else ""), "warning" if c > 2 * n else "info"))
             elif k == "REBOOT" and len(p) >= 2:
                 out.append(("redemarrage_requis", p[1], "warning" if p[1] == "oui" else "info"))
+            elif k == "FAILEDBOOT":
+                noms = [x for x in l.strip()[10:].split() if x]
+                if noms:
+                    out.append(("echecs_au_demarrage", "%d : %s — au démarrage, avant que l'horloge soit réglée" % (len(noms), ", ".join(noms)), "info"))
             elif k == "FAILED":
                 reste = l.strip()[6:].strip()
                 # Windows sépare par « | » (des noms de service contiennent des espaces), Linux par des espaces
@@ -78856,6 +78860,7 @@ def sensorium_retirer_acquit(wkey: str) -> dict:
 
 
 _SN_MOTS = {"socle": "socle (parc, Docker, réponses)", "partage": "partage et Funnel", "appareils": "appareils",
+            "echecs au demarrage": "échecs au démarrage (avant l'horloge)",
             "acces distant": "accès distant à Freebox OS", "upnp": "UPnP", "dmz": "DMZ", "ftp": "FTP", "vpn": "VPN",
             "systeme": "système", "connexion": "connexion", "redirections": "redirections de ports", "en echec": "en échec", "mises a jour": "mises à jour", "hors machine": "hors machine",
             "redemarrage requis": "redémarrage requis", "protection noyau": "protection du noyau", "ipv4": "IPv4",
@@ -115760,7 +115765,7 @@ function _snNom(wk){ const i = wk.indexOf('.'); return i>=0 ? wk.slice(i+1) : wk
 // Le libellé d'une clé que le serveur n'a pas étiquetée (corrélations) : celui d'une ligne connue, sinon la clé.
 function _snLib(wk){ const r = ((SN.etat&&SN.etat.rows)||[]).find(x=>x.wkey===wk); return (r&&r.libelle) || _snNom(wk); }
 // Les détails d'une machine de la flotte, en mots : « disque C: 67 % », « mises à jour il y a 2 j ».
-const SN_MACH = {os:'système', antivirus:'antivirus', charge:'charge', mises_a_jour:'mises à jour', services_en_echec:'services en échec'};
+const SN_MACH = {os:'système', antivirus:'antivirus', charge:'charge', mises_a_jour:'mises à jour', services_en_echec:'services en échec', echecs_au_demarrage:'échecs au démarrage'};
 function _snMach(cle){ const k = cle.replace(/^disque\./,''); return cle.startsWith('disque.') ? 'disque '+k : (SN_MACH[cle] || cle.replace(/_/g,' ')); }
 async function snEntrer(){
   try{ SN.etat = await apiPost('/api/sensorium/etat', {}); }catch(e){ SN.etat = {ok:false, error:String(e)}; }
