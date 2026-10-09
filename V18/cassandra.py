@@ -78893,7 +78893,7 @@ def _sensorium_libelle(wkey: str) -> str:
             "fail2ban": "Fail2ban", "cron": "Tâche planifiée", "fastpanel": "FastPanel", "journaux": "Journaux",
             "mysql": "MySQL", "cassandra": "Cassandra", "certbot": "Certbot", "exposition": "Exposition",
             "disque_sante": "Santé du disque", "php_fpm": "PHP-FPM", "box": "Box", "tailnet": "Tailnet", "prison": "Prison fail2ban", "domaine_courriel": "Courriel du domaine",
-            "image": "Image du conteneur"}
+            "image": "Image du conteneur", "dns_local": "DNS local de la maison"}
     if not reste:
         return noms.get(fam, wkey)
     if fam == "machine":
@@ -115753,7 +115753,7 @@ const SN_FAMILLES = [
   ['reseau','Réseau','interface.|port.'], ['stockage','Stockage','stockage.'], ['securite','Sécurité','security.'],
   ['maj','Mises à jour','maj.'], ['courriel','Courriel','courriel.|domaine_courriel.'], ['acces','Accès et pare-feu','ssh.|cle_ssh.|pare_feu.|fail2ban.|prison.'],
   ['cron','Tâches planifiées','cron.'], ['fastpanel','FastPanel','fastpanel.'], ['erreurs','Erreurs des journaux','erreurs.|journaux.'],
-  ['certbot','Renouvellement des certificats','certbot.'], ['box','La box','box.'], ['tailnet','Tailnet','tailnet.'], ['capteur','Capteurs','capteur.'], ['sante','Santé','health.']
+  ['certbot','Renouvellement des certificats','certbot.'], ['box','La box','box.|dns_local'], ['tailnet','Tailnet','tailnet.'], ['capteur','Capteurs','capteur.'], ['sante','Santé','health.']
 ];
 function _snE(t){ return (typeof flE==='function') ? flE(t) : String(t==null?'':t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function _snFam(wk){ for(const f of SN_FAMILLES){ if(f[2].split('|').some(p=>wk.startsWith(p))) return f[0]; } return 'autre'; }

@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# LE DNS LOCAL (10-10) — à la maison, les sites d'Orion se résolvent vers son adresse locale.
+# Sans lui, une visite depuis la maison sort par l'adresse publique et revient par la box : les sites la voient
+# venir de la box (192.168.1.254), et un blocage par adresse (Authentik, fail2ban) frapperait toute la maison.
+# Les noms viennent de nginx (tout site ajouté dans FastPanel y entre seul) ; relancé par une minuterie, il ne
+# recharge dnsmasq que si la liste change. Le reste des questions part vers la box, qui connaît les noms locaux.
+set -u
+CONF=/etc/cassandra/dns-local.conf
+HOSTS=/var/lib/cassandra-dns-local/noms.hosts   # hors de /etc/cassandra (0700) : dnsmasq le relit sans root
+SERVEURS=/var/lib/cassandra-dns-local/locaux.servers
+mkdir -p -m 0755 /var/lib/cassandra-dns-local
+ADRESSE=""
+[ -r /etc/cassandra/dns-local.env ] && . /etc/cassandra/dns-local.env
+[ -n "$ADRESSE" ] || { echo "ADRESSE vide dans /etc/cassandra/dns-local.env" >&2; exit 1; }
+
+noms=$(nginx -T 2>/dev/null | awk '$1 == "server_name" { for (i = 2; i <= NF; i++) print $i }' | tr -d ';' \
+    | grep -E '^[a-z0-9-]+(\.[a-z0-9-]+)+$' | grep -vx 'localhost' | sort -u)
+[ -n "$noms" ] || { echo "nginx ne donne aucun nom : liste gardée" >&2; exit 0; }
+
+neuf=$(mktemp); neufs=$(mktemp)
+{
+    echo "# Écrit par cassandra-dns-local-noms — ne pas modifier à la main."
+    for n in $noms; do echo "$ADRESSE $n"; done
+} > "$neuf"
+# Un site derrière Cloudflare a une adresse IPv6 publique (Cloudflare) : transmise telle quelle, le navigateur la
+# préférerait et repasserait par Internet. Ces noms se répondent ici seuls (IPv6 : réponse vide). Un domaine nu n'en
+# est pas : ses autres noms (le courriel chez OVH…) doivent continuer de se résoudre au dehors.
+{
+    echo "# Écrit par cassandra-dns-local-noms — ne pas modifier à la main."
+    for n in $noms; do
+        case "$n" in *.*.*) ;; *) continue ;; esac
+        [ -n "$(dig +short +time=3 +tries=1 AAAA "$n" @1.1.1.1 2>/dev/null | grep ':')" ] && echo "server=/$n/"
+    done
+} > "$neufs"
+change=0
+cmp -s "$neuf" "$HOSTS" || { install -m 0644 "$neuf" "$HOSTS"; change=1; }
+cmp -s "$neufs" "$SERVEURS" || { install -m 0644 "$neufs" "$SERVEURS"; change=1; }
+if [ $change = 1 ]; then
+    # Pas pendant le démarrage du service (ce script en est le prélude : le signal le tuerait lui-même).
+    [ "$(systemctl is-active cassandra-dns-local.service)" = active ] && systemctl reload cassandra-dns-local.service
+    echo "noms : $(echo "$noms" | wc -l), dont $(grep -c '^server=' "$SERVEURS") sans IPv6"
+fi
+rm -f "$neuf" "$neufs"
+exit 0

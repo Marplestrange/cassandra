@@ -1,0 +1,9 @@
+[Unit]
+Description=Cassandra — DNS local : relire les sites de nginx
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

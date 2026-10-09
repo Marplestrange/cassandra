@@ -1,0 +1,14 @@
+[Unit]
+Description=Cassandra — DNS local de la maison (les sites d'Orion vers son adresse locale)
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+ExecStartPre=/usr/local/sbin/cassandra-dns-local-noms
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/cassandra/dns-local.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

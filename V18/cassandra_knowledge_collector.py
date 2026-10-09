@@ -4477,6 +4477,35 @@ def collect_fail2ban_prisons() -> list:
     return out
 
 
+_DNS_LOCAL_CONF = "/etc/cassandra/dns-local.conf"
+_DNS_LOCAL_NOMS = "/var/lib/cassandra-dns-local/noms.hosts"
+
+
+def collect_dns_local() -> list:
+    """LE DNS LOCAL DE LA MAISON (10-10) : les sites d'ici doivent s'y résoudre vers l'adresse locale. Tombé, la
+    maison retombe sur la box : les sites la voient de nouveau venir de la box, et si la box le donne seul aux
+    appareils, plus rien ne se résout. Chaque adresse d'écoute est interrogée."""
+    if not os.path.exists(_DNS_LOCAL_CONF) or not _qui("dig"):
+        return []
+    try:
+        ecoutes = re.findall(r"(?m)^listen-address=(\S+)", open(_DNS_LOCAL_CONF, encoding="utf-8").read())
+        noms = [l.split()[1] for l in open(_DNS_LOCAL_NOMS, encoding="utf-8") if l.strip() and not l.startswith("#")]
+    except Exception:
+        ecoutes, noms = [], []
+    if not noms:
+        return [_mesure("dns_local", "reseau", "AUCUN NOM : la liste des sites est vide", sev="warning")]
+    attendu = next((a for a in ecoutes if ":" not in a), "")
+    ko = []
+    for a in ecoutes:
+        r = (run_cmd(["dig", "+short", "+time=2", "+tries=1", "A", noms[0], "@" + a], timeout=6) or "").split()
+        if attendu not in r:
+            ko.append("%s ne répond pas juste (%s)" % (a, " ".join(r) or "rien"))
+    if ko:
+        return [_mesure("dns_local", "reseau", "EN PANNE · " + " ; ".join(ko), sev="warning")]
+    return [_mesure("dns_local", "reseau", "%d site%s résolu%s vers %s · %s" % (
+        len(noms), "s" if len(noms) > 1 else "", "s" if len(noms) > 1 else "", attendu, " et ".join(ecoutes)))]
+
+
 _DOMAINES_CACHE = {"t": 0, "d": []}
 _DKIM_SELECTEURS = ("default", "dkim", "mail", "selector1", "selector2", "google", "k1", "s1", "s2",
                     "ovhmo-selector-1", "ovhmo-selector-2", "ovhex", "fm1", "mxvault")
@@ -4759,7 +4788,7 @@ def collect_mesures_diverses() -> list:
     rows = []
     for fn in (collect_file_courriel, collect_ssh_echecs, collect_docker_ressources, collect_certbot, collect_journaux_poids,
                collect_sante_applicative, collect_box, collect_tailnet, collect_fail2ban_prisons,
-               collect_courriel_domaines, collect_images_docker):
+               collect_courriel_domaines, collect_images_docker, collect_dns_local):
         try:
             rows.extend(fn() or [])
         except Exception as e:
@@ -5429,7 +5458,7 @@ def build_world_model():
         def _diverses(lignes, vus):
             for r in lignes:
                 U(r["cle"], r["categorie"] or "divers", r["valeur"], vus, r["severite"] or "info")
-        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux.", "trafic.", "mysql.", "cassandra.", "box.", "tailnet.", "prison.", "domaine_courriel.", "image."):
+        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux.", "trafic.", "mysql.", "cassandra.", "box.", "tailnet.", "prison.", "domaine_courriel.", "image.", "dns_local"):
             _famille(_pref, _q("SELECT cle, categorie, valeur, severite FROM mesures_diverses WHERE cle LIKE ?", _pref + "%"), _diverses)
 
         # Clés SSH autorisées, une par une : une clé ajoutée ou retirée entre au journal des changements

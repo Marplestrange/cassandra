@@ -10,7 +10,7 @@
 # Idempotent : relancé toutes les deux minutes, il remet le socle si Docker, Tailscale ou FastPanel réécrivent INPUT.
 set -u
 CONF=/etc/cassandra/parefeu-socle.conf
-PARC4=""; RESEAU4=""; BOX4=""; POLITIQUE6=ACCEPT
+PARC4=""; RESEAU4=""; RESEAU6=""; BOX4=""; POLITIQUE6=ACCEPT
 [ -r "$CONF" ] && . "$CONF"
 
 socle() {   # $1 = iptables | ip6tables
@@ -29,9 +29,17 @@ socle() {   # $1 = iptables | ip6tables
         # Les réponses SSDP (découverte des appareils : pont Hue…) : elles viennent d'une autre adresse que
         # celle interrogée (multidiffusion), le suivi de connexion ne les reconnaît pas comme des réponses.
         [ -n "$RESEAU4" ] && $T -w -A $C -s "$RESEAU4" -p udp --sport 1900 -j ACCEPT
+        # Le DNS local (10-10) : la maison résout les sites d'Orion vers son adresse locale.
+        [ -n "$RESEAU4" ] && $T -w -A $C -s "$RESEAU4" -p udp --dport 53 -j ACCEPT
+        [ -n "$RESEAU4" ] && $T -w -A $C -s "$RESEAU4" -p tcp --dport 53 -j ACCEPT
     else
         $T -w -A $C -p ipv6-icmp -j ACCEPT
         $T -w -A $C -s fe80::/10 -p udp --dport 546 -j ACCEPT
+        # Le DNS local en IPv6 : la box annonce un DNS IPv6 aux appareils, qu'ils préfèrent souvent.
+        for a in $RESEAU6; do
+            $T -w -A $C -s "$a" -p udp --dport 53 -j ACCEPT
+            $T -w -A $C -s "$a" -p tcp --dport 53 -j ACCEPT
+        done
     fi
     $T -w -A $C -j RETURN
     # Le saut, une seule fois, APRÈS Tailscale et fail2ban : une adresse bannie ne doit pas garder sa connexion

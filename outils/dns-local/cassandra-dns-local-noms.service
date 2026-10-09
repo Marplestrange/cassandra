@@ -1,0 +1,6 @@
+[Unit]
+Description=Cassandra — DNS local : relire les sites de nginx
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cassandra-dns-local-noms
