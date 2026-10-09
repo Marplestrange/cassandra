@@ -78787,7 +78787,11 @@ def sensorium_acquits() -> dict:
         now = _memoire_now()
         conn.execute("DELETE FROM sensorium_acquits WHERE jusqua <> '' AND jusqua < ?", (now,))
         conn.commit()
-        return {r["wkey"]: dict(r) for r in conn.execute("SELECT * FROM sensorium_acquits")}
+        # `sanitize_data` échappe tout corps entrant : la raison arrivait « c&#x27;est », et l'écran
+        # l'échappait une seconde fois. Elle se rend déséchappée ; l'écran fait son travail, une fois.
+        import html as _html
+        return {r["wkey"]: dict(dict(r), raison=_html.unescape(str(r["raison"] or "")))
+                for r in conn.execute("SELECT * FROM sensorium_acquits")}
     finally:
         conn.close()
 
@@ -78832,7 +78836,7 @@ def sensorium_accepter(wkey: str, raison: str, jours, acteur: str = "") -> dict:
         conn.execute("INSERT INTO sensorium_acquits (wkey, raison, jusqua, valeur, par) VALUES (?,?,?,?,?) "
                      "ON CONFLICT(wkey) DO UPDATE SET raison=excluded.raison, jusqua=excluded.jusqua, valeur=excluded.valeur, "
                      "par=excluded.par, ts=datetime('now')",
-                     (wkey, str(raison or "")[:300], jusqua, str(rows[wkey].get("value") or "")[:300], acteur))
+                     (wkey, __import__("html").unescape(str(raison or ""))[:300], jusqua, str(rows[wkey].get("value") or "")[:300], acteur))
         conn.commit()
     finally:
         conn.close()
@@ -78850,13 +78854,44 @@ def sensorium_retirer_acquit(wkey: str) -> dict:
     return {"ok": True, "retire": bool(n)}
 
 
+_SN_MOTS = {"en echec": "en échec", "mises a jour": "mises à jour", "hors machine": "hors machine",
+            "redemarrage requis": "redémarrage requis", "protection noyau": "protection du noyau", "ipv4": "IPv4",
+            "ipv6": "IPv6", "file attente": "file d'attente", "echecs": "échecs", "etat": "état", "paquets": "paquets",
+            "usage": "occupation", "load": "charge", "score": "score", "fuseau": "fuseau horaire", "heure": "heure",
+            "disque": "disque", "temperature": "température", "uptime": "allumée depuis", "os": "système"}
+
+
+def _sn_mots(t: str) -> str:
+    """Les mots d'une clé, accentués : une expression connue entière, sinon chaque expression de plusieurs mots."""
+    if t in _SN_MOTS:
+        return _SN_MOTS[t]
+    for k, v in _SN_MOTS.items():
+        if " " in k and k in t:
+            t = t.replace(k, v)
+    return t
+
+
 def _sensorium_libelle(wkey: str) -> str:
+    """Le nom d'une mesure en français : « Athena — services en échec », « Pare-feu IPv4 »."""
     fam, _, reste = wkey.partition(".")
     noms = {"service": "Service", "docker": "Conteneur", "web": "Site", "ssl": "Certificat", "machine": "Machine",
             "sauvegarde": "Sauvegarde", "montage": "Disque", "stockage": "Stockage", "controle": "Contrôle",
             "capteur": "Capteur", "prevision": "Prévision", "courriel": "Courriel", "ssh": "SSH", "erreurs": "Erreurs",
-            "conteneur_ressources": "Conteneur", "system": "Système", "systemd": "Systemd", "maj": "Mises à jour"}
-    return "%s %s" % (noms.get(fam, fam.capitalize()), reste.replace("_", " ")) if reste else wkey
+            "conteneur_ressources": "Conteneur", "system": "Système", "systemd": "Systemd", "maj": "Mises à jour",
+            "pare_feu": "Pare-feu", "fleet": "Flotte", "trafic": "Trafic", "health": "Santé", "security": "Noyau",
+            "ram": "Mémoire", "cpu": "Processeur", "swap": "Mémoire d'échange", "disk": "Disque", "load": "Charge",
+            "port": "Port", "interface": "Interface", "logiciel": "Logiciel", "config": "Réglage", "cle_ssh": "Clé SSH",
+            "fail2ban": "Fail2ban", "cron": "Tâche planifiée", "fastpanel": "FastPanel", "journaux": "Journaux",
+            "mysql": "MySQL", "cassandra": "Cassandra", "certbot": "Certbot", "exposition": "Exposition",
+            "disque_sante": "Santé du disque", "php_fpm": "PHP-FPM"}
+    if not reste:
+        return noms.get(fam, wkey)
+    if fam == "machine":
+        m, _, quoi = reste.partition(".")
+        quoi = quoi.replace("_", " ")
+        return "%s — %s" % (m.capitalize(), _sn_mots(quoi)) if quoi else m.capitalize()
+    r = reste.replace("_", " ")
+    return "%s %s" % (noms.get(fam, fam.capitalize()), _sn_mots(r))
 
 
 def _sensorium_alertes_passe() -> dict:
@@ -79111,6 +79146,12 @@ def sensorium_etat() -> dict:
                 r["gestes"] = [{"id": g["id"], "libelle": g["libelle"]} for g in sensorium_gestes(r)]
     except Exception as e:
         logging.info("[SENSORIUM] acquits/gestes : %s", e)
+    for r in rows:
+        if isinstance(r, dict):
+            try:
+                r["libelle"] = _sensorium_libelle(str(r.get("wkey") or ""))
+            except Exception:
+                pass
     try:
         changes = world_changes_from_socket() or []
     except Exception:
@@ -87668,9 +87709,31 @@ def _pf_ports(j: list) -> list:
     return out
 
 
+_PF_OPTIONS_CIBLE = ("--reject-with", "--log-prefix", "--log-level", "--to-destination", "--to-source",
+                     "--to-ports", "--set-mark", "--set-xmark")
+
+
+def _pf_sans_options_cible(j: list) -> list:
+    out, saute = [], False
+    for x in j:
+        if saute:
+            saute = False
+            continue
+        if x in _PF_OPTIONS_CIBLE:
+            saute = True
+            continue
+        if x in ("--log-uid", "--log-tcp-options", "--log-ip-options"):
+            continue
+        out.append(x)
+    return out
+
+
 def _pf_lisible(j: list) -> dict:
     """Une règle en clair : conditions, cible, et si elle s'applique à tout (aucune condition)."""
     cible, _ = _pf_val(j, "-j", "-g")
+    # Les options DE LA CIBLE (« --reject-with icmp-port-unreachable », « --log-prefix x ») ne sont pas des
+    # conditions : sans ce retrait, un REJECT final passait pour conditionnel et le verdict restait « ouvert ».
+    j = _pf_sans_options_cible(j)
     conds = []
     s, ns = _pf_val(j, "-s", "--source")
     if s:
@@ -115677,6 +115740,11 @@ function _snAge(ts){
 }
 function _snCauses(r){ try{ const d = r.detail ? JSON.parse(r.detail) : null; return (d && d.causes_probables) || []; }catch(e){ return []; } }
 function _snNom(wk){ const i = wk.indexOf('.'); return i>=0 ? wk.slice(i+1) : wk; }
+// Le libellé d'une clé que le serveur n'a pas étiquetée (corrélations) : celui d'une ligne connue, sinon la clé.
+function _snLib(wk){ const r = ((SN.etat&&SN.etat.rows)||[]).find(x=>x.wkey===wk); return (r&&r.libelle) || _snNom(wk); }
+// Les détails d'une machine de la flotte, en mots : « disque C: 67 % », « mises à jour il y a 2 j ».
+const SN_MACH = {os:'système', antivirus:'antivirus', charge:'charge', mises_a_jour:'mises à jour', services_en_echec:'services en échec'};
+function _snMach(cle){ const k = cle.replace(/^disque\./,''); return cle.startsWith('disque.') ? 'disque '+k : (SN_MACH[cle] || cle.replace(/_/g,' ')); }
 async function snEntrer(){
   try{ SN.etat = await apiPost('/api/sensorium/etat', {}); }catch(e){ SN.etat = {ok:false, error:String(e)}; }
   snRail(); snRendre();
@@ -115703,7 +115771,7 @@ function _snLigne(r, avecFam){
   const acc = w ? `<button class="mx-btn" onclick='snAccepter(${JSON.stringify(wk)})' title="Je sais, c'est normal : se taire jusqu'à l'échéance (revient si ça empire)">Accepter…</button>`
            : (a ? `<button class="mx-btn" onclick='snRetirerAcquit(${JSON.stringify(wk)})'>Ne plus accepter</button>` : '');
   return `<div class="mx-row"><span class="mx-dot ${w?'warn':(a?'':'ok')}"></span>
-    <div class="mx-rt"><b style="cursor:pointer" title="Son histoire sur 30 jours" onclick='snHisto(${JSON.stringify(wk)})'>${_snE(_snNom(wk))}${avecFam?` <span class="mx-pill">${_snE(wk.split('.')[0])}</span>`:''}${a?` <span class="mx-pill">acceptée</span>`:''}</b><span>${_snE(r.value)}</span>
+    <div class="mx-rt"><b style="cursor:pointer" title="${_snE(wk)} — son histoire sur 30 jours" onclick='snHisto(${JSON.stringify(wk)})'>${_snE(r.libelle||_snNom(wk))}${a?` <span class="mx-pill">acceptée</span>`:''}</b><span>${_snE(r.value)}</span>
     ${a?`<span>acceptée : ${_snE(a.raison||'sans raison')}${a.jusqua?' · jusqu\'au '+_snE(String(a.jusqua).slice(0,10)):''}</span>`:''}
     ${causes.length?`<span style="color:var(--warn)">cause probable : ${_snE(causes[0])}${causes.length>1?` <span class="mx-st">(+${causes.length-1})</span>`:''}</span>`:''}</div>
     <div class="mx-gest"><span class="mx-st" title="${_snE(r.observed_at||'')}">il y a ${_snAge(r.observed_at)}</span>${gestes}${acc}</div></div>`;
@@ -115719,25 +115787,25 @@ async function snHisto(wk){
   let r; try{ r = await apiPost('/api/sensorium/historique', {wkey:wk}); }catch(e){ r = {ok:false}; }
   if(!r || !r.ok){ return; }
   const h = r.historique||[], a = r.actuelle||{};
-  page.innerHTML = `<section class="mx-sec"><div class="mx-eyebrow"><a style="cursor:pointer" onclick="snRendre()">← retour</a> · ${_snE(wk)}</div>
+  page.innerHTML = `<section class="mx-sec"><div class="mx-eyebrow"><a style="cursor:pointer" onclick="snRendre()">← retour</a> · ${_snE(_snLib(wk))}</div>
     <div class="mx-verdict"><span class="mx-vmark ${a.severity==='warning'?'':'stable'}"></span><div><p class="mx-vtitle">${_snE(a.value||'—')}</p>
     <p class="mx-vsub">${r.disponibilite_30j!=null?'Disponibilité sur 30 jours : <b>'+_snE(r.disponibilite_30j)+' %</b> · ':''}${h.length} changement${h.length>1?'s':''} en 30 jours</p></div></div></section>
     <section class="mx-sec"><div class="mx-eyebrow">Son histoire</div><div class="mx-rows">${h.map(c=>`<div class="mx-row"><span class="mx-dot ${c.severity==='warning'?'warn':'ok'}"></span><div class="mx-rt"><b>${_snE({added:'apparue',removed:'disparue',modified:'a changé'}[c.change_type]||c.change_type)}</b><span>${_snE(c.new_value||c.old_value||'')}</span>${c.old_value&&c.new_value?`<span class="mx-st">avant : ${_snE(c.old_value)}</span>`:''}</div><span class="mx-st">${_snE(String(c.ts||'').slice(0,16).replace('T',' '))}</span></div>`).join('') || '<div class="mx-vsub">Rien n\'a changé en 30 jours.</div>'}</div></section>`;
 }
 async function snAccepter(wk){
-  const raison = prompt("Pourquoi cette alerte est-elle normale ?\n(elle se taira, et reviendra si son chiffre empire)", "");
-  if(raison===null) return;
-  const jours = prompt("Pendant combien de jours ? (0 = sans échéance)", "30");
-  if(jours===null) return;
+  const raison = await buSaisir("Pourquoi « "+_snLib(wk)+" » est-elle normale ?\n(elle se taira, et reviendra si son chiffre empire)", "");
+  if(raison===null || raison===undefined) return;
+  const jours = await buSaisir("Pendant combien de jours ? (0 = sans échéance)", "30");
+  if(jours===null || jours===undefined) return;
   const r = await apiPost('/api/sensorium/accepter', {wkey:wk, raison:raison, jours:parseInt(jours||'30',10)||0});
-  if(!r || !r.ok){ alert('Impossible : '+((r&&r.erreur)||'?')); return; }
+  if(!r || !r.ok){ buDire('Impossible : '+((r&&r.erreur)||'?')); return; }
   snEntrer();
 }
 async function snRetirerAcquit(wk){ await apiPost('/api/sensorium/retirer', {wkey:wk}); snEntrer(); }
 async function snReparer(wk, geste, libelle){
-  if(!confirm(libelle+' ?\n\nLe geste passe par le catalogue sécurisé de Cassandra.')) return;
+  if(!await buConfirmer(libelle+' ?\n\nLe geste passe par le catalogue sécurisé de Cassandra.')) return;
   const r = await apiPost('/api/sensorium/reparer', {wkey:wk, geste:geste, confirme:true});
-  alert((r&&r.ok?'Fait : ':'Échec : ')+((r&&(r.geste||r.erreur))||'')+(r&&r.resultat&&r.resultat.sortie?'\n\n'+String(r.resultat.sortie).slice(0,600):''));
+  buDire((r&&r.ok?'Fait : ':'Échec : ')+((r&&(r.geste||r.erreur))||'')+(r&&r.resultat&&r.resultat.sortie?'\n\n'+String(r.resultat.sortie).slice(0,600):''));
   setTimeout(snEntrer, 4000);
 }
 function snRendre(){
@@ -115754,7 +115822,7 @@ function snRendre(){
   if(SN.vue==='changements'){
     const ch = E.changes||[], co = E.correlations||[];
     page.innerHTML = (co.length?`<section class="mx-sec"><div class="mx-eyebrow">Alertes et leur cause probable</div><div class="mx-rows">${co.map(c=>{ let cs=[]; try{cs=JSON.parse(c.causes||'[]');}catch(e){}
-        return `<div class="mx-row"><span class="mx-dot warn"></span><div class="mx-rt"><b>${_snE(_snNom(String(c.entite||'')))}</b><span>${_snE(c.alerte)}</span>${cs.map(x=>`<span>↳ ${_snE(x)}</span>`).join('')}</div><span class="mx-st">${_snE(String(c.ts||'').slice(0,16).replace('T',' '))}</span></div>`; }).join('')}</div></section>`:'')
+        return `<div class="mx-row"><span class="mx-dot warn"></span><div class="mx-rt"><b>${_snE(_snLib(String(c.entite||'')))}</b><span>${_snE(c.alerte)}</span>${cs.map(x=>`<span>↳ ${_snE(x)}</span>`).join('')}</div><span class="mx-st">${_snE(String(c.ts||'').slice(0,16).replace('T',' '))}</span></div>`; }).join('')}</div></section>`:'')
       + `<section class="mx-sec"><div class="mx-eyebrow">Derniers changements</div><div class="mx-rows">${ch.map(c=>`<div class="mx-row"><span class="mx-dot ${c.severity==='warning'?'warn':''}"></span><div class="mx-rt"><b>${_snE(c.entity_name)} <span class="mx-pill">${_snE({added:'apparu',removed:'disparu',modified:'changé'}[c.change_type]||c.change_type)}</span></b><span>${_snE(c.new_value||c.old_value||'')}</span></div><span class="mx-st">${_snE(String(c.ts||'').slice(5,16).replace('T',' '))}</span></div>`).join('') || '<div class="mx-vsub">Aucun changement relevé.</div>'}</div></section>`;
     return;
   }
@@ -115770,16 +115838,18 @@ function snRendre(){
   const get = k => (rows.find(r=>r.wkey===k)||{}).value;
   const titre = alertes.length ? `${alertes.length} point${alertes.length>1?'s':''} demande${alertes.length>1?'nt':''} un regard` : 'Tout ce qui est mesuré va bien';
   const kpi = (lib, v, em) => v ? `<div class="mx-kpi"><span>${_snE(lib)}</span><b>${_snE(v)}</b>${em?`<em>${_snE(em)}</em>`:''}</div>` : '';
+  const sante = String(get('health.score')||''), sI = sante.indexOf(' · ');   // le score en grand, le pourquoi en petit
   page.innerHTML =
     `<section class="mx-sec"><div class="mx-verdict"><span class="mx-vmark ${alertes.length?'':'stable'}"></span><div><p class="mx-vtitle">${titre}</p>
       <p class="mx-vsub">${_snE(get('system.hostname')||'')} · ${_snE(get('system.os')||'')} · allumée depuis ${_snE(get('system.uptime')||'?')} · ${rows.length} relevés${E.source!=='collecteur'?' · <b>'+_snE(E.source)+'</b>':''}${capKO.length?` · <a style="color:var(--warn);cursor:pointer" onclick="snVue('capteurs')">${capKO.length} capteur${capKO.length>1?'s':''} en défaut</a>`:''}</p></div></div>
-      <div class="mx-kpis">${kpi('Santé', get('health.score'))}${kpi('Disque /', get('disk./.usage'))}${kpi('RAM', get('ram.usage'))}${kpi('Charge', get('load.1m'), get('cpu.load')?'CPU '+get('cpu.load'):'')}${kpi('Température', get('system.temperature'))}${kpi('Mises à jour', (get('maj.paquets')||'').split(',')[0])}</div></section>`
+      <div class="mx-kpis">${kpi('Santé', sI>0 ? sante.slice(0, sI) : sante, sI>0 ? sante.slice(sI+3) : '')}${kpi('Disque /', get('disk./.usage'))}${kpi('RAM', get('ram.usage'))}${kpi('Charge', get('load.1m'), get('cpu.load')?'CPU '+get('cpu.load'):'')}${kpi('Température', get('system.temperature'))}${kpi('Mises à jour', (get('maj.paquets')||'').split(',')[0])}</div></section>`
     + (alertes.length?`<section class="mx-sec"><div class="mx-eyebrow">Ce qui demande un regard</div><div class="mx-rows">${alertes.map(r=>_snLigne(r,true)).join('')}</div></section>`:'')
     + (prev.length?`<section class="mx-sec"><div class="mx-eyebrow">Ce qui va arriver</div><div class="mx-rows">${prev.map(r=>_snLigne(r,false)).join('')}</div></section>`:'')
     + `<section class="mx-sec"><div class="mx-eyebrow">La flotte</div><div class="mx-rows">${rows.filter(r=>String(r.wkey).startsWith('fleet.')).map(r=>{
           const m = String(r.wkey).slice(6), det = rows.filter(x=>String(x.wkey).startsWith('machine.'+m+'.') && !String(x.wkey).endsWith('.sonde'));
           const w = r.severity==='warning' || det.some(x=>x.severity==='warning');
-          return `<div class="mx-row"><span class="mx-dot ${w?'warn':'ok'}"></span><div class="mx-rt"><b>${_snE(m)}</b><span>${_snE(r.value)}${det.length?' · '+det.slice(0,4).map(x=>_snE(String(x.wkey).split('.').slice(2).join('.').replace(/_/g,' '))+' '+_snE(x.value)).join(' · '):''}</span></div><span class="mx-st">il y a ${_snAge(r.observed_at)}</span></div>`; }).join('') || '<div class="mx-vsub">Aucune machine relevée.</div>'}</div></section>`;
+          return `<div class="mx-row"><span class="mx-dot ${w?'warn':'ok'}"></span><div class="mx-rt"><b>${_snE(m)}</b><span>${_snE(r.value)}${det.length?' · '+det.slice(0,4).map(x=>{ const c=String(x.wkey).split('.').slice(2).join('.'), v=String(x.value||'');
+            return _snE(_snMach(c))+' '+_snE(c==='mises_a_jour' ? v.replace(/^dernière mise à jour\s*/,'') : v); }).join(' · '):''}</span></div><span class="mx-st">il y a ${_snAge(r.observed_at)}</span></div>`; }).join('') || '<div class="mx-vsub">Aucune machine relevée.</div>'}</div></section>`;
 }
 
 async function mxEntrer(){

@@ -1943,9 +1943,14 @@ def collect_tailscale_peers():
                 name = dns_name.split(".")[0] or k[:8]
                 ts_ips = v.get("TailscaleIPs", [])
                 ts_ip = ts_ips[0] if ts_ips else ""
+                vu = str(v.get("LastSeen") or "")
                 peers.append({
                     "name": name, "dns_name": dns_name, "tailscale_ip": ts_ip,
                     "online": 1 if v.get("Online") else 0,
+                    # « 0001-01-01 » : Tailscale ne date pas un appareil en ligne. L'étiquette serveur dit
+                    # qu'une absence est une panne ; sans elle, un téléphone éteint n'en est pas une.
+                    "last_seen": "" if vu.startswith("0001") else vu[:19],
+                    "dns_name": dns_name + ("|serveur" if "tag:server" in (v.get("Tags") or []) else ""),
                     "last_check": datetime.now().isoformat(),
                 })
             return peers
@@ -3128,13 +3133,18 @@ def collect_firewall_rules():
     iptables (forme -S) et nftables (Orion filtre en nft : le relevé ne voyait rien de ses 84 règles)."""
     rules = []
     now = datetime.now().isoformat()
-    for l in (run_cmd(["iptables", "-S"], timeout=10) or "").splitlines() if _qui("iptables") else []:
-        if l.startswith("-A "):
-            act = "DENY" if re.search(r"-j (DROP|REJECT)", l) else ("ALLOW" if "-j ACCEPT" in l else "AUTRE")
-            m = re.search(r"--dport (\d+)", l)
-            rules.append({"tool": "iptables", "chain": l.split()[1], "action": act, "port": m.group(1) if m else "",
-                          "raw": l[:200], "last_check": now})
-    if _qui("nft"):
+    # LES POLITIQUES ET LES CHAÎNES AUSSI (09-10) : sans « -P INPUT ACCEPT », aucun verdict n'était possible.
+    for outil in ("iptables", "ip6tables"):
+        for l in (run_cmd([outil, "-S"], timeout=10) or "").splitlines() if _qui(outil) else []:
+            if l.startswith(("-A ", "-P ", "-N ")):
+                act = ("POLICY:" + l.split()[-1]) if l.startswith("-P ") else ("CHAIN" if l.startswith("-N ") else
+                      ("DENY" if re.search(r"-j (DROP|REJECT)", l) else ("ALLOW" if "-j ACCEPT" in l else "AUTRE")))
+                m = re.search(r"--dports? (\d+)", l)
+                rules.append({"tool": outil, "chain": l.split()[1], "action": act, "port": m.group(1) if m else "",
+                              "raw": l[:200], "last_check": now})
+    # nft ne se lit QUE s'il porte autre chose qu'iptables : sur iptables-nft, ce sont les mêmes règles,
+    # comptées deux fois (51 + 67 sur Orion le 09-10).
+    if _qui("nft") and not any(r["tool"] == "iptables" for r in rules):
         chaine = ""
         for l in (run_cmd(["nft", "list", "ruleset"], timeout=10) or "").splitlines():
             t = l.strip()
@@ -3914,6 +3924,9 @@ def collect_paquets_mouvements() -> int:
 _CAUSES_TYPES = ("config_file", "paquet", "service", "docker", "logiciel", "network", "config", "security", "system", "web")
 
 
+_CAUSES_NAISSANCE = ("service", "docker", "web", "controle", "ssl", "montage", "stockage", "courriel", "application")
+
+
 def causes_probables(conn, entite: str, maintenant_local: str = None) -> list:
     """Les changements des 30 minutes qui précèdent, hors bruit (mesures continues, capteurs, prévisions), et hors
     l'entité elle-même. Les plus proches d'abord."""
@@ -3924,7 +3937,10 @@ def causes_probables(conn, entite: str, maintenant_local: str = None) -> list:
         "AND entity_type IN (%s) AND entity_name <> ? ORDER BY ts DESC LIMIT 40" % ",".join("?" * len(_CAUSES_TYPES)),
         [depuis, t.isoformat()] + list(_CAUSES_TYPES) + [entite]).fetchall()
     out = []
+    famille = entite.split(".", 1)[0] + "."
     for ts, typ, nom, chg, nv in rows:
+        if str(nom or "").startswith(famille) and chg == "added":
+            continue                       # une sœur née dans le même relevé n'explique rien
         # Les unités systemd éphémères (timedated, hostnamed, sessions…) naissent et meurent à la demande : leur
         # apparition ou disparition n'explique rien. Seul un service qui CHANGE d'état est une cause plausible.
         if typ == "service" and chg in ("added", "removed"):
@@ -4272,6 +4288,8 @@ def _trafic_heure(chemin: str):
         return None
     limite = datetime.now() - timedelta(hours=1)
     n = e4 = e5 = 0
+    robots, e5_redem = {}, 0
+    redemarrages = _cassandra_demarrages()
     for l in reversed(lignes):
         m = _ACCES_RE.search(l)
         if not m:
@@ -4285,10 +4303,40 @@ def _trafic_heure(chemin: str):
         n += 1
         c = m.group(7)
         if c.startswith("5"):
-            e5 += 1
+            # Un 502 dans les deux minutes qui suivent un démarrage de Cassandra : son redémarrage, pas une panne.
+            if c in ("502", "503", "504") and any(0 <= (t - d).total_seconds() <= 120 for d in redemarrages):
+                e5_redem += 1
+            else:
+                e5 += 1
         elif c.startswith("4"):
             e4 += 1
-    return n, e4, e5
+        ua = l.rsplit('"', 2)[-2] if l.count('"') >= 2 else ""
+        rb = _ROBOT_RE.search(ua)
+        if rb:
+            nom = rb.group(0)
+            robots[nom] = robots.get(nom, 0) + 1
+    return n, e4, e5, robots, e5_redem
+
+
+# Les robots qui se nomment : moteurs, réseaux sociaux, IA. Un robot qui se cache n'est pas compté.
+_ROBOT_RE = re.compile(r"(?i)(meta-externalagent|facebookexternalhit|Googlebot|bingbot|GPTBot|ChatGPT-User|ClaudeBot|"
+                       r"Claude-User|PerplexityBot|Amazonbot|Applebot|Bytespider|YandexBot|AhrefsBot|SemrushBot|"
+                       r"MJ12bot|DotBot|PetalBot|DuckDuckBot|Baiduspider|CCBot|[\w.-]*(?:bot|crawler|spider)\b)")
+
+
+def _cassandra_demarrages() -> list:
+    """Les démarrages du service Cassandra dans l'heure (heure locale), lus au journal de systemd."""
+    out = []
+    try:
+        t = run_cmd(["journalctl", "-u", "cassandra", "--since", "-65min", "-o", "short-iso", "--no-pager",
+                     "-g", "Started"], timeout=8) or ""
+        for l in t.splitlines():
+            m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", l)
+            if m:
+                out.append(datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        pass
+    return out
 
 
 def collect_sante_applicative() -> list:
@@ -4306,16 +4354,22 @@ def collect_sante_applicative() -> list:
         r = _trafic_heure(chemin)
         if not r or not r[0]:
             continue
-        n, e4, e5 = r
+        n, e4, e5, robots, e5_redem = r
         pct = 100.0 * e5 / n
-        out.append(_mesure("trafic.%s" % nom, "trafic", "%d requêtes dans l'heure · %d erreurs 5xx (%.0f %%) · %d 4xx" % (n, e5, pct, e4),
+        nr = sum(robots.values())
+        tete = sorted(robots.items(), key=lambda kv: -kv[1])[:3]
+        part = (" · %d %% de robots (%s)" % (round(100.0 * nr / n), ", ".join("%s %d %%" % (k, round(100.0 * v / n)) for k, v in tete))) if nr else ""
+        redem = (" · %d autre%s pendant un redémarrage de Cassandra" % (e5_redem, "s" if e5_redem > 1 else "")) if e5_redem else ""
+        out.append(_mesure("trafic.%s" % nom, "trafic", "%d requêtes dans l'heure · %d erreurs 5xx (%.0f %%)%s · %d 4xx%s" % (
+                               n, e5, pct, redem, e4, part),
                            "warning" if (e5 >= 10 and pct >= 5) else "info"))
     # MySQL / MariaDB
     if _qui("mysqladmin"):
         st = run_cmd(["mysqladmin", "status"], timeout=10) or ""
         m = re.search(r"Threads:\s*(\d+).*?Slow queries:\s*(\d+).*?Queries per second avg:\s*([\d.]+)", st)
         if m:
-            out.append(_mesure("mysql.etat", "application", "%s connexions · %s requêtes/s · %s requêtes lentes depuis le démarrage" % (m.group(1), m.group(3), m.group(2)),
+            out.append(_mesure("mysql.etat", "application", "%s connexions · %s requêtes/s · %s requêtes lentes depuis le démarrage" % (
+                               m.group(1), ("%.1f" % float(m.group(3))).replace(".", ","), m.group(2)),
                                "warning" if int(m.group(1)) >= 140 else "info"))
         elif st:
             out.append(_mesure("mysql.etat", "application", "injoignable : %s" % st.strip()[:120], "warning"))
@@ -4592,7 +4646,8 @@ def upsert_world(conn, key, category, value, detail=None, severity="info", vus=N
         det = json.dumps(detail, ensure_ascii=False) if detail is not None else None
         continu = category in _WORLD_CONTINUS or key in _WORLD_CONTINUS_CLES
         if row is None:
-            if severity == "warning" and category not in ("capteur", "prevision"):
+            # UNE MESURE QUI NAÎT n'a pas de cause (09-10) : seule une chose du monde qui apparaît en panne en a.
+            if severity == "warning" and category in _CAUSES_NAISSANCE:
                 try:
                     causes = causes_probables(conn, key, local)
                     if causes:
@@ -4659,6 +4714,48 @@ def _world_elaguer(conn, prefixe: str, vus: set) -> int:
                     "VALUES (?,?,?,?,?,?,?)", (local, cat, wk, "removed", str(val)[:500], None, "info"))
             n += 1
     return n
+
+
+def _pf_verdict(lignes: list) -> dict:
+    """Le verdict d'un `iptables -S` : chaque règle atteinte depuis INPUT, sous-chaînes dépliées. Même règle
+    que `_pf_parcours` dans cassandra.py (onglet Sécurité) : un « tout refuser » sans condition, au bout d'un
+    chemin de sauts eux-mêmes sans condition, filtre autant qu'une politique DROP."""
+    pol, ch = {}, {}
+    for l in lignes:
+        j = l.split()
+        if len(j) >= 3 and j[0] == "-P":
+            pol[j[1]] = j[2]
+        elif len(j) >= 2 and j[0] == "-N":
+            ch.setdefault(j[1], [])
+        elif len(j) >= 2 and j[0] == "-A":
+            ch.setdefault(j[1], []).append(j[2:])
+    etat = {"regles": 0, "refus": 0, "refuse_tout": False}
+
+    def suivre(nom, prof, vu, sans_condition):
+        for j in ch.get(nom, []):
+            cible = j[j.index("-j") + 1] if "-j" in j and j.index("-j") + 1 < len(j) else ""
+            # « --reject-with icmp-… » appartient à la cible : un REJECT final reste un « tout refuser ».
+            reste = list(j)
+            for opt in ("--reject-with", "--log-prefix", "--log-level"):
+                if opt in reste and reste.index(opt) + 1 < len(reste):
+                    k = reste.index(opt)
+                    del reste[k:k + 2]
+            pour_tout = [x for x in reste if x not in ("-j", cible)] == []
+            if cible in ch and cible not in vu and prof < 6:
+                suivre(cible, prof + 1, vu | {cible}, sans_condition and pour_tout)
+                continue
+            etat["regles"] += 1
+            if cible in ("DROP", "REJECT"):
+                etat["refus"] += 1
+                if pour_tout and sans_condition:
+                    etat["refuse_tout"] = True
+            if pour_tout and cible in ("RETURN", "ACCEPT", "DROP", "REJECT"):
+                return
+
+    suivre("INPUT", 0, {"INPUT"}, True)
+    p = pol.get("INPUT", "?")
+    return {"politique": p, "filtre": p in ("DROP", "REJECT") or etat["refuse_tout"],
+            "regles": etat["regles"], "refus": etat["refus"]}
 
 
 def _duree_txt(sec) -> str:
@@ -4830,10 +4927,26 @@ def build_world_model():
         def _flotte(lignes, vus):
             for r in lignes:
                 nm = (r["name"] or "").strip()
-                if nm:
-                    U("fleet.%s" % nm, "fleet", "en ligne" if r["online"] else "hors ligne", vus,
-                      "info" if r["online"] else "warning")
-        lignes_flotte = _q("SELECT name, online FROM tailscale_peers")
+                if not nm:
+                    continue
+                if r["online"]:
+                    U("fleet.%s" % nm, "fleet", "en ligne", vus)
+                    continue
+                # UNE ABSENCE N'EST PAS UNE PANNE (09-10) : « claude-cloud », parti le 08-10, serait resté en
+                # alerte pour toujours. Un serveur absent alerte ; un autre appareil, seulement le premier jour.
+                serveur = (r["dns_name"] or "").endswith("|serveur")
+                age = None
+                try:
+                    age = (datetime.now(timezone.utc) - datetime.strptime(r["last_seen"][:19], "%Y-%m-%dT%H:%M:%S")
+                           .replace(tzinfo=timezone.utc)).total_seconds() if r["last_seen"] else None
+                except Exception:
+                    age = None
+                depuis = (" depuis %s" % _duree_txt(age)) if age is not None else ""
+                if serveur or age is None or age < 86400:
+                    U("fleet.%s" % nm, "fleet", "hors ligne%s" % depuis, vus, "warning")
+                else:
+                    U("fleet.%s" % nm, "fleet", "absent%s (dernière présence le %s UTC)" % (depuis, r["last_seen"][:16].replace("T", " ")), vus)
+        lignes_flotte = _q("SELECT name, online, last_seen, dns_name FROM tailscale_peers")
         if lignes_flotte[0]:      # Tailscale muet : on n'efface pas la flotte sur un silence
             _famille("fleet.", lignes_flotte, _flotte)
 
@@ -4907,8 +5020,6 @@ def build_world_model():
                   divers, "info" if r["heure_synchro"] == "oui" else "warning")
             if r["fuseau"]:
                 U("system.fuseau", "system", r["fuseau"], divers)
-            if r["pare_feu"]:
-                U("system.pare_feu", "security", r["pare_feu"], divers, "warning" if r["pare_feu"] == "aucune règle" else "info")
             if r["securite_noyau"]:
                 U("system.protection_noyau", "security", r["securite_noyau"], divers)
 
@@ -4995,18 +5106,28 @@ def build_world_model():
                   vus, "warning" if nouvelle else "info")
         _famille("cle_ssh.", _q("SELECT user, key_type, key_hash, comment FROM ssh_authorized_keys"), _cles)
 
-        # Pare-feu : le nombre de règles par outil, et ce qu'elles bloquent
+        # Pare-feu : LE VERDICT EFFECTIF (09-10), pas un nombre de règles — 84 règles ne filtraient rien.
         def _parefeu(lignes, vus):
             par = {}
             for r in lignes:
-                t = r["tool"] or "?"
-                d = par.setdefault(t, {"n": 0, "bloque": set()})
-                d["n"] += 1
-                if r["action"] == "DENY" and r["port"]:
-                    d["bloque"].add(r["port"])
-            for t, d in par.items():
-                U("pare_feu.%s" % t, "security", "%d règles%s" % (d["n"], (" · bloque les ports %s" % ", ".join(sorted(d["bloque"], key=lambda x: int(x))[:10])) if d["bloque"] else ""), vus)
-        _famille("pare_feu.", _q("SELECT tool, action, port FROM firewall_rules"), _parefeu)
+                par.setdefault(r["tool"] or "?", []).append(r["raw"] or "")
+            for outil, nom in (("iptables", "ipv4"), ("ip6tables", "ipv6")):
+                if outil not in par:
+                    continue
+                v = _pf_verdict(par[outil])
+                if v["filtre"]:
+                    val, sev = "filtre — ce qui n'est pas permis est refusé (politique %s, %d règle%s atteinte%s)" % (
+                        v["politique"], v["regles"], "s" if v["regles"] > 1 else "", "s" if v["regles"] > 1 else ""), "info"
+                else:
+                    val, sev = "OUVERT — rien n'est refusé par défaut (politique %s ; %d règle%s atteinte%s, dont %d qui refuse%s sous condition)" % (
+                        v["politique"], v["regles"], "s" if v["regles"] > 1 else "", "s" if v["regles"] > 1 else "",
+                        v["refus"], "nt" if v["refus"] > 1 else ""), "warning"
+                U("pare_feu.%s" % nom, "security", val, vus, sev, detail={"politique": v["politique"], "regles": v["regles"]})
+            if "nftables" in par and "iptables" not in par:
+                U("pare_feu.nftables", "security", "%d règles (nftables seul : verdict non calculé)" % len(par["nftables"]), vus)
+        _famille("pare_feu.", _q("SELECT tool, action, port, raw FROM firewall_rules"), _parefeu)
+        # L'ancienne ligne « system.pare_feu » comptait les règles : elle se taisait sur l'essentiel.
+        conn.execute("DELETE FROM world_model WHERE wkey = 'system.pare_feu'")
 
         # Fail2ban : les adresses bannies maintenant, par prison
         def _f2b(lignes, vus):
@@ -5114,11 +5235,27 @@ def build_world_model():
                   detail={"dernier_ok": ok_ts, "lignes": r["n_lignes"], "duree_ms": r["duree_ms"]})
         _famille("capteur.", _q("SELECT * FROM sensor_health"), _capteurs)
 
-        # Santé globale
+        # Santé globale — CE QUE LE SENSORIUM VOIT DE TRAVERS COMPTE AUSSI (09-10) : 100/100 « excellent »
+        # avec cinq alertes ouvertes et un pare-feu ouvert ne disait pas la vérité. Les ressources (score
+        # calculé au relevé), puis −5 par alerte de CETTE machine (ni la flotte, ni les capteurs), plafonné à
+        # −30, et −10 si son pare-feu ne filtre pas.
         h, _ok = _q("SELECT score, status FROM health_scores ORDER BY id DESC LIMIT 1")
         if h:
-            U("health.score", "system", "%s/100 (%s)" % (h[0]["score"], h[0]["status"]), divers,
-              "warning" if (h[0]["status"] in ("degraded", "critical", "warning")) else "info")
+            base = int(h[0]["score"] or 0)
+            alertes = [r[0] for r in conn.execute(
+                "SELECT wkey FROM world_model WHERE severity IN ('warning','critical') AND wkey NOT LIKE 'fleet.%' "
+                "AND wkey NOT LIKE 'machine.%' AND wkey NOT LIKE 'capteur.%' AND wkey NOT LIKE 'health.%' "
+                "AND wkey NOT LIKE 'pare_feu.%'").fetchall()]
+            ouvert = conn.execute("SELECT 1 FROM world_model WHERE wkey = 'pare_feu.ipv4' AND value LIKE 'OUVERT%'").fetchone()
+            moins = min(30, 5 * len(alertes)) + (10 if ouvert else 0)
+            score = max(0, base - moins)
+            statut = "critique" if score < 50 else "à surveiller" if score < 75 else "bonne" if score < 90 else "excellente"
+            pourquoi = [x for x in ["%d alerte%s" % (len(alertes), "s" if len(alertes) > 1 else "") if alertes else "",
+                                    "pare-feu ouvert" if ouvert else "",
+                                    ("ressources %d/100" % base) if base < 100 else ""] if x]
+            U("health.score", "system", "%d/100 (%s)%s" % (score, statut, (" · " + ", ".join(pourquoi)) if pourquoi else ""),
+              divers, "warning" if score < 75 else "info",
+              detail={"ressources": base, "alertes": alertes[:20], "pare_feu_ouvert": bool(ouvert)})
 
         for prefixe, vus in familles_ok:
             _world_elaguer(conn, prefixe, vus)
