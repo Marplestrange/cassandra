@@ -3941,6 +3941,8 @@ def causes_probables(conn, entite: str, maintenant_local: str = None) -> list:
     for ts, typ, nom, chg, nv in rows:
         if str(nom or "").startswith(famille) and chg == "added":
             continue                       # une sœur née dans le même relevé n'explique rien
+        if nom == "config.fichier":
+            continue                       # Cassandra réécrit elle-même son fichier de réglages à chaque écriture
         # Les unités systemd éphémères (timedated, hostnamed, sessions…) naissent et meurent à la demande : leur
         # apparition ou disparition n'explique rien. Seul un service qui CHANGE d'état est une cause plausible.
         if typ == "service" and chg in ("added", "removed"):
@@ -4241,6 +4243,12 @@ def collect_exposition() -> list:
         e["portees"].add(portee)
     ip_pub = _ip_publique()
     candidats = [pt for pt, e in ecoute.items() if not e["portees"] <= {"machine", "tailscale"}]
+    # CE QUE LE PARE-FEU EN FAIT (09-10) : « réseau (toutes les interfaces) » mentait dès que le pare-feu filtre.
+    pf4 = _pf_verdict((run_cmd(["iptables", "-S"], timeout=10) or "").splitlines()) if _qui("iptables") else None
+    pf6 = _pf_verdict((run_cmd(["ip6tables", "-S"], timeout=10) or "").splitlines()) if _qui("ip6tables") else None
+
+    def _ouvert(pf, port):
+        return (not pf) or (not pf["filtre"]) or any(a <= port <= b for a, b in pf["ouverts"])
 
     def frappe(port):
         if not ip_pub:
@@ -4261,7 +4269,12 @@ def collect_exposition() -> list:
         if pub:
             niveau = "PUBLIC (joignable sur %s, via la box)" % ip_pub
         elif "toutes les interfaces" in e["portees"] or any(x.startswith("adresse publique") for x in e["portees"]):
-            niveau = "réseau (%s)" % portee
+            if _ouvert(pf4, port):
+                niveau = "réseau (%s)" % portee
+            else:
+                niveau = "réseau : refusé par le pare-feu, sauf le parc et Tailscale"
+            if "toutes les interfaces" in e["portees"] and pf6:
+                niveau += " · IPv6 %s" % ("ouvert" if _ouvert(pf6, port) else "refusé")
         else:
             niveau = portee
         sensible = _PORTS_SENSIBLES.get(port)
@@ -4288,7 +4301,7 @@ def _trafic_heure(chemin: str):
         return None
     limite = datetime.now() - timedelta(hours=1)
     n = e4 = e5 = 0
-    robots, e5_redem = {}, 0
+    robots, e5_redem, effractions = {}, 0, 0
     redemarrages = _cassandra_demarrages()
     for l in reversed(lignes):
         m = _ACCES_RE.search(l)
@@ -4310,12 +4323,20 @@ def _trafic_heure(chemin: str):
                 e5 += 1
         elif c.startswith("4"):
             e4 += 1
+        req = l.split('"', 2)[1] if l.count('"') >= 2 else ""
+        if _EFFRACTION_RE.search(req) or (req.startswith("POST /wp-login.php") and c == "200"):
+            effractions += 1           # un POST wp-login rendu 200 = mot de passe refusé (302 quand il réussit)
         ua = l.rsplit('"', 2)[-2] if l.count('"') >= 2 else ""
         rb = _ROBOT_RE.search(ua)
         if rb:
             nom = rb.group(0)
             robots[nom] = robots.get(nom, 0) + 1
-    return n, e4, e5, robots, e5_redem
+    return n, e4, e5, robots, e5_redem, effractions
+
+
+# Ce qui ne s'appelle que pour forcer une porte : secrets, dépôts, greffons piratés, failles connues.
+_EFFRACTION_RE = re.compile(r"(?i)^(GET|POST|HEAD) \S*(\.env\b|/\.git/|wp-config\.php|/wp-content/plugins/[^/ ]+/(up|shell|x|fix)\.php|"
+                            r"eval-stdin\.php|/vendor/phpunit|/cgi-bin/|\.\./|/xmlrpc\.php|/phpmyadmin|/pma/|/boaform|/HNAP1)")
 
 
 # Les robots qui se nomment : moteurs, réseaux sociaux, IA. Un robot qui se cache n'est pas compté.
@@ -4354,14 +4375,15 @@ def collect_sante_applicative() -> list:
         r = _trafic_heure(chemin)
         if not r or not r[0]:
             continue
-        n, e4, e5, robots, e5_redem = r
+        n, e4, e5, robots, e5_redem, eff = r
         pct = 100.0 * e5 / n
         nr = sum(robots.values())
         tete = sorted(robots.items(), key=lambda kv: -kv[1])[:3]
         part = (" · %d %% de robots (%s)" % (round(100.0 * nr / n), ", ".join("%s %d %%" % (k, round(100.0 * v / n)) for k, v in tete))) if nr else ""
         redem = (" · %d autre%s pendant un redémarrage de Cassandra" % (e5_redem, "s" if e5_redem > 1 else "")) if e5_redem else ""
-        out.append(_mesure("trafic.%s" % nom, "trafic", "%d requêtes dans l'heure · %d erreurs 5xx (%.0f %%)%s · %d 4xx%s" % (
-                               n, e5, pct, redem, e4, part),
+        effr = (" · %d tentative%s d'effraction" % (eff, "s" if eff > 1 else "")) if eff else ""
+        out.append(_mesure("trafic.%s" % nom, "trafic", "%d requêtes dans l'heure · %d erreurs 5xx (%.0f %%)%s · %d 4xx%s%s" % (
+                               n, e5, pct, redem, e4, part, effr),
                            "warning" if (e5 >= 10 and pct >= 5) else "info"))
     # MySQL / MariaDB
     if _qui("mysqladmin"):
@@ -4405,6 +4427,71 @@ def collect_sante_applicative() -> list:
                     mo, info.get("NRestarts", "0"), (info.get("ActiveEnterTimestamp") or "?")[:30]), "warning" if mo >= 4096 else "info"))
         except ValueError:
             pass
+    return out
+
+
+def _premieres_vues(espace: str, cles) -> dict:
+    """{clé: date de première vue}. À la toute première prise de connaissance d'un espace, tout ce qui existe
+    est « connu » (0000) : seul ce qui apparaît ENSUITE est nouveau."""
+    k = get_conn()
+    try:
+        k.execute("CREATE TABLE IF NOT EXISTS world_meta (cle TEXT PRIMARY KEY, valeur TEXT)")
+        vues = {r[0][len(espace) + 1:]: r[1] for r in k.execute("SELECT cle, valeur FROM world_meta WHERE cle LIKE ?", (espace + ":%",))}
+        premiere = not vues
+        maint = datetime.now().isoformat()
+        for c in cles:
+            if c not in vues:
+                vues[c] = "0000" if premiere else maint
+                k.execute("INSERT OR REPLACE INTO world_meta (cle, valeur) VALUES (?,?)", (espace + ":" + c, vues[c]))
+        k.commit()
+        return vues
+    finally:
+        k.close()
+
+
+def _depuis_24h(vu: str) -> bool:
+    return vu > (datetime.now() - timedelta(hours=24)).isoformat()
+
+
+def collect_tailnet() -> list:
+    """LE TAILNET (09-10) : Tailscale passe tout le pare-feu — un appareil qui le rejoint entre partout. Un
+    appareil NOUVEAU alerte 24 h ; un partage (serve) ou une publication sur Internet (Funnel) se dit."""
+    if not _qui("tailscale"):
+        return []
+    out = []
+    try:
+        d = json.loads(run_cmd(["tailscale", "status", "--json"], timeout=10) or "{}")
+    except Exception:
+        d = {}
+    pairs = list((d.get("Peer") or {}).values())
+    if pairs:
+        noms = {}
+        for p in pairs:
+            nom = (p.get("DNSName") or "").split(".")[0] or p.get("HostName") or "?"
+            noms[nom] = p
+        vues = _premieres_vues("tailnet", noms.keys())
+        for nom, p in sorted(noms.items()):
+            if _depuis_24h(vues.get(nom, "0000")):
+                out.append(_mesure("tailnet.nouveau.%s" % nom, "securite",
+                                   "NOUVEL appareil dans le tailnet : %s (%s, %s) — vu la première fois le %s" % (
+                                       nom, p.get("OS") or "?", (p.get("TailscaleIPs") or ["?"])[0], vues[nom][:16].replace("T", " ")),
+                                   "warning"))
+        out.append(_mesure("tailnet.appareils", "securite", "%d appareil%s : %s" % (
+            len(noms), "s" if len(noms) > 1 else "", ", ".join(sorted(noms)))))
+    # Partage et Funnel : `serve status --json` rend {} quand rien n'est partagé.
+    try:
+        sv = json.loads(run_cmd(["tailscale", "serve", "status", "--json"], timeout=10) or "{}") or {}
+    except Exception:
+        sv = None
+    if sv is not None:
+        funnel = [h for h, v in (sv.get("AllowFunnel") or {}).items() if v]
+        web = list((sv.get("Web") or {}).keys())
+        if funnel:
+            out.append(_mesure("tailnet.partage", "securite", "FUNNEL OUVERT : %s est publié sur Internet par Tailscale, à côté de la box et du pare-feu" % ", ".join(funnel), "warning"))
+        elif web or sv.get("TCP"):
+            out.append(_mesure("tailnet.partage", "securite", "partage dans le tailnet seulement : %s" % ", ".join(web or ["ports TCP"])))
+        else:
+            out.append(_mesure("tailnet.partage", "securite", "aucun partage ni Funnel"))
     return out
 
 
@@ -4520,6 +4607,26 @@ def collect_box() -> list:
             k.close()
         except Exception as e:
             print(f"[BOX] redirections : {e}", file=sys.stderr)
+        # LES APPAREILS DE LA MAISON (09-10) : un appareil jamais vu sur le réseau alerte 24 h.
+        hotes = api("/lan/browser/pub/", session=S)
+        if isinstance(hotes, list):
+            par_mac = {}
+            for h in hotes:
+                mac = str(((h.get("l2ident") or {}).get("id")) or "").lower()
+                if mac:
+                    par_mac[mac] = h
+            vues_ = _premieres_vues("box_appareil", par_mac.keys())
+            actifs = 0
+            for mac, h in sorted(par_mac.items()):
+                actifs += 1 if h.get("active") else 0
+                if _depuis_24h(vues_.get(mac, "0000")):
+                    ip = next((x.get("addr") for x in (h.get("l3connectivities") or []) if x.get("af") == "ipv4"), "?")
+                    out.append(_mesure("box.appareil.%s" % mac.replace(":", ""), "box",
+                                       "NOUVEL appareil sur le réseau : %s%s · %s · %s — vu la première fois le %s" % (
+                                           h.get("primary_name") or "sans nom", (" (%s)" % h["vendor_name"]) if h.get("vendor_name") else "",
+                                           ip, mac, vues_[mac][:16].replace("T", " ")), "warning"))
+            out.append(_mesure("box.appareils", "box", "%d connecté%s sur %d connu%s" % (
+                actifs, "s" if actifs > 1 else "", len(par_mac), "s" if len(par_mac) > 1 else "")))
         out.append(_mesure("box.redirections", "box", ("%d ouverte%s : %s" % (len(redir), "s" if len(redir) > 1 else "", " · ".join(
             "%s %s → %s" % (r.get("ip_proto"), r.get("wan_port_start"), r.get("comment") or r.get("hostname") or r.get("lan_ip")) for r in redir)))
                            if redir else "aucune : rien n'entre de dehors"))
@@ -4534,7 +4641,7 @@ def collect_box() -> list:
 def collect_mesures_diverses() -> list:
     rows = []
     for fn in (collect_file_courriel, collect_ssh_echecs, collect_docker_ressources, collect_certbot, collect_journaux_poids,
-               collect_sante_applicative, collect_box):
+               collect_sante_applicative, collect_box, collect_tailnet):
         try:
             rows.extend(fn() or [])
         except Exception as e:
@@ -4853,7 +4960,7 @@ def _pf_verdict(lignes: list) -> dict:
             ch.setdefault(j[1], [])
         elif len(j) >= 2 and j[0] == "-A":
             ch.setdefault(j[1], []).append(j[2:])
-    etat = {"regles": 0, "refus": 0, "refuse_tout": False}
+    etat = {"regles": 0, "refus": 0, "refuse_tout": False, "ouverts": []}
 
     def suivre(nom, prof, vu, sans_condition):
         for j in ch.get(nom, []):
@@ -4865,6 +4972,18 @@ def _pf_verdict(lignes: list) -> dict:
                     k = reste.index(opt)
                     del reste[k:k + 2]
             pour_tout = [x for x in reste if x not in ("-j", cible)] == []
+            # Un port ouvert À TOUS : ACCEPT atteint sans condition, sans source ni interface, avec un port.
+            if cible == "ACCEPT" and sans_condition:
+                pts = []
+                for opt in ("--dport", "--dports"):
+                    if opt in reste and reste.index(opt) + 1 < len(reste):
+                        for mo in reste[reste.index(opt) + 1].split(","):
+                            a, _, b = mo.partition(":")
+                            if a.isdigit():
+                                pts.append((int(a), int(b) if b.isdigit() else int(a)))
+                autres = [x for x in reste if x.startswith("-") and x not in ("-p", "-m", "--dport", "--dports", "-j")]
+                if pts and not autres:
+                    etat["ouverts"].extend(pts)
             if cible in ch and cible not in vu and prof < 6:
                 suivre(cible, prof + 1, vu | {cible}, sans_condition and pour_tout)
                 continue
@@ -4879,7 +4998,7 @@ def _pf_verdict(lignes: list) -> dict:
     suivre("INPUT", 0, {"INPUT"}, True)
     p = pol.get("INPUT", "?")
     return {"politique": p, "filtre": p in ("DROP", "REJECT") or etat["refuse_tout"],
-            "regles": etat["regles"], "refus": etat["refus"]}
+            "regles": etat["regles"], "refus": etat["refus"], "ouverts": etat["ouverts"]}
 
 
 def _duree_txt(sec) -> str:
@@ -5192,7 +5311,7 @@ def build_world_model():
         def _diverses(lignes, vus):
             for r in lignes:
                 U(r["cle"], r["categorie"] or "divers", r["valeur"], vus, r["severite"] or "info")
-        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux.", "trafic.", "mysql.", "cassandra.", "box."):
+        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux.", "trafic.", "mysql.", "cassandra.", "box.", "tailnet."):
             _famille(_pref, _q("SELECT cle, categorie, valeur, severite FROM mesures_diverses WHERE cle LIKE ?", _pref + "%"), _diverses)
 
         # Clés SSH autorisées, une par une : une clé ajoutée ou retirée entre au journal des changements
@@ -5247,6 +5366,12 @@ def build_world_model():
                         v["politique"], v["regles"], "s" if v["regles"] > 1 else "", "s" if v["regles"] > 1 else "",
                         v["refus"], "nt" if v["refus"] > 1 else ""), "warning"
                 U("pare_feu.%s" % nom, "security", val, vus, sev, detail={"politique": v["politique"], "regles": v["regles"]})
+            # LE SOCLE (09-10) : s'il disparaît, le parc et le témoin sont refusés sans bruit.
+            if os.path.exists("/etc/cassandra/parefeu-socle.conf"):
+                manque = [nom for outil, nom in (("iptables", "IPv4"), ("ip6tables", "IPv6"))
+                          if not any(l.strip() == "-A INPUT -j cassandra_socle" for l in par.get(outil, []))]
+                U("pare_feu.socle", "security", ("ABSENT en %s : le parc, Docker et les réponses risquent d'être refusés" % " et ".join(manque))
+                  if manque else "en place (IPv4 et IPv6)", vus, "warning" if manque else "info")
             if "nftables" in par and "iptables" not in par:
                 U("pare_feu.nftables", "security", "%d règles (nftables seul : verdict non calculé)" % len(par["nftables"]), vus)
         _famille("pare_feu.", _q("SELECT tool, action, port, raw FROM firewall_rules"), _parefeu)
@@ -5861,7 +5986,8 @@ class KnowledgeCollector:
         _init_oom  = collected.get("oom_events", [])
         _init_fail = collected.get("failed_units", [])
         health = compute_health_score(
-            _init_metrics, _init_ssl, {}, [], [], [], [],
+            # Le processeur du démarrage est celui du collecteur qui démarre : il ne dit rien de la machine.
+            dict(_init_metrics or {}, cpu_pct=0), _init_ssl, {}, [], [], [], [],
             sum(1 for e in _init_oom if e.get("recent")), len(_init_fail)
         )
         save_health_score(health)

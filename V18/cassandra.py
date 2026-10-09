@@ -78761,7 +78761,8 @@ def _flotte_sensorium_boucle() -> None:
 # silence n'est pas une guérison.
 SENSORIUM_NOTIF_APRES_S = 600
 # La sécurité n'attend pas dix minutes : une clé SSH apparue se dit tout de suite.
-_SENSORIUM_IMMEDIAT = ("cle_ssh.", "box.redirection.", "box.upnp", "box.dmz", "box.acces_distant")   # ce qui ouvre la maison : tout de suite
+_SENSORIUM_IMMEDIAT = ("cle_ssh.", "box.redirection.", "box.upnp", "box.dmz", "box.acces_distant",
+                       "tailnet.nouveau.", "tailnet.partage", "pare_feu.socle")   # ce qui ouvre la maison : tout de suite
 SENSORIUM_FERMER_APRES_S = 120
 _SENSORIUM_CRITIQUES = ("stockage.", "montage.", "web.", "controle.tls.", "systemd.failed_units")
 
@@ -78854,7 +78855,8 @@ def sensorium_retirer_acquit(wkey: str) -> dict:
     return {"ok": True, "retire": bool(n)}
 
 
-_SN_MOTS = {"acces distant": "accès distant à Freebox OS", "upnp": "UPnP", "dmz": "DMZ", "ftp": "FTP", "vpn": "VPN",
+_SN_MOTS = {"socle": "socle (parc, Docker, réponses)", "partage": "partage et Funnel", "appareils": "appareils",
+            "acces distant": "accès distant à Freebox OS", "upnp": "UPnP", "dmz": "DMZ", "ftp": "FTP", "vpn": "VPN",
             "systeme": "système", "connexion": "connexion", "redirections": "redirections de ports", "en echec": "en échec", "mises a jour": "mises à jour", "hors machine": "hors machine",
             "redemarrage requis": "redémarrage requis", "protection noyau": "protection du noyau", "ipv4": "IPv4",
             "ipv6": "IPv6", "file attente": "file d'attente", "echecs": "échecs", "etat": "état", "paquets": "paquets",
@@ -78884,13 +78886,17 @@ def _sensorium_libelle(wkey: str) -> str:
             "port": "Port", "interface": "Interface", "logiciel": "Logiciel", "config": "Réglage", "cle_ssh": "Clé SSH",
             "fail2ban": "Fail2ban", "cron": "Tâche planifiée", "fastpanel": "FastPanel", "journaux": "Journaux",
             "mysql": "MySQL", "cassandra": "Cassandra", "certbot": "Certbot", "exposition": "Exposition",
-            "disque_sante": "Santé du disque", "php_fpm": "PHP-FPM", "box": "Box"}
+            "disque_sante": "Santé du disque", "php_fpm": "PHP-FPM", "box": "Box", "tailnet": "Tailnet"}
     if not reste:
         return noms.get(fam, wkey)
     if fam == "machine":
         m, _, quoi = reste.partition(".")
         quoi = quoi.replace("_", " ")
         return "%s — %s" % (m.capitalize(), _sn_mots(quoi)) if quoi else m.capitalize()
+    if fam == "tailnet" and reste.startswith("nouveau."):
+        return "Tailnet — nouvel appareil %s" % reste.split(".", 1)[1]
+    if fam == "box" and reste.startswith("appareil."):
+        return "Box — nouvel appareil sur le réseau"
     if fam == "box" and reste.startswith("redirection."):
         p = reste.split(".", 1)[1].split("_", 1)
         return "Box — redirection %s %s" % (p[0].upper(), p[1] if len(p) > 1 else "")
@@ -115738,7 +115744,7 @@ const SN_FAMILLES = [
   ['reseau','Réseau','interface.|port.'], ['stockage','Stockage','stockage.'], ['securite','Sécurité','security.'],
   ['maj','Mises à jour','maj.'], ['courriel','Courriel','courriel.'], ['acces','Accès et pare-feu','ssh.|cle_ssh.|pare_feu.|fail2ban.'],
   ['cron','Tâches planifiées','cron.'], ['fastpanel','FastPanel','fastpanel.'], ['erreurs','Erreurs des journaux','erreurs.|journaux.'],
-  ['certbot','Renouvellement des certificats','certbot.'], ['box','La box','box.'], ['capteur','Capteurs','capteur.'], ['sante','Santé','health.']
+  ['certbot','Renouvellement des certificats','certbot.'], ['box','La box','box.'], ['tailnet','Tailnet','tailnet.'], ['capteur','Capteurs','capteur.'], ['sante','Santé','health.']
 ];
 function _snE(t){ return (typeof flE==='function') ? flE(t) : String(t==null?'':t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function _snFam(wk){ for(const f of SN_FAMILLES){ if(f[2].split('|').some(p=>wk.startsWith(p))) return f[0]; } return 'autre'; }
