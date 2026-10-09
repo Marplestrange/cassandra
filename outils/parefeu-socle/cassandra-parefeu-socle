@@ -14,7 +14,9 @@ PARC4=""; RESEAU4=""; RESEAU6=""; BOX4=""; POLITIQUE6=ACCEPT
 [ -r "$CONF" ] && . "$CONF"
 
 socle() {   # $1 = iptables | ip6tables
-    local T=$1 C=cassandra_socle
+    # Construit à part, puis substitué d'un coup s'il diffère : jamais d'instant où la chaîne active est vide.
+    local T=$1 ACTIF=cassandra_socle C=cassandra_socle_neuf
+    $T -w -N $ACTIF 2>/dev/null || true
     $T -w -N $C 2>/dev/null || true
     $T -w -F $C
     $T -w -A $C -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
@@ -42,11 +44,28 @@ socle() {   # $1 = iptables | ip6tables
         done
     fi
     $T -w -A $C -j RETURN
+    if [ "$($T -w -S $C | sed "s/$C/X/")" = "$($T -w -S $ACTIF | sed "s/$ACTIF/X/")" ]; then
+        $T -w -F $C; $T -w -X $C
+    else
+        # Le saut vers la neuve d'abord, puis l'ancienne retirée ; renommer garde les sauts (ils suivent la chaîne).
+        local p
+        p=$($T -w -S INPUT | grep '^-A INPUT' | grep -n -x -- "-A INPUT -j $ACTIF" | head -1 | cut -d: -f1)
+        [ -n "$p" ] && $T -w -I INPUT "$p" -j $C
+        while $T -w -C INPUT -j $ACTIF 2>/dev/null; do $T -w -D INPUT -j $ACTIF; done
+        $T -w -F $ACTIF; $T -w -X $ACTIF
+        $T -w -E $C $ACTIF
+    fi
+    C=$ACTIF
     # Le saut, une seule fois, APRÈS Tailscale et fail2ban : une adresse bannie ne doit pas garder sa connexion
     # ouverte grâce à « déjà établie ».
+    # Déjà à sa place (une seule fois, juste après) : on n'y touche pas. Le retirer pour le reposer laissait un
+    # instant sans socle, qu'un relevé du Sensorium attrapait (« ABSENT en IPv6 », 10-10).
+    local regles pos der
+    regles=$($T -w -S INPUT | grep '^-A INPUT')
+    pos=$(echo "$regles" | grep -n -x -- "-A INPUT -j $C" | cut -d: -f1 | tr '\n' ' ')
+    der=$(echo "$regles" | grep -v -x -- "-A INPUT -j $C" | grep -n -E -- '-j (ts-input|f2b-[^ ]+)$' | tail -1 | cut -d: -f1)
+    [ "$pos" = "$(( ${der:-0} + 1 )) " ] && return 0
     while $T -w -C INPUT -j $C 2>/dev/null; do $T -w -D INPUT -j $C; done
-    local der
-    der=$($T -w -S INPUT | grep '^-A INPUT' | grep -n -E -- '-j (ts-input|f2b-[^ ]+)$' | tail -1 | cut -d: -f1)
     $T -w -I INPUT $(( ${der:-0} + 1 )) -j $C
 }
 
