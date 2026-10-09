@@ -15661,8 +15661,12 @@ def get_ssh_keys():
 
 
 def get_firewall_rules():
-    data = get_entity_from_socket("firewall_rules")
-    return data if data else query_db("SELECT chain, policy, rules_count FROM firewall_rules LIMIT 20")
+    """Le pare-feu APPLIQUÉ, lu dans le noyau (09-10). La requête d'avant visait des colonnes
+    (policy, rules_count) qui n'existent pas : le rapport d'audit recevait du vide."""
+    try:
+        return pf_noyau_texte()
+    except Exception as e:
+        return "pare-feu illisible : %s" % e
 
 
 def get_sysctl_issues():
@@ -45949,14 +45953,19 @@ _MAIL_ANNONCE_PJ = re.compile(
 
 
 def mail_annonce_piece(corps: str) -> str:
-    """L'expression qui ANNONCE une pièce jointe, ou "" s'il n'y en a pas.
+    """[QUARANTAINE jusqu'au 2027-01-07] Aucun usage trouvé le 2026-10-09 : ni lecture de son nom,
+    ni chaîne qui le porte, ni décorateur, ni trace au journal sur trente jours. Le corps est mis de
+    côté, pas supprimé : s'il est appelé, le fil se tire — alerte critique, quarantaine annulée,
+    version d'avant restaurée. Une fonction ne se retire qu'après avoir crié sans être entendue.
 
+    Ce que la fonction disait d'elle-même :
+    L'expression qui ANNONCE une pièce jointe, ou "" s'il n'y en a pas.
+    
     On rend l'EXPRESSION TROUVÉE, pas un simple vrai/faux : un avertissement
     qui cite les mots de la personne se comprend sans réfléchir, là où « pièce
     jointe manquante » fait douter de ce que le programme a cru lire.
     """
-    m = _MAIL_ANNONCE_PJ.search(str(corps or ""))
-    return m.group(0).strip() if m else ""
+    return evolution_fil_tire('mail_annonce_piece')
 
 
 def mail_folders(refresh: bool = False) -> dict:
@@ -71100,9 +71109,43 @@ def _parefeu_catalogue(p: dict) -> tuple:
     proto = str((p or {}).get("proto") or "TCP").lower()
 
     if op == "etat":
-        cmd = ["ufw", "status", "numbered"] if shutil.which("ufw") else ["iptables", "-L", "INPUT", "-n", "-v"]
-        r = _sys_run(cmd, timeout=10)
-        return (0 if r.get("ok") else 1), r.get("output") or r.get("error")
+        # LE NOYAU, ENTIER (09-10) : INPUT seul ne montrait ni les sous-chaînes ni l'accord avec FastPanel.
+        _SEC_CACHE["d"] = None
+        return 0, pf_noyau_texte()
+
+    if op in ("fermer", "ouvrir", "restreindre") and _fp_db_path():
+        # PAR FASTPANEL (09-10) : une règle posée à côté de lui n'existe ni dans son écran ni après un
+        # redémarrage. Même chemin, mêmes gardes et même filet de deux minutes que l'onglet Sécurité.
+        if not port.isdigit() or not (1 <= int(port) <= 65535):
+            return 1, "port invalide"
+        pr = {"tcp": "TCP", "udp": "UDP", "all": "ALL"}.get(proto)
+        if not pr:
+            return 1, "protocole invalide (TCP, UDP ou ALL)"
+        etat = _sec_fp_parefeu_api()
+        if not etat["ok"]:
+            return 1, "API de FastPanel injoignable (%s) : rien n'a été posé" % (etat["erreur"] or "?")
+        sources = str((p or {}).get("sources") or "")
+        if op == "ouvrir":
+            a_retirer = [r for r in etat["regles"] if _sec_pf_couvre(r, int(port), pr) and str(r.get("policy")) in ("DROP", "PARTIAL_DROP")]
+            if a_retirer:
+                res = [securite_pf_geste("regle_retirer", {"id": r.get("id")}) for r in a_retirer]
+            else:
+                res = [securite_pf_geste("regle_poser", {"nom": "Cassandra ouvre %s %s" % (port, pr), "ports": port,
+                                                         "proto": pr, "sens": "INPUT", "politique": "ACCEPT"})]
+        else:
+            res = [securite_pf_geste("regle_poser", {
+                "nom": ("Cassandra restreint %s %s" if op == "restreindre" else "Cassandra ferme %s %s") % (port, pr),
+                "ports": port, "proto": pr, "sens": "INPUT", "sources": sources,
+                "politique": "PARTIAL_ACCEPT" if op == "restreindre" else "DROP"})]
+        rates = [r.get("error") for r in res if not r.get("ok")]
+        if rates:
+            return 1, "refusé : " + "; ".join(filter(None, rates))
+        essais = [r["essai"] for r in res if r.get("essai")]
+        _SEC_CACHE["d"] = None
+        logging.info("[PAREFEU] %s %s/%s par FastPanel (%d essai(s))", op, port, pr, len(essais))
+        return 0, ("Posé dans FastPanel. %s\n\n%s" % (
+            ("À L'ESSAI : se défait seul dans deux minutes si l'administrateur ne clique pas « Garder » "
+             "dans Sécurité › Pare-feu." if essais else "Réglage définitif."), pf_noyau_texte()))
 
     elif op == "lister":
         r = _sys_run(["ss", "-tulpn"], timeout=10)
@@ -71116,12 +71159,16 @@ def _parefeu_catalogue(p: dict) -> tuple:
 
         has_ufw = shutil.which("ufw")
         if op == "fermer":
+            # LE RÉSULTAT SE LIT (09-10) : « fermé » s'annonçait même quand la commande avait échoué.
             if has_ufw:
-                _sys_run(["ufw", "deny", port + "/" + proto], timeout=10)
+                r = _sys_run(["ufw", "deny", port + "/" + proto], timeout=10)
             else:
-                _sys_run(["iptables", "-I", "INPUT", "-p", proto, "--dport", port, "-j", "DROP"], timeout=10)
+                r = _sys_run(["iptables", "-I", "INPUT", "-p", proto, "--dport", port, "-j", "DROP"], timeout=10)
+            if not r.get("ok"):
+                return 1, "échec : %s" % (r.get("output") or r.get("error") or "?")[-300:]
             logging.info("[PAREFEU] port %s/%s fermé", port, proto)
-            return 0, "port %s/%s fermé" % (port, proto.upper())
+            return 0, "port %s/%s fermé (règle %s, non gardée au redémarrage sans iptables-persistent)\n\n%s" % (
+                port, proto.upper(), "ufw" if has_ufw else "iptables", pf_noyau_texte())
         else:
             if has_ufw:
                 _sys_run(["ufw", "delete", "deny", port + "/" + proto], timeout=10)
@@ -71184,12 +71231,19 @@ def _reboot_catalogue(p: dict) -> tuple:
 
 _CATALOGUE = {
     "parefeu": {
-        "quoi": ("Fermer ou ouvrir un port réseau (ufw ou iptables). op=etat (règles pare-feu), op=lister (ports en écoute via ss), op=fermer (port et proto), op=ouvrir (port et proto)."),
+        "quoi": ("Le pare-feu RÉEL. op=etat : ce que le noyau applique vraiment (IPv4/IPv6, sous-chaînes, "
+                 "accord avec FastPanel, ports Docker) — à lire AVANT toute affirmation sur le pare-feu. "
+                 "op=lister : ports en écoute (ss). op=fermer / op=ouvrir (port, proto) ; op=restreindre (port, "
+                 "proto, sources = adresses séparées par des virgules) : n'autorise ce port qu'à ces adresses. "
+                 "Avec FastPanel, tout passe par lui (visible dans Sécurité, gardé au redémarrage) ; ce qui peut "
+                 "fermer est posé À L'ESSAI deux minutes, jusqu'à ce que l'administrateur clique « Garder »."),
         "fonction": "_parefeu_catalogue",
-        "params": {"op": {"etat": ["etat"], "lister": ["lister"], "fermer": ["fermer"], "ouvrir": ["ouvrir"]},
+        "params": {"op": {"etat": ["etat"], "lister": ["lister"], "fermer": ["fermer"], "ouvrir": ["ouvrir"],
+                          "restreindre": ["restreindre"]},
                    "port": {"libre": True, "max": 5},
-                   "proto": {"TCP": ["TCP"], "UDP": ["UDP"], "ALL": ["ALL"]}},
-        "facultatifs": ("port", "proto"),   # etat et lister n'en ont pas besoin
+                   "proto": {"TCP": ["TCP"], "UDP": ["UDP"], "ALL": ["ALL"]},
+                   "sources": {"libre": True, "max": 400}},
+        "facultatifs": ("port", "proto", "sources"),   # etat et lister n'en ont pas besoin
         "reseau": True,
     },
     "paquet": {
@@ -87569,6 +87623,213 @@ def _sec_adresses_machine() -> dict:
     return {"public_v4": v4, "public_v6": v6, "reseaux_locaux": locaux}
 
 
+_PF_CIBLES = {"ACCEPT": "autorise", "DROP": "refuse", "REJECT": "rejette", "RETURN": "rend la main",
+              "LOG": "note dans le journal"}
+
+
+def _pf_chaines(cmd: list) -> tuple:
+    """(lu, {chaîne: politique}, {chaîne: [jetons de chaque règle]}) depuis `iptables -S` (ou ip6tables)."""
+    import shlex
+    ok, t = _sec_sortie(cmd, timeout=8)
+    pol, ch = {}, {}
+    if not ok:
+        return False, pol, ch
+    for l in t.splitlines():
+        try:
+            j = shlex.split(l)
+        except ValueError:
+            j = l.split()
+        if len(j) >= 3 and j[0] == "-P":
+            pol[j[1]] = j[2]
+            ch.setdefault(j[1], [])
+        elif len(j) >= 2 and j[0] == "-N":
+            ch.setdefault(j[1], [])
+        elif len(j) >= 2 and j[0] == "-A":
+            ch.setdefault(j[1], []).append(j[2:])
+    return True, pol, ch
+
+
+def _pf_val(j: list, *opts) -> tuple:
+    """(valeur, niée) de la première option trouvée parmi `opts`."""
+    for i, x in enumerate(j):
+        if x in opts and i + 1 < len(j):
+            return j[i + 1], (i > 0 and j[i - 1] == "!")
+    return "", False
+
+
+def _pf_ports(j: list) -> list:
+    """[(début, fin)] des ports de destination d'une règle ; [] = tous."""
+    v, _n = _pf_val(j, "--dport", "--dports", "--destination-port", "--destination-ports")
+    out = []
+    for morceau in v.split(","):
+        a, _, b = morceau.partition(":")
+        if a.isdigit():
+            out.append((int(a), int(b) if b.isdigit() else int(a)))
+    return out
+
+
+def _pf_lisible(j: list) -> dict:
+    """Une règle en clair : conditions, cible, et si elle s'applique à tout (aucune condition)."""
+    cible, _ = _pf_val(j, "-j", "-g")
+    conds = []
+    s, ns = _pf_val(j, "-s", "--source")
+    if s:
+        conds.append(("sauf depuis " if ns else "depuis ") + s)
+    i, ni = _pf_val(j, "-i", "--in-interface")
+    if i:
+        conds.append(("hors interface " if ni else "par ") + i)
+    p, _np = _pf_val(j, "-p", "--protocol")
+    ports = _pf_ports(j)
+    if ports:
+        conds.append("%s %s" % ((p or "tcp/udp").upper(), ", ".join(("%d" % a) if a == b else "%d-%d" % (a, b) for a, b in ports)))
+    elif p:
+        conds.append(p.upper())
+    etat, _ne = _pf_val(j, "--ctstate", "--state")
+    if etat:
+        conds.append("connexions déjà établies" if set(etat.split(",")) <= {"RELATED", "ESTABLISHED"} else "état " + etat)
+    com, _ = _pf_val(j, "--comment")
+    if com:
+        conds.append("« %s »" % com[:60])
+    # Toute autre option (-m set, --match-set, -d…) est une condition : la règle ne vaut pas pour tout.
+    connues = {"-p", "--protocol", "-s", "--source", "-i", "--in-interface", "--dport", "--dports", "--ctstate",
+               "--state", "--comment", "-j", "-g", "-m", "!", "--destination-port", "--destination-ports"}
+    autres = [x for k, x in enumerate(j) if x.startswith("-") and x not in connues]
+    if autres:
+        conds.append(" ".join(autres)[:60])
+    return {"cible": cible, "conditions": conds, "pour_tout": not conds, "proto": (p or "").lower(),
+            "ports": ports, "source": "" if ns else s}
+
+
+def _pf_parcours(pol: dict, ch: dict) -> dict:
+    """Chaque règle ATTEINTE depuis INPUT, dans l'ordre, sous-chaînes dépliées ; et le verdict effectif."""
+    lignes = []
+    refuse_tout = [False]
+
+    def suivre(nom, prof, vu, sans_condition):
+        # `sans_condition` : tout paquet entrant arrive jusqu'ici (chaque saut du chemin était inconditionnel).
+        for j in ch.get(nom, []):
+            r = _pf_lisible(j)
+            r.update({"chaine": nom, "profondeur": prof, "brut": " ".join(j)[:200]})
+            if r["cible"] in ch and r["cible"] not in vu and prof < 6:
+                r["saut"] = True
+                lignes.append(r)
+                suivre(r["cible"], prof + 1, vu | {r["cible"]}, sans_condition and r["pour_tout"])
+                continue
+            lignes.append(r)
+            if r["pour_tout"] and r["cible"] in ("DROP", "REJECT") and sans_condition:
+                refuse_tout[0] = True      # une règle finale « tout refuser » filtre autant qu'une politique DROP
+            if r["pour_tout"] and r["cible"] in ("RETURN", "ACCEPT", "DROP", "REJECT"):
+                return                     # au-delà, plus rien n'est atteint dans cette chaîne
+
+    suivre("INPUT", 0, {"INPUT"}, True)
+    politique = pol.get("INPUT", "?")
+    refus = [x for x in lignes if x["cible"] in ("DROP", "REJECT")]
+    return {"politique": politique, "regles": lignes,
+            "filtre": politique in ("DROP", "REJECT") or refuse_tout[0],
+            "refus": len(refus), "autorise": len([x for x in lignes if x["cible"] == "ACCEPT"])}
+
+
+def _pf_docker_publies() -> list:
+    """Les ports publiés par Docker : ils passent par FORWARD, à côté d'INPUT — un pare-feu qui ne regarde
+    qu'INPUT ne les voit pas. `-d 127.0.0.1` = la machine seulement."""
+    import shlex
+    ok, t = _sec_sortie(["iptables", "-t", "nat", "-S", "DOCKER"], timeout=8)
+    out = []
+    for l in (t.splitlines() if ok else []):
+        try:
+            j = shlex.split(l)
+        except ValueError:
+            continue
+        if "DNAT" not in j:
+            continue
+        d, _ = _pf_val(j, "-d")
+        vers, _ = _pf_val(j, "--to-destination")
+        p, _ = _pf_val(j, "-p")
+        ports = _pf_ports(j)
+        out.append({"port": ports[0][0] if ports else 0, "proto": p or "tcp", "vers": vers,
+                    "portee": "machine" if d.startswith("127.") else ("tout" if not d else d)})
+    return out
+
+
+def _pf_accord(regles_fp: list, ch: dict, politique_fp: str, politique_noyau: str, refuse_tout: bool) -> dict:
+    """FastPanel ↔ noyau, règle à règle : ce que FastPanel déclare est-il appliqué, et le noyau porte-t-il
+    dans la chaîne de FastPanel des règles que FastPanel ignore ?"""
+    noyau = [_pf_lisible(j) for j in ch.get("fastpanel_rules", [])]
+    manquantes = []
+    for r in regles_fp or []:
+        a, _, b = str(r.get("ports") or r.get("port_range") or "").partition("-")
+        if not a.isdigit():
+            continue
+        a, b = int(a), int(b) if b.isdigit() else int(a)
+        proto = str(r.get("proto") or "").lower()
+        trouve = any(any(x <= a and b <= y for x, y in n["ports"]) and (proto in ("all", "") or n["proto"] in (proto, ""))
+                     for n in noyau)
+        if not trouve:
+            manquantes.append(str(r.get("nom") or r.get("name") or "%s/%s" % (a, proto)))
+    connues = len(regles_fp or [])
+    inconnues = max(0, len([n for n in noyau if n["ports"]]) - (connues - len(manquantes)))
+    pf = str(politique_fp or "").upper()
+    pol_ok = (not pf) or (pf == "DROP") == (politique_noyau in ("DROP", "REJECT") or refuse_tout)
+    return {"accord": not manquantes and not inconnues and pol_ok, "manquantes": manquantes,
+            "inconnues": inconnues, "politique_fp": pf, "politique_ok": pol_ok, "chaine_noyau": len(noyau)}
+
+
+def _pf_noyau(regles_fp=None, politique_fp: str = "") -> dict:
+    """LE PARE-FEU APPLIQUÉ, lu dans le noyau (09-10). C'est la seule vérité : un panneau, un plan ou une
+    annonce ne valent que si le noyau les porte."""
+    lu4, pol4, ch4 = _pf_chaines(["iptables", "-S"])
+    lu6, pol6, ch6 = _pf_chaines(["ip6tables", "-S"])
+    out = {"lu": lu4, "outil": "iptables", "v4": _pf_parcours(pol4, ch4) if lu4 else None,
+           "v6": _pf_parcours(pol6, ch6) if lu6 else None, "docker": _pf_docker_publies() if lu4 else []}
+    if not lu4:
+        ok, t = _sec_sortie(["nft", "list", "ruleset"], timeout=8)
+        out["outil"] = "nftables"
+        out["lu"] = ok
+        out["v4"] = {"politique": "DROP" if re.search(r"hook input[^\n]*policy drop", t) else ("ACCEPT" if ok else "?"),
+                     "regles": [], "filtre": bool(re.search(r"hook input[^\n]*policy drop", t)), "refus": 0, "autorise": 0}
+    v4 = out["v4"] or {}
+    out["filtre"] = bool(v4.get("filtre"))
+    out["v6_ouvert"] = bool(out["v6"]) and not out["v6"]["filtre"] and out["filtre"]
+    if regles_fp is not None and lu4:
+        out["accord"] = _pf_accord(regles_fp, ch4, politique_fp, v4.get("politique", "?"), v4.get("filtre", False))
+    return out
+
+
+def pf_noyau_texte(fw: dict = None) -> str:
+    """Le pare-feu appliqué, en lignes lisibles — pour Cassandra, Itare et le rapport d'audit."""
+    fw = fw or _sec_parefeu()
+    n = fw.get("noyau") or {}
+    if not n.get("lu"):
+        return "Pare-feu : lecture du noyau IMPOSSIBLE (%s) — aucune affirmation possible sur ce qui est filtré." % n.get("outil", "?")
+    v4 = n.get("v4") or {}
+    L = ["PARE-FEU APPLIQUÉ (lu dans le noyau par %s, à l'instant) :" % n.get("outil"),
+         "- Verdict IPv4 : %s (politique d'entrée %s, %d règle(s) qui refusent, %d qui autorisent)." % (
+             "FILTRE — ce qui n'est pas permis est refusé" if v4.get("filtre") else "OUVERT — rien n'est refusé par défaut",
+             v4.get("politique", "?"), v4.get("refus", 0), v4.get("autorise", 0))]
+    if n.get("v6"):
+        L.append("- Verdict IPv6 : %s (politique %s)." % ("filtre" if n["v6"]["filtre"] else "ouvert", n["v6"]["politique"]))
+    for r in v4.get("regles") or []:
+        L.append("  %s[%s] %s%s" % ("  " * r["profondeur"], r["chaine"],
+                                     ("→ chaîne " + r["cible"]) if r.get("saut") else _PF_CIBLES.get(r["cible"], r["cible"] or "?"),
+                                     (" : " + " · ".join(r["conditions"])) if r["conditions"] else " : tout"))
+    if fw.get("source") == "fastpanel":
+        P = fw.get("panneau") or []
+        L.append("- FastPanel déclare %d règle(s)%s." % (len(P), (" — politique " + fw.get("politique_panneau")) if fw.get("politique_panneau") else ""))
+        for r in P:
+            L.append("  · %s : %s/%s %s %s" % (r.get("nom") or "règle", r.get("ports") or "*", r.get("proto") or "*",
+                                              r.get("politique") or "?", r.get("sources") or ""))
+        a = n.get("accord") or {}
+        if a:
+            L.append("- Accord FastPanel ↔ noyau : %s." % ("OUI" if a.get("accord") else "NON — " + "; ".join(filter(None, [
+                ("non appliquées : " + ", ".join(a["manquantes"])) if a.get("manquantes") else "",
+                ("%d règle(s) du noyau inconnues de FastPanel" % a["inconnues"]) if a.get("inconnues") else "",
+                "politique différente" if not a.get("politique_ok") else ""]))))
+    for d in n.get("docker") or []:
+        L.append("- Docker publie %s/%s → %s (%s)." % (d["port"], d["proto"], d["vers"],
+                                                      "machine seulement" if d["portee"] == "machine" else "joignable du réseau, à côté du pare-feu"))
+    return "\n".join(L)
+
+
 def _sec_parefeu() -> dict:
     """Le pare-feu : celui de FastPanel s'il existe (ses règles), et toujours ce que le noyau applique."""
     out = {"source": "systeme", "outil": "iptables", "politique": "?", "filtre": False, "regles_systeme": 0,
@@ -87607,6 +87868,15 @@ def _sec_parefeu() -> dict:
                                   for x in api["regles"]]
     except Exception as e:
         logging.info("[SECURITE] pare-feu du panneau : %s", e)
+    try:
+        n = _pf_noyau(out["panneau"] if out["source"] == "fastpanel" else None, out.get("politique_panneau") or "")
+        out["noyau"] = n
+        if n.get("lu"):
+            out["filtre"] = n["filtre"]
+            out["politique"] = (n.get("v4") or {}).get("politique", out["politique"])
+            out["regles_systeme"] = len([r for r in (n.get("v4") or {}).get("regles", []) if not r.get("saut")])
+    except Exception as e:
+        logging.warning("[SECURITE] pare-feu du noyau : %s", e)
     return out
 
 
@@ -102785,6 +103055,12 @@ button.logo:focus-visible{outline:2px solid var(--accent);outline-offset:3px;
 #tab-securite .sc-tbl tr.sc-focus td{background:var(--warn-bg,rgba(180,83,9,.06))}
 #tab-securite .sc-cel{display:inline-block;min-width:64px;border-radius:6px;padding:2px 7px;font:600 10.5px 'JetBrains Mono',monospace;box-sizing:border-box;white-space:nowrap}
 #tab-securite .sc-tbl .sc-geste{margin-top:6px}
+#tab-securite .sc-pf-noyau{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
+#tab-securite .sc-pf-tete{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--txt-faint);margin:2px 0 8px}
+#tab-securite .sc-pf-liste{display:flex;flex-direction:column;gap:4px;margin:6px 0 10px}
+#tab-securite .sc-pf-l{display:flex;align-items:center;gap:8px;font-size:13px;min-width:0}
+#tab-securite .sc-pf-l>span:nth-child(2){flex:1;min-width:0;overflow-wrap:anywhere}
+#tab-securite .sc-pf-ch{font-size:11px}
 #tab-securite .sc-tbl table{min-width:520px}
 #tab-securite .sc-cel.non{color:var(--txt-ghost)}
 #tab-securite .sc-cel.a1{background:var(--acc-15);color:var(--ok)}
@@ -115130,10 +115406,38 @@ function scParefeu(){
     } else {
         h += scL(scP('', 'RÈGLES'), (fw.regles_systeme || 0) + ' règle' + ((fw.regles_systeme || 0) > 1 ? 's' : '') + ' d’entrée', 'Sans panneau d’hébergement, le pare-feu se règle sur la machine (nftables, ufw) : ici, il se lit.', '');
     }
+    h += scPfNoyau(fw);
     scHtml('sc-fw', h);
     const f = document.getElementById('sc-s-fw-form'); if (f) f.setAttribute('data-page', api ? 'parefeu' : 'aucune');
     if (f && !api) f.hidden = true; else if (f && SC.page === 'parefeu') f.hidden = false;
     scPfEssais(); scPfPuces(); scPfSourcesVoir();
+}
+// LE NOYAU (09-10) : ce qui est APPLIQUÉ, pas ce qu'un panneau ou un plan déclare. Chaque règle atteinte
+// depuis INPUT, sous-chaînes dépliées ; l'accord avec FastPanel ; IPv6 ; les ports que Docker publie.
+const SC_PF_CIB = {ACCEPT: ['ok', 'AUTORISE'], DROP: ['panne', 'REFUSE'], REJECT: ['panne', 'REJETTE'], RETURN: ['', 'RETOUR'], LOG: ['', 'NOTE']};
+function scPfNoyau(fw){
+    const n = fw.noyau || {};
+    if (!n.lu) return scL(scP('panne', 'NOYAU'), 'Le noyau ne se lit pas', 'Sans cette lecture, rien ne peut être affirmé sur ce qui est filtré.', '');
+    const v4 = n.v4 || {}, a = n.accord, R = v4.regles || [];
+    let h = '<div class="sc-pf-noyau"><div class="sc-pf-tete">Ce que le noyau applique · <span class="sc-mono">' + mxE(n.outil || '') + '</span> · lu à l’instant</div>';
+    if (a) h += scL(scP(a.accord ? 'ok' : 'panne', a.accord ? 'EN ACCORD' : 'ÉCART'),
+                    a.accord ? 'FastPanel et le noyau disent la même chose' : 'FastPanel et le noyau divergent',
+                    a.accord ? (a.chaine_noyau ? a.chaine_noyau + ' règle(s) dans sa chaîne' : 'aucune règle d’un côté comme de l’autre')
+                             : mxE([(a.manquantes || []).length ? 'non appliquées : ' + a.manquantes.join(', ') : '',
+                                    a.inconnues ? a.inconnues + ' règle(s) du noyau inconnues de FastPanel' : '',
+                                    a.politique_ok ? '' : 'politique différente (FastPanel ' + (a.politique_fp || '?') + ')'].filter(Boolean).join(' · ')), '');
+    h += '<div class="sc-pf-liste">' + (R.length ? R.map(function(r){
+            const C = r.saut ? ['', 'CHAÎNE'] : (SC_PF_CIB[r.cible] || ['', mxE(r.cible || '?')]);
+            return '<div class="sc-pf-l" style="padding-left:' + (r.profondeur * 18) + 'px">' + scP(C[0], C[1])
+                 + '<span>' + (r.saut ? '<b>' + mxE(r.cible) + '</b> ' : '') + mxE((r.conditions || []).join(' · ') || (r.saut ? 'toujours' : 'tout le reste'))
+                 + '</span><span class="sc-mono sc-pf-ch">' + mxE(r.chaine) + '</span></div>'; }).join('')
+          : '<div class="empty-state">INPUT ne contient aucune règle.</div>') + '</div>';
+    if (n.v6) h += scL(scP(n.v6.filtre ? 'ok' : (n.v6_ouvert ? 'panne' : ''), 'IPv6'), n.v6.filtre ? 'IPv6 filtré' : 'IPv6 : tout accepter',
+                       'politique ' + mxE(n.v6.politique) + (n.v6_ouvert ? ' — IPv4 filtre mais IPv6 reste ouvert : une porte à côté' : ''), '');
+    (n.docker || []).forEach(function(d){
+        h += scL(scP(d.portee === 'machine' ? 'ok' : 'regarder', 'DOCKER'), mxE(d.port + '/' + d.proto + ' → ' + d.vers),
+                 d.portee === 'machine' ? 'publié sur la machine seulement (127.0.0.1)' : 'publié au réseau, À CÔTÉ du pare-feu (Docker passe par FORWARD)', ''); });
+    return h + '</div>';
 }
 function scPfEssais(){
     const E = (SC.d && SC.d.parefeu_essais) || [];
