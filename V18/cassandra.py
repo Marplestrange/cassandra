@@ -87660,7 +87660,7 @@ def _sec_ecoutes() -> list:
 def _sec_adresses_machine() -> dict:
     """Les adresses publiques que porte la machine elle-même ; sans v4 publique, elle est derrière une box."""
     _ok, sortie = _sec_sortie(["ip", "-o", "addr", "show"], timeout=5)
-    v4, v6, locaux = [], [], []
+    v4, v6, locaux, ips_locales = [], [], [], []
     for ligne in sortie.splitlines():
         m = re.search(r"\binet6?\s+([0-9a-fA-F:.]+)/", ligne)
         if not m:
@@ -87670,8 +87670,10 @@ def _sec_adresses_machine() -> dict:
             try:
                 n = _sec_ip.ip_network(c.group(1), strict=False)
                 if n.is_private and not n.is_loopback and n.subnet_of(_sec_ip.ip_network("0.0.0.0/0")) and not (n.network_address in _SEC_TS) \
-                        and " docker" not in ligne and " br-" not in ligne and str(n) not in locaux:
-                    locaux.append(str(n))
+                        and " docker" not in ligne and " br-" not in ligne:
+                    if str(n) not in locaux:
+                        locaux.append(str(n))
+                    ips_locales.append(c.group(1).split("/")[0])
             except (ValueError, TypeError):
                 pass
         try:
@@ -87680,7 +87682,56 @@ def _sec_adresses_machine() -> dict:
             continue
         if ip.is_global and not (ip.version == 4 and ip in _SEC_TS) and not (ip.version == 6 and ip in _SEC_TS6):
             (v4 if ip.version == 4 else v6).append(str(ip))
-    return {"public_v4": v4, "public_v6": v6, "reseaux_locaux": locaux}
+    return {"public_v4": v4, "public_v6": v6, "reseaux_locaux": locaux, "ips_locales": ips_locales}
+
+
+def _sec_box_redirections():
+    """Les redirections de la box vers le réseau local, telles que le collecteur les lit par l'API de la box
+    (famille « La box » du Sensorium) : [{proto, port, vers, port_vers}] ; None si la box n'est pas lue."""
+    try:
+        rows = query_db("SELECT cle, valeur FROM mesures_diverses WHERE cle LIKE 'box.redirection%'") or []
+    except Exception:
+        return None
+    if not rows:
+        return None
+    out = []
+    for r in rows:
+        m = re.match(r"(tcp|udp)\s+(\d+)\s+→\s+([0-9.]+):(\d+)", str(r.get("valeur") or ""))
+        if m:
+            out.append({"proto": m.group(1), "port": int(m.group(2)), "vers": m.group(3), "port_vers": int(m.group(4))})
+    return out
+
+
+def _pf_admis(v4: dict, port: int, proto: str) -> str:
+    """Qui le pare-feu laisse joindre ce port depuis le réseau : « tous », « reseau » (une plage locale entière),
+    « parc » (des adresses une à une), ou « » (personne). Les règles liées à une interface (lo, Tailscale,
+    Docker) ou à l'état « déjà établie » ne comptent pas : elles ne valent pas pour un visiteur du réseau."""
+    if not v4 or not v4.get("filtre"):
+        return "tous"
+    rang = {"": 0, "parc": 1, "reseau": 2, "tous": 3}
+    mieux = ""
+    for r in v4.get("regles") or []:
+        if r.get("saut") or r.get("cible") != "ACCEPT":
+            continue
+        conds = " ".join(r.get("conditions") or [])
+        if "par " in conds or "hors interface" in conds or "connexions déjà établies" in conds or "état " in conds \
+                or "ping" in conds or "depuis le port" in conds:
+            continue
+        if r.get("proto") not in ("", "all", proto):
+            continue
+        if r.get("ports") and not any(a <= port <= b for a, b in r["ports"]):
+            continue
+        s = r.get("source") or ""
+        if not s:
+            niv = "tous"
+        else:
+            try:
+                niv = "parc" if _sec_ip.ip_network(s, strict=False).prefixlen >= 32 else "reseau"
+            except ValueError:
+                niv = "parc"
+        if rang[niv] > rang[mieux]:
+            mieux = niv
+    return mieux
 
 
 _PF_CIBLES = {"ACCEPT": "autorise", "DROP": "refuse", "REJECT": "rejette", "RETURN": "rend la main",
@@ -87987,12 +88038,34 @@ def _sec_exposition(ecoutes: list, machine: dict, fw: dict) -> list:
         s["ports"].add("%s/%s" % (e["port"], e["proto"]))
         s["portees"].add(_sec_portee(e["adresse"]))
     derriere_box = not machine.get("public_v4")
+    # LE PARE-FEU ET LA BOX COMPTENT (10-10) : « ouvert au réseau local » se lisait sur l'adresse d'écoute seule ;
+    # sous « refuser par défaut », seul le parc joint la plupart des ports. Et la box, lue par son API, dit ce
+    # qu'elle redirige vraiment : « selon la box » devient oui ou non.
+    v4 = ((fw.get("noyau") or {}).get("v4")) if (fw.get("noyau") or {}).get("lu") else None
+    redir = _sec_box_redirections() if derriere_box else None
+    mes_ips = set(machine.get("ips_locales") or [])
     out = []
     for s in par.values():
         pt = s["portees"]
-        reseau = bool(pt & {"tout", "reseau", "public"})
+        ecoute_reseau = bool(pt & {"tout", "reseau", "public"})
+        admis = []
+        for x in s["ports"]:
+            p, _, pr = x.partition("/")
+            admis.append(_pf_admis(v4, int(p), pr) if v4 else ("tous" if not fw.get("filtre") else ""))
+        reseau = ecoute_reseau and any(a in ("tous", "reseau") for a in admis)
+        parc = ecoute_reseau and not reseau and "parc" in admis
+        ports_tcp = {int(x.split("/")[0]) for x in s["ports"] if x.endswith("/tcp")}
+        ports_udp = {int(x.split("/")[0]) for x in s["ports"] if x.endswith("/udp")}
         if "public" in pt or ("tout" in pt and not derriere_box):
             internet = "filtre" if fw.get("filtre") else "oui"
+        elif (pt & {"tout", "reseau"}) and redir is not None:
+            # Les sites écoutent sur l'adresse locale (192.168.1.199), celle que vise la box.
+            vise = [r for r in redir if r["vers"] in mes_ips and r["port_vers"] in (ports_tcp if r["proto"] == "tcp" else ports_udp)]
+            if not vise:
+                internet = "non"
+            else:
+                ok = any(_pf_admis(v4, r["port_vers"], r["proto"]) == "tous" for r in vise) if v4 else not fw.get("filtre")
+                internet = "oui" if ok else "filtre"
         elif "tout" in pt:
             internet = "box"
         else:
@@ -88003,7 +88076,7 @@ def _sec_exposition(ecoutes: list, machine: dict, fw: dict) -> list:
                      "avahi-daemon": "arret:avahi-daemon", "cupsd": "arret:cups"}.get(s["processus"], "")
         out.append({"nom": s["nom"], "processus": s["processus"],
                     "ports": sorted(s["ports"], key=lambda x: int(x.split("/")[0])),
-                    "machine": True, "tailscale": bool(pt & {"tout", "tailscale"}), "reseau": reseau,
+                    "machine": True, "tailscale": bool(pt & {"tout", "tailscale"}), "reseau": reseau, "parc": parc,
                     "internet": internet, "sensible": s["sensible"], "geste": geste})
     out.sort(key=lambda x: (not (x["sensible"] and x["reseau"]), not x["reseau"], x["nom"].lower()))
     return out
@@ -88135,6 +88208,8 @@ def _sec_verdict(d: dict) -> dict:
     sensibles = [s for s in reseau if s["sensible"]]
     publics = [s for s in expo if s["internet"] == "oui"]
     publics_sensibles = [s for s in publics if s["sensible"]]
+    # Un serveur web public est le but d'un hébergeur : seul un AUTRE service public mérite un regard.
+    publics_inattendus = [s for s in publics if s["processus"] not in ("nginx", "apache2", "httpd", "caddy", "haproxy", "traefik")]
     fw, ssh, maj, f2b = d["parefeu"], d["ssh"], d["maj"], d["fail2ban"]
     box = not d["machine"].get("public_v4")
     if publics_sensibles:
@@ -88164,13 +88239,18 @@ def _sec_verdict(d: dict) -> dict:
         sous.append("Rien n'applique les correctifs de sécurité sans vous.")
     if publics and not box:
         sous.append("« Joignable » se lit sur la machine : un pare-feu chez l'hébergeur, s'il existe, ne se voit pas d'ici.")
-    if box:
+    redir = d.get("box_redirections")
+    if box and redir is None:
         sous.append("La machine est derrière une box : ce que la box redirige depuis Internet ne se voit pas d'ici.")
+    elif box:
+        vers_moi = sorted({"%s %d" % (r["proto"].upper(), r["port"]) for r in redir if r["vers"] in (d["machine"].get("ips_locales") or [])})
+        sous.append("Derrière la box, qui ne redirige vers cette machine %s (lu par son API)." % (
+            "que " + ", ".join(vers_moi) if vers_moi else "rien"))
     if niveau == "stable" and not sous:
         sous.append("Pare-feu actif, SSH par clé, correctifs appliqués.")
     chiffres = [
-        {"v": str(len(publics)), "lib": "exposés à Internet" + (" (hors redirections de la box)" if box else ""),
-         "niveau": "panne" if publics_sensibles else ("regarder" if publics else "ok")},
+        {"v": str(len(publics)), "lib": "exposés à Internet" + (" (hors redirections de la box)" if box and redir is None else ""),
+         "niveau": "panne" if publics_sensibles else ("regarder" if publics_inattendus else "ok")},
         {"v": str(len(reseau)), "lib": "ouverts au réseau local", "niveau": "regarder" if reseau and not fw["filtre"] else "ok"},
         {"v": {"yes": "oui", "no": "non"}.get(ssh.get("mots_de_passe"), "?"), "lib": "mots de passe SSH acceptés",
          "niveau": "regarder" if ssh.get("mots_de_passe") == "yes" else "ok"},
@@ -88223,6 +88303,7 @@ def securite_etat(compte: str = "", force: bool = False, ip: str = "") -> dict:
         except Exception:
             conf = {}
         d = {"ok": True, "machine": machine, "parefeu": fw, "exposition": _sec_exposition(_sec_ecoutes(), machine, fw),
+             "box_redirections": _sec_box_redirections() if not machine.get("public_v4") else None,
              "ssh": _sec_ssh(), "comptes": comptes, "cles_fichiers": _sec_cles_de(sorted(set(["root"] + comptes["sudo"]))),
              "cles": cles, "fail2ban": _sec_fail2ban(), "maj": _sec_maj(), "cage": _sec_cage(),
              "confinement": conf, "mesure": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -105622,7 +105703,7 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
 
         <section class="mx-sec" data-page="exposition" id="sc-s-expo" hidden>
           <div class="mx-chart-h"><h2>Exposition — qui peut joindre quoi</h2><span class="mx-meta" id="sc-expo-meta"></span></div>
-          <p class="mx-prose">Chaque service de la machine sur quatre anneaux, du plus proche au plus loin. Derrière une box, seuls les ports qu’elle redirige arrivent d’Internet : ils ne se voient pas d’ici.</p>
+          <p class="mx-prose">Chaque service de la machine sur quatre anneaux, du plus proche au plus loin. Le pare-feu compte : « le parc » veut dire que seules les machines du parc passent. Derrière une box, seuls les ports qu’elle redirige arrivent d’Internet — lus par son API quand elle est reliée, sinon « selon la box ».</p>
           <div class="sc-leg"><span><i class="sc-cel a1"></i>la machine seule</span><span><i class="sc-cel a2"></i>Tailscale (vos machines)</span><span><i class="sc-cel a3"></i>le réseau local</span><span><i class="sc-cel a4"></i>Internet</span><span><i class="sc-cel box"></i>selon la box</span></div>
           <div class="sc-tbl"><table><thead><tr><th>Service</th><th>Machine</th><th>Tailscale</th><th>Réseau local</th><th>Internet</th></tr></thead><tbody id="sc-expo"></tbody></table></div>
           <div class="sc-prov" id="sc-expo-prov"></div>
@@ -105637,7 +105718,7 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
         </section>
         <section class="mx-sec" data-page="parefeu" id="sc-s-fw-form" hidden>
           <div class="mx-chart-h"><h2 id="sc-pf-titre">Poser une règle</h2><span class="mx-meta">par l’API de FastPanel · la même règle apparaît dans le panneau</span></div>
-          <p class="mx-prose">La machine elle-même et Tailscale passent toujours : ils sont acceptés avant ces règles. Un réglage qui peut fermer est <b>à l’essai deux minutes</b> : sans « Garder », il se défait seul — on ne s’enferme pas dehors.</p>
+          <p class="mx-prose">La machine elle-même, Tailscale et le parc passent toujours : le socle les accepte avant ces règles. Un réglage qui peut fermer est <b>à l’essai deux minutes</b> : sans « Garder », il se défait seul — on ne s’enferme pas dehors.</p>
           <input type="hidden" id="sc-pf-id" value="">
           <div class="sc-champs">
             <div class="s-field"><label class="s-label" for="sc-pf-nom">Nom</label><input class="s-input" id="sc-pf-nom" maxlength="60" placeholder="Grafana par Tailscale seulement"></div>
@@ -105645,7 +105726,7 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
             <div class="s-field"><label class="s-label" for="sc-pf-proto">Protocole</label><select class="s-select" id="sc-pf-proto"><option value="TCP">TCP</option><option value="UDP">UDP</option><option value="ALL">TCP et UDP</option></select></div>
             <div class="s-field"><label class="s-label" for="sc-pf-sens">Sens</label><select class="s-select" id="sc-pf-sens"><option value="INPUT">entrant</option><option value="OUTPUT">sortant</option></select></div>
             <div class="s-field"><label class="s-label" for="sc-pf-pol">Effet</label><select class="s-select" id="sc-pf-pol" onchange="scPfSourcesVoir()">
-              <option value="DROP">refuser à tous (hors machine et Tailscale)</option>
+              <option value="DROP">refuser à tous (hors machine, Tailscale et parc)</option>
               <option value="PARTIAL_ACCEPT">n’autoriser que ces adresses</option>
               <option value="PARTIAL_DROP">refuser ces adresses</option>
               <option value="ACCEPT">autoriser à tous</option></select></div>
@@ -115464,16 +115545,20 @@ function scExposition(){
         const g = s.geste ? scB(lib[s.geste] || 'Agir', "scGeste('" + s.geste + "')")
                 : (s.sensible && s.reseau && fw.api_ok && port) ? scB('Fermer au réseau', "scPfPreparer('" + mxE(String(s.nom).replace(/'/g, '')) + "', '" + port + "')") : '';
         return '<tr' + (s.sensible && s.reseau ? ' class="sc-focus"' : '') + '><td class="svc"><b>' + mxE(s.nom) + '</b><span>' + mxE(s.processus) + ' · ' + mxE((s.ports || []).join(', ')) + '</span>' + (g ? '<div class="sc-geste">' + g + '</div>' : '') + '</td>'
-             + '<td>' + cel(s.machine, 1, 'ici') + '</td><td>' + cel(s.tailscale, 2, 'atteint') + '</td><td>' + cel(s.reseau, 3, 'ouvert') + '</td><td>' + net(s.internet) + '</td></tr>';
+             + '<td>' + cel(s.machine, 1, 'ici') + '</td><td>' + cel(s.tailscale, 2, 'atteint') + '</td><td>'
+             + (s.reseau ? cel(true, 3, 'ouvert') : s.parc ? '<span class="sc-cel a2" title="Seules les machines du parc passent le pare-feu">le parc</span>' : cel(false))
+             + '</td><td>' + net(s.internet) + '</td></tr>';
     }).join('') || '<tr><td colspan="5"><div class="empty-state">Aucun service à l’écoute lu (ss).</div></td></tr>');
     const reseau = E.filter(function(s){ return s.reseau && s.nom !== 'Cassandra'; }).length, pub = E.filter(function(s){ return s.internet === 'oui'; }).length;
     scTexte('sc-expo-meta', reseau + ' ouvert' + (reseau > 1 ? 's' : '') + ' au réseau local · ' + pub + ' public' + (pub > 1 ? 's' : ''));
-    const pv = (d.machine || {}).public_v4 || [];
+    const pv = (d.machine || {}).public_v4 || [], rd = d.box_redirections;
+    const rdTxt = (rd || []).map(function(r){ return r.proto.toUpperCase() + ' ' + r.port + ' → ' + r.vers + ':' + r.port_vers; }).join(' · ');
     scHtml('sc-expo-prov', '<span class="src">ss -ltnup</span><span class="src">' + mxE(fw.outil || 'pare-feu') + '</span>'
         + (pv.length ? '<span>Adresse publique portée par la machine : <span class="sc-mono">' + mxE(pv.join(', ')) + '</span></span>'
-                     : '<span>Aucune adresse publique sur la machine : Internet arrive par la box, qui seule sait ce qu’elle redirige.</span>'));
+           : rd ? '<span class="src">API de la box</span><span>Redirections de la box : <span class="sc-mono">' + mxE(rdTxt || 'aucune') + '</span></span>'
+                : '<span>Aucune adresse publique sur la machine : Internet arrive par la box, qui seule sait ce qu’elle redirige.</span>'));
 }
-const SC_PF_POL = {ACCEPT: ['ok', 'AUTORISE', 'autorisé à tous'], DROP: ['panne', 'REFUSE', 'refusé à tous (hors machine et Tailscale)'],
+const SC_PF_POL = {ACCEPT: ['ok', 'AUTORISE', 'autorisé à tous'], DROP: ['panne', 'REFUSE', 'refusé à tous (hors machine, Tailscale et parc)'],
                    PARTIAL_ACCEPT: ['pas_encore', 'SEULEMENT', 'autorisé seulement à'], PARTIAL_DROP: ['regarder', 'SAUF', 'refusé à']};
 function scParefeu(){
     const fw = SC.d.parefeu || {}, fp = fw.source === 'fastpanel', R = fw.panneau || [], api = !!fw.api_ok;
@@ -115483,7 +115568,7 @@ function scParefeu(){
     const bascule = api ? (pol === 'DROP' ? scB('Tout accepter par défaut', "scPfPolitique('ACCEPT')") : scB('Refuser par défaut', "scPfPolitique('DROP')", 'sc-danger')) : '';
     let h = scL(scP(fw.filtre ? 'ok' : 'panne', fw.filtre ? 'FILTRE' : 'OUVERT'),
                 fw.filtre ? 'Ce qui n’est pas permis est refusé' : 'Politique : tout accepter',
-                fw.filtre ? 'Politique d’entrée ' + mxE(fw.politique) + ' ; permis : la machine, Tailscale, et ce que chaque règle ouvre.' : 'Rien n’est refusé par défaut : tout ce qui écoute est joignable, sauf ce qu’une règle ci-dessous refuse.', bascule);
+                fw.filtre ? 'Politique d’entrée ' + mxE(fw.politique) + ' ; permis : la machine, Tailscale, le parc et Docker (le socle), et ce que chaque règle ouvre.' : 'Rien n’est refusé par défaut : tout ce qui écoute est joignable, sauf ce qu’une règle ci-dessous refuse.', bascule);
     if (fp) {
         h += R.length ? R.map(function(r){ const P = SC_PF_POL[r.politique] || ['', r.politique || '?', r.politique];
                 const src = r.sources ? ' ' + r.sources.split(',').join(', ') : '';
@@ -115692,7 +115777,9 @@ function scFlux(){
     if (!SC.flux) return;
     const lib = {auth: 'SSH', f2b: 'FAIL2BAN', cage: 'CAGE', admin: 'ADMIN'};
     const L = SC.flux.filter(function(e){ return SC.filtre === 'tout' || e.src === SC.filtre; });
-    scHtml('sc-flux', L.length ? L.map(function(e){ return '<div class="sc-ev"><span class="h">' + mxE(String(e.ts || '').slice(5).replace('-', '/')) + '</span>' + scP(e.niveau || '', lib[e.src] || e.src) + '<span class="t">' + mxE(e.texte) + '</span></div>'; }).join('')
+    // « 2026-10-09 19:05 » → « 09/10 19:05 » (jour/mois ; l'ancien découpage donnait le mois d'abord).
+    const quand = function(ts){ const m = /^\d{4}-(\d{2})-(\d{2})[ T](\d{2}:\d{2})/.exec(String(ts || '')); return m ? m[2] + '/' + m[1] + ' ' + m[3] : String(ts || ''); };
+    scHtml('sc-flux', L.length ? L.map(function(e){ return '<div class="sc-ev"><span class="h">' + mxE(quand(e.ts)) + '</span>' + scP(e.niveau || '', lib[e.src] || e.src) + '<span class="t">' + mxE(e.texte) + '</span></div>'; }).join('')
                                : '<div class="empty-state">Rien pour ce filtre.</div>');
 }
 async function scAuditLire(id){
