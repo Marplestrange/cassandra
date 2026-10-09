@@ -78678,7 +78678,8 @@ def _flotte_sonde_lire_sortie(nom: str, sortie: str) -> list:
                             + (" · voit le serveur en panne" if vu == "alerte" else ""), "warning" if age >= 300 or vu == "alerte" else "info"))
             elif k == "WU" and len(p) >= 2 and p[1].lstrip("-").isdigit():
                 j = int(p[1])
-                out.append(("mises_a_jour", "dernière mise à jour il y a %d j" % j, "warning" if j > 45 else "info"))
+                # 35 jours : un mois de correctifs (le deuxième mardi) manqué, plus une marge.
+                out.append(("mises_a_jour", "dernière mise à jour il y a %d j" % j, "warning" if j > 35 else "info"))
         except Exception:
             continue
     return out
@@ -78859,7 +78860,7 @@ def sensorium_retirer_acquit(wkey: str) -> dict:
     return {"ok": True, "retire": bool(n)}
 
 
-_SN_MOTS = {"socle": "socle (parc, Docker, réponses)", "partage": "partage et Funnel", "appareils": "appareils",
+_SN_MOTS = {"wifi": "Wi-Fi", "socle": "socle (parc, Docker, réponses)", "partage": "partage et Funnel", "appareils": "appareils",
             "echecs au demarrage": "échecs au démarrage (avant l'horloge)",
             "acces distant": "accès distant à Freebox OS", "upnp": "UPnP", "dmz": "DMZ", "ftp": "FTP", "vpn": "VPN",
             "systeme": "système", "connexion": "connexion", "redirections": "redirections de ports", "en echec": "en échec", "mises a jour": "mises à jour", "hors machine": "hors machine",
@@ -78891,7 +78892,8 @@ def _sensorium_libelle(wkey: str) -> str:
             "port": "Port", "interface": "Interface", "logiciel": "Logiciel", "config": "Réglage", "cle_ssh": "Clé SSH",
             "fail2ban": "Fail2ban", "cron": "Tâche planifiée", "fastpanel": "FastPanel", "journaux": "Journaux",
             "mysql": "MySQL", "cassandra": "Cassandra", "certbot": "Certbot", "exposition": "Exposition",
-            "disque_sante": "Santé du disque", "php_fpm": "PHP-FPM", "box": "Box", "tailnet": "Tailnet"}
+            "disque_sante": "Santé du disque", "php_fpm": "PHP-FPM", "box": "Box", "tailnet": "Tailnet", "prison": "Prison fail2ban", "domaine_courriel": "Courriel du domaine",
+            "image": "Image du conteneur"}
     if not reste:
         return noms.get(fam, wkey)
     if fam == "machine":
@@ -78900,6 +78902,8 @@ def _sensorium_libelle(wkey: str) -> str:
         return "%s — %s" % (m.capitalize(), _sn_mots(quoi)) if quoi else m.capitalize()
     if fam == "tailnet" and reste.startswith("nouveau."):
         return "Tailnet — nouvel appareil %s" % reste.split(".", 1)[1]
+    if fam in ("prison", "domaine_courriel", "image"):
+        return "%s %s" % (noms[fam], reste)
     if fam == "box" and reste.startswith("appareil."):
         return "Box — nouvel appareil sur le réseau"
     if fam == "box" and reste.startswith("redirection."):
@@ -115743,11 +115747,11 @@ const _MX_JOURS=['dim.','lun.','mar.','mer.','jeu.','ven.','sam.'];
 const SN = {etat:null, vue:'maintenant', fam:null};
 const SN_FAMILLES = [
   ['system','Système','system.'], ['ressources','Ressources','cpu.|ram.|swap.|load.|disk.|montage.'], ['service','Services','service.|systemd.'],
-  ['docker','Conteneurs','docker.|conteneur_ressources.'], ['web','Sites','web.'], ['controle','Contrôles de bout en bout','controle.'],
+  ['docker','Conteneurs','docker.|conteneur_ressources.|image.'], ['web','Sites','web.'], ['controle','Contrôles de bout en bout','controle.'],
   ['ssl','Certificats','ssl.'], ['sauvegarde','Sauvegardes','sauvegarde.'], ['prevision','Ce qui va arriver','prevision.'],
   ['flotte','Flotte','fleet.|machine.'], ['config','Config de Cassandra','config.'], ['logiciel','Logiciels','logiciel.'],
   ['reseau','Réseau','interface.|port.'], ['stockage','Stockage','stockage.'], ['securite','Sécurité','security.'],
-  ['maj','Mises à jour','maj.'], ['courriel','Courriel','courriel.'], ['acces','Accès et pare-feu','ssh.|cle_ssh.|pare_feu.|fail2ban.'],
+  ['maj','Mises à jour','maj.'], ['courriel','Courriel','courriel.|domaine_courriel.'], ['acces','Accès et pare-feu','ssh.|cle_ssh.|pare_feu.|fail2ban.|prison.'],
   ['cron','Tâches planifiées','cron.'], ['fastpanel','FastPanel','fastpanel.'], ['erreurs','Erreurs des journaux','erreurs.|journaux.'],
   ['certbot','Renouvellement des certificats','certbot.'], ['box','La box','box.'], ['tailnet','Tailnet','tailnet.'], ['capteur','Capteurs','capteur.'], ['sante','Santé','health.']
 ];

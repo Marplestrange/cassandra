@@ -4301,7 +4301,7 @@ def _trafic_heure(chemin: str):
         return None
     limite = datetime.now() - timedelta(hours=1)
     n = e4 = e5 = 0
-    robots, e5_redem, effractions = {}, 0, 0
+    robots, e5_redem, effractions, refusees = {}, 0, 0, 0
     redemarrages = _cassandra_demarrages()
     for l in reversed(lignes):
         m = _ACCES_RE.search(l)
@@ -4324,14 +4324,19 @@ def _trafic_heure(chemin: str):
         elif c.startswith("4"):
             e4 += 1
         req = l.split('"', 2)[1] if l.count('"') >= 2 else ""
-        if _EFFRACTION_RE.search(req) or (req.startswith("POST /wp-login.php") and c == "200"):
-            effractions += 1           # un POST wp-login rendu 200 = mot de passe refusé (302 quand il réussit)
+        if _EFFRACTION_RE.search(req):
+            effractions += 1
+        # UNE CONNEXION REFUSÉE : WordPress rend 200 à un mot de passe faux (302 quand il réussit), Cassandra
+        # 401, Vaultwarden 400 sur son jeton.
+        elif ((req.startswith("POST /wp-login.php") and c == "200") or (req.startswith("POST /api/login") and c == "401")
+              or (req.startswith("POST /identity/connect/token") and c == "400") or (req.startswith("POST /admin") and c == "401")):
+            refusees += 1
         ua = l.rsplit('"', 2)[-2] if l.count('"') >= 2 else ""
         rb = _ROBOT_RE.search(ua)
         if rb:
             nom = rb.group(0)
             robots[nom] = robots.get(nom, 0) + 1
-    return n, e4, e5, robots, e5_redem, effractions
+    return n, e4, e5, robots, e5_redem, effractions, refusees
 
 
 # Ce qui ne s'appelle que pour forcer une porte : secrets, dépôts, greffons piratés, failles connues.
@@ -4375,13 +4380,15 @@ def collect_sante_applicative() -> list:
         r = _trafic_heure(chemin)
         if not r or not r[0]:
             continue
-        n, e4, e5, robots, e5_redem, eff = r
+        n, e4, e5, robots, e5_redem, eff, refus = r
         pct = 100.0 * e5 / n
         nr = sum(robots.values())
         tete = sorted(robots.items(), key=lambda kv: -kv[1])[:3]
         part = (" · %d %% de robots (%s)" % (round(100.0 * nr / n), ", ".join("%s %d %%" % (k, round(100.0 * v / n)) for k, v in tete))) if nr else ""
         redem = (" · %d autre%s pendant un redémarrage de Cassandra" % (e5_redem, "s" if e5_redem > 1 else "")) if e5_redem else ""
         effr = (" · %d tentative%s d'effraction" % (eff, "s" if eff > 1 else "")) if eff else ""
+        if refus:
+            effr += " · %d connexion%s refusée%s" % (refus, "s" if refus > 1 else "", "s" if refus > 1 else "")
         out.append(_mesure("trafic.%s" % nom, "trafic", "%d requêtes dans l'heure · %d erreurs 5xx (%.0f %%)%s · %d 4xx%s%s" % (
                                n, e5, pct, redem, e4, part, effr),
                            "warning" if (e5 >= 10 and pct >= 5) else "info"))
@@ -4451,6 +4458,97 @@ def _premieres_vues(espace: str, cles) -> dict:
 
 def _depuis_24h(vu: str) -> bool:
     return vu > (datetime.now() - timedelta(hours=24)).isoformat()
+
+
+def collect_fail2ban_prisons() -> list:
+    """Chaque prison fail2ban : bannies maintenant, bannies depuis son démarrage, échecs en cours. « Aucune
+    adresse bannie » au total ne disait pas si les prisons travaillaient."""
+    if not _qui("fail2ban-client"):
+        return []
+    st = run_cmd(["fail2ban-client", "status"], timeout=10) or ""
+    m = re.search(r"Jail list:\s*(.+)", st)
+    out = []
+    for j in [x.strip() for x in (m.group(1).split(",") if m else []) if x.strip()]:
+        t = run_cmd(["fail2ban-client", "status", j], timeout=10) or ""
+        g = lambda e: int((re.search(e + r":\s*(\d+)", t) or [0, 0])[1])
+        out.append(_mesure("prison.%s" % j, "securite", "%d bannie%s maintenant · %d depuis le démarrage de fail2ban · %d échec%s en cours" % (
+            g("Currently banned"), "s" if g("Currently banned") > 1 else "", g("Total banned"),
+            g("Currently failed"), "s" if g("Currently failed") > 1 else "")))
+    return out
+
+
+_DOMAINES_CACHE = {"t": 0, "d": []}
+_DKIM_SELECTEURS = ("default", "dkim", "mail", "selector1", "selector2", "google", "k1", "s1", "s2",
+                    "ovhmo-selector-1", "ovhmo-selector-2", "ovhex", "fm1", "mxvault")
+
+
+def collect_courriel_domaines() -> list:
+    """QUI PEUT ENVOYER AU NOM DE MES DOMAINES (10-10) : SPF, DKIM, DMARC de chaque domaine servi ici. Sans eux,
+    n'importe qui envoie « de » chez vous, et vos vrais envois finissent en indésirables. Relu toutes les heures."""
+    if time.time() - _DOMAINES_CACHE["t"] < 3600 and _DOMAINES_CACHE["d"]:
+        return _DOMAINES_CACHE["d"]
+    if not _qui("dig"):
+        return []
+    try:
+        k = get_conn()
+        noms = {r[0] for r in k.execute("SELECT DISTINCT domain FROM web_sites")}
+        k.close()
+    except Exception:
+        noms = set()
+    racines = sorted({".".join(str(n).strip(".").split(".")[-2:]) for n in noms if n and "." in str(n)})
+
+    def txt(nom):
+        return [l.strip().strip('"').replace('" "', "") for l in (run_cmd(["dig", "+short", "+time=3", "+tries=1", "TXT", nom], timeout=8) or "").splitlines() if l.strip()]
+    ip = ""
+    try:
+        ip = _ip_publique() or ""
+    except Exception:
+        pass
+    out = []
+    for d in racines:
+        spf = next((t for t in txt(d) if t.lower().startswith("v=spf1")), "")
+        dmarc = next((t for t in txt("_dmarc." + d) if t.lower().startswith("v=dmarc1")), "")
+        dkim = [s for s in _DKIM_SELECTEURS if any("p=" in t for t in txt("%s._domainkey.%s" % (s, d)))]
+        pol = (re.search(r"\bp=(\w+)", dmarc) or [None, ""])[1].lower()
+        parts = []
+        sev = "info"
+        if spf:
+            fin = (re.search(r"([~\-?+])all\b", spf) or [None, ""])[1]
+            parts.append("SPF %s" % {"-": "strict (-all)", "~": "souple (~all)", "?": "neutre (?all)", "+": "OUVERT À TOUS (+all)"}.get(fin, "sans fin"))
+            if fin == "+":
+                sev = "warning"
+            if ip and ("ip4:" + ip) not in spf and "include:" not in spf and " a " not in (spf + " ") and " mx " not in (spf + " "):
+                parts.append("cette machine (%s) n'y est pas" % ip)
+        else:
+            parts.append("AUCUN SPF : n'importe qui peut écrire en son nom")
+            sev = "warning"
+        parts.append(("DKIM : %s" % ", ".join(dkim)) if dkim else "DKIM : aucune signature trouvée")
+        if dmarc:
+            parts.append("DMARC %s" % {"none": "en surveillance seulement (p=none)", "quarantine": "met en quarantaine",
+                                        "reject": "rejette l'usurpation"}.get(pol, pol or "?"))
+        else:
+            parts.append("AUCUN DMARC")
+            sev = "warning"
+        out.append(_mesure("domaine_courriel.%s" % d, "courriel", " · ".join(parts), sev))
+    _DOMAINES_CACHE.update({"t": time.time(), "d": out})
+    return out
+
+
+def collect_images_docker() -> list:
+    """L'âge de l'image de chaque conteneur : les correctifs de sécurité d'un service arrivent par elle."""
+    if not _qui("docker"):
+        return []
+    out = []
+    for l in (run_cmd(["docker", "ps", "--format", "{{.Names}}|{{.Image}}"], timeout=10) or "").splitlines():
+        nom, _, img = l.partition("|")
+        cree = (run_cmd(["docker", "image", "inspect", "-f", "{{.Created}}", img], timeout=10) or "").strip()[:19]
+        try:
+            age = (datetime.now(timezone.utc) - datetime.strptime(cree, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)).days
+        except Exception:
+            continue
+        out.append(_mesure("image.%s" % nom, "conteneur", "image %s construite il y a %d j%s" % (
+            img, age, " : sans doute des correctifs en retard, à mettre à jour" if age > 60 else ""), "warning" if age > 60 else "info"))
+    return out
 
 
 def collect_tailnet() -> list:
@@ -4607,6 +4705,25 @@ def collect_box() -> list:
             k.close()
         except Exception as e:
             print(f"[BOX] redirections : {e}", file=sys.stderr)
+        # LE WI-FI (10-10) : le chiffrement de chaque réseau ; ouvert, WEP ou WPA1 est une alerte.
+        bss = api("/wifi/bss/", session=S)
+        if isinstance(bss, list):
+            noms_ch = {"wpa23_psk_ccmp": "WPA2/WPA3", "wpa3_psk_ccmp": "WPA3", "wpa2_psk_ccmp": "WPA2", "wpa2_psk_auto": "WPA2",
+                       "wpa12_psk_auto": "WPA1/WPA2", "wpa_psk_tkip": "WPA1", "wep": "WEP", "none": "OUVERT"}
+            vus_ssid, faibles = {}, []
+            for b in bss:
+                cfg = b.get("config") or {}
+                if not cfg.get("enabled"):
+                    continue
+                ch = noms_ch.get(cfg.get("encryption"), cfg.get("encryption") or "?")
+                vus_ssid.setdefault(cfg.get("ssid") or "?", set()).add(ch)
+                if ch in ("OUVERT", "WEP", "WPA1", "WPA1/WPA2"):
+                    faibles.append(cfg.get("ssid") or "?")
+            wps = (api("/wifi/wps/config/", session=S) or {}).get("enabled")
+            out.append(_mesure("box.wifi", "box", "%s · WPS %s" % (
+                " · ".join("%s (%s)" % (s, "/".join(sorted(c))) for s, c in sorted(vus_ssid.items())),
+                "actif (bouton de la box)" if wps else "désactivé") + ((" · CHIFFREMENT FAIBLE : %s" % ", ".join(faibles)) if faibles else ""),
+                "warning" if faibles else "info"))
         # LES APPAREILS DE LA MAISON (09-10) : un appareil jamais vu sur le réseau alerte 24 h.
         hotes = api("/lan/browser/pub/", session=S)
         if isinstance(hotes, list):
@@ -4641,7 +4758,8 @@ def collect_box() -> list:
 def collect_mesures_diverses() -> list:
     rows = []
     for fn in (collect_file_courriel, collect_ssh_echecs, collect_docker_ressources, collect_certbot, collect_journaux_poids,
-               collect_sante_applicative, collect_box, collect_tailnet):
+               collect_sante_applicative, collect_box, collect_tailnet, collect_fail2ban_prisons,
+               collect_courriel_domaines, collect_images_docker):
         try:
             rows.extend(fn() or [])
         except Exception as e:
@@ -5311,7 +5429,7 @@ def build_world_model():
         def _diverses(lignes, vus):
             for r in lignes:
                 U(r["cle"], r["categorie"] or "divers", r["valeur"], vus, r["severite"] or "info")
-        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux.", "trafic.", "mysql.", "cassandra.", "box.", "tailnet."):
+        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux.", "trafic.", "mysql.", "cassandra.", "box.", "tailnet.", "prison.", "domaine_courriel.", "image."):
             _famille(_pref, _q("SELECT cle, categorie, valeur, severite FROM mesures_diverses WHERE cle LIKE ?", _pref + "%"), _diverses)
 
         # Clés SSH autorisées, une par une : une clé ajoutée ou retirée entre au journal des changements
