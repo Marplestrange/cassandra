@@ -4408,9 +4408,133 @@ def collect_sante_applicative() -> list:
     return out
 
 
+_BOX_JETON = os.environ.get("CASSANDRA_FREEBOX_TOKEN") or os.path.join(os.path.dirname(CASSANDRA_CONFIG), "freebox-app.token")
+
+
+def _box_duree(sec) -> str:
+    try:
+        sec = int(sec)
+    except Exception:
+        return "?"
+    j, r = divmod(sec, 86400)
+    return ("%d j %d h" % (j, r // 3600)) if j else ("%d h %d min" % (r // 3600, (r % 3600) // 60))
+
+
+def collect_box() -> list:
+    """LA BOX (09-10) : ce qu'elle ouvre sur Internet, lu en LECTURE SEULE par son API locale. Sans jeton
+    d'application autorisé sur la box, rien : la famille n'existe pas."""
+    if not os.path.exists(_BOX_JETON):
+        return []
+    import hmac, urllib.request, urllib.error
+    try:
+        c = json.load(open(_BOX_JETON))
+        base = c["box"].rstrip("/") + c["base"]
+    except Exception as e:
+        return [_mesure("box.acces", "box", "jeton de la box illisible : %s" % str(e)[:120], "warning")]
+
+    def api(chemin, corps=None, session=""):
+        h = {"Content-Type": "application/json"}
+        if session:
+            h["X-Fbx-App-Auth"] = session
+        req = urllib.request.Request(base + chemin, data=json.dumps(corps).encode() if corps is not None else None, headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=8) as r:
+                d = json.load(r)
+        except urllib.error.HTTPError as e:
+            try:
+                d = json.load(e)
+            except Exception:
+                d = {"success": False, "error_code": "http_%d" % e.code}
+        return d.get("result") if d.get("success") else None
+
+    try:
+        defi = (api("/login/") or {}).get("challenge")
+        s = api("/login/session/", {"app_id": c["app_id"], "password": hmac.new(c["app_token"].encode(), str(defi).encode(), hashlib.sha1).hexdigest()})
+        S = (s or {}).get("session_token")
+    except Exception as e:
+        return [_mesure("box.acces", "box", "API de la box injoignable : %s" % str(e)[:120], "warning")]
+    if not S:
+        return [_mesure("box.acces", "box", "la box refuse la session (application retirée de Freebox OS ?)", "warning")]
+    out = []
+    try:
+        cx = api("/connection/", session=S) or {}
+        up = cx.get("state") == "up"
+        out.append(_mesure("box.connexion", "box", "%s · IPv4 %s%s · débit max ↓ %s ↑ %s Mb/s" % (
+            "en ligne" if up else "HORS LIGNE (%s)" % cx.get("state"), cx.get("ipv4") or "?",
+            (" · IPv6 %s" % cx.get("ipv6")) if cx.get("ipv6") else "",
+            int((cx.get("bandwidth_down") or 0) / 1e6), int((cx.get("bandwidth_up") or 0) / 1e6)), "info" if up else "warning"))
+        sy = api("/system/", session=S) or {}
+        temp = [x.get("value") for x in (sy.get("sensors") or []) if isinstance(x.get("value"), (int, float))]
+        out.append(_mesure("box.systeme", "box", "%s · micrologiciel %s · allumée depuis %s%s" % (
+            sy.get("model_info", {}).get("pretty_name") or sy.get("board_name") or "Freebox", sy.get("firmware_version") or "?",
+            _box_duree(sy.get("uptime_val")), (" · %d °C au plus chaud" % max(temp)) if temp else "")))
+        cf = api("/connection/config/", session=S) or {}
+        out.append(_mesure("box.acces_distant", "box", ("OUVERT : Freebox OS joignable depuis Internet (port %s)" % cf.get("remote_access_port"))
+                           if cf.get("remote_access") else "fermé (Freebox OS n'est joignable que de la maison)",
+                           "warning" if cf.get("remote_access") else "info"))
+        v6 = api("/connection/ipv6/config/", session=S) or {}
+        if v6.get("ipv6_enabled"):
+            out.append(_mesure("box.ipv6", "box", "pare-feu IPv6 de la box actif" if v6.get("ipv6_firewall")
+                               else "pare-feu IPv6 de la box COUPÉ : chaque appareil est joignable d'Internet en IPv6",
+                               "info" if v6.get("ipv6_firewall") else "warning"))
+        up_ = api("/upnpigd/config/", session=S) or {}
+        up_r = api("/upnpigd/redir/", session=S) or []
+        out.append(_mesure("box.upnp", "box", ("ACTIVÉ : les appareils peuvent ouvrir des ports seuls (%d ouverts)" % len(up_r))
+                           if up_.get("enabled") else "désactivé (aucun appareil n'ouvre de port seul)",
+                           "warning" if up_.get("enabled") else "info"))
+        dmz = api("/fw/dmz/", session=S) or {}
+        out.append(_mesure("box.dmz", "box", ("ACTIVE : %s reçoit tout ce qui n'est pas redirigé" % dmz.get("ip")) if dmz.get("enabled") else "désactivée",
+                           "warning" if dmz.get("enabled") else "info"))
+        ftp = api("/ftp/config/", session=S) or {}
+        ftp_ouvert = ftp.get("enabled") and ftp.get("allow_remote_access")
+        out.append(_mesure("box.ftp", "box", "FTP de la box OUVERT à Internet%s" % (" (anonyme !)" if ftp.get("allow_anonymous") else "")
+                           if ftp_ouvert else ("actif, de la maison seulement" if ftp.get("enabled") else "éteint"),
+                           "warning" if ftp_ouvert else "info"))
+        vpn = [v.get("name") for v in (api("/vpn/", session=S) or []) if v.get("state") == "started"]
+        out.append(_mesure("box.vpn", "box", ("serveur%s VPN démarré%s : %s" % ("s" if len(vpn) > 1 else "", "s" if len(vpn) > 1 else "", ", ".join(vpn)))
+                           if vpn else "aucun serveur VPN démarré"))
+        # Les redirections : une ligne chacune ; une NOUVELLE (moins de 24 h, hors première prise de connaissance) alerte.
+        redir = [r for r in (api("/fw/redir/", session=S) or []) if r.get("enabled")]
+        vues = {}
+        try:
+            k = get_conn()
+            k.execute("CREATE TABLE IF NOT EXISTS world_meta (cle TEXT PRIMARY KEY, valeur TEXT)")
+            vues = {r[0][len("box_redir:"):]: r[1] for r in k.execute("SELECT cle, valeur FROM world_meta WHERE cle LIKE 'box_redir:%'")}
+            premiere = not vues
+            maint = datetime.now().isoformat()
+            lim = (datetime.now() - timedelta(hours=24)).isoformat()
+            for r in redir:
+                wan = r.get("wan_port_start")
+                fin_ = r.get("wan_port_end")
+                cle = "%s_%s" % (r.get("ip_proto"), wan if wan == fin_ else "%s-%s" % (wan, fin_))
+                if cle not in vues:
+                    vues[cle] = "0000" if premiere else maint
+                    k.execute("INSERT OR REPLACE INTO world_meta (cle, valeur) VALUES (?,?)", ("box_redir:" + cle, vues[cle]))
+                nouvelle = vues[cle] > lim
+                out.append(_mesure("box.redirection.%s" % cle, "box", "%s%s %s → %s:%s%s%s" % (
+                    "NOUVELLE · " if nouvelle else "", r.get("ip_proto"), cle.split("_", 1)[1], r.get("lan_ip"), r.get("lan_port"),
+                    (" (%s)" % (r.get("comment") or r.get("hostname"))) if (r.get("comment") or r.get("hostname")) else "",
+                    (" · seulement depuis %s" % r.get("src_ip")) if r.get("src_ip") not in (None, "", "0.0.0.0") else " · depuis tout Internet"),
+                    "warning" if nouvelle else "info"))
+            k.commit()
+            k.close()
+        except Exception as e:
+            print(f"[BOX] redirections : {e}", file=sys.stderr)
+        out.append(_mesure("box.redirections", "box", ("%d ouverte%s : %s" % (len(redir), "s" if len(redir) > 1 else "", " · ".join(
+            "%s %s → %s" % (r.get("ip_proto"), r.get("wan_port_start"), r.get("comment") or r.get("hostname") or r.get("lan_ip")) for r in redir)))
+                           if redir else "aucune : rien n'entre de dehors"))
+    finally:
+        try:
+            api("/login/logout/", {}, session=S)
+        except Exception:
+            pass
+    return out
+
+
 def collect_mesures_diverses() -> list:
     rows = []
-    for fn in (collect_file_courriel, collect_ssh_echecs, collect_docker_ressources, collect_certbot, collect_journaux_poids, collect_sante_applicative):
+    for fn in (collect_file_courriel, collect_ssh_echecs, collect_docker_ressources, collect_certbot, collect_journaux_poids,
+               collect_sante_applicative, collect_box):
         try:
             rows.extend(fn() or [])
         except Exception as e:
@@ -5068,7 +5192,7 @@ def build_world_model():
         def _diverses(lignes, vus):
             for r in lignes:
                 U(r["cle"], r["categorie"] or "divers", r["valeur"], vus, r["severite"] or "info")
-        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux.", "trafic.", "mysql.", "cassandra."):
+        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux.", "trafic.", "mysql.", "cassandra.", "box."):
             _famille(_pref, _q("SELECT cle, categorie, valeur, severite FROM mesures_diverses WHERE cle LIKE ?", _pref + "%"), _diverses)
 
         # Clés SSH autorisées, une par une : une clé ajoutée ou retirée entre au journal des changements
