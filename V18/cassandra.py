@@ -73186,7 +73186,7 @@ def secure_execute(cmd: str) -> str:
 #   disque / SSL / sécurité = détection + investigation + action sur clic.
 # ============================================================
 _PROACTIVE_LAST = [0.0]
-_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer", "disque.purger")   # seules actions auto-remédiables (réversibles)
+_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer", "disque.purger", "wp.maj", "wp.plugin", "wp.restaurer")   # seules actions auto-remédiables (réversibles)
 
 
 def _detect_disk() -> list:
@@ -73287,6 +73287,293 @@ def _detect_domaines_expiration() -> list:
                         "title": "Le domaine %s expire dans %d jours" % (dom, max(jours, 0)),
                         "detail": "%s expire le %s (registre, par RDAP). À renouveler chez le registraire : tous ses sites s'éteignent le jour dit." % (dom, exp.strftime("%d/%m/%Y")),
                         "suggested_action": "", "action_kind": "diagnostic"})
+    return out
+
+
+# ── Sites WordPress : les quatre gestes que Cassandra peut faire seule (10-10) ──────────────────────────────────────
+# Tout passe par wp-cli, au nom de l'utilisateur du site (jamais en root sur ses fichiers), et chaque geste PROUVE son effet :
+# le site doit répondre après. La mise à jour prend un point de restauration d'abord et revient en arrière si le site tombe.
+_WP_DOM_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,120}$")
+_WP_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,60}$")
+_WP_POINTS = CASSANDRA_DATA_DIR + "/wp-points"
+_WP_CACHE_MAJ = {}              # domaine -> (relevé à, {"coeur": [...], "plugins": [...]})
+_WP_CLE_MAJ = "sites-wordpress/mettre-a-jour-le-cur-et-les-plugins"
+_WP_CLE_PLUGIN = "sites-wordpress/desactiver-un-plugin-fautif"
+_WP_CLE_CACHE = "sites-wordpress/vider-le-cache"
+_WP_CLE_RESTAURE = "sites-wordpress/restaurer-le-site-depuis-une-sauvegarde"
+
+
+def _wp_sites() -> list:
+    """Les sites WordPress de la machine : un wp-config.php sous /var/www/<utilisateur>/data/www/<domaine>/."""
+    import glob, pwd
+    out = []
+    for cfg in sorted(glob.glob("/var/www/*/data/www/*/wp-config.php")):
+        chemin = os.path.dirname(cfg)
+        dom = os.path.basename(chemin).lower()
+        try:
+            user = pwd.getpwuid(os.stat(cfg).st_uid).pw_name
+        except Exception:
+            continue
+        if _WP_DOM_RE.match(dom) and user != "root":
+            out.append({"domaine": dom, "chemin": chemin, "user": user, "logs": os.path.dirname(os.path.dirname(os.path.dirname(chemin))) + "/logs"})
+    return out
+
+
+def _wp_site(dom: str):
+    return next((x for x in _wp_sites() if x["domaine"] == str(dom or "").lower()), None)
+
+
+def _wp(site: dict, args: list, timeout: int = 180, entree: bytes = None) -> tuple:
+    """(code, sortie octets) d'une commande wp-cli au nom de l'utilisateur du site. Les arguments sont une LISTE : rien ne passe par un shell."""
+    cmd = ["runuser", "-u", site["user"], "--", "wp", "--path=" + site["chemin"], "--skip-plugins", "--skip-themes"] + [str(a) for a in args]
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout, input=entree)
+        return p.returncode, (p.stdout or b"") + (b"\n" + p.stderr if p.returncode != 0 else b"")
+    except Exception as e:
+        return 1, str(e).encode()[:300]
+
+
+def _wp_json(site: dict, args: list):
+    rc, out = _wp(site, list(args) + ["--format=json"], timeout=120)
+    try:
+        return json.loads(out.decode("utf-8", "replace").strip() or "[]") if rc == 0 else None
+    except Exception:
+        return None
+
+
+def _wp_point(site: dict, raison: str) -> str:
+    """Un point de restauration : la base (exportée) et les dossiers plugins/thèmes. Rend son identifiant, ou lève une erreur : sans point, pas de mise à jour."""
+    import tarfile, gzip
+    os.makedirs(_WP_POINTS, mode=0o700, exist_ok=True)
+    maintenant = datetime.utcnow()
+    pid = "%s-%s" % (site["domaine"], maintenant.strftime("%Y%m%d-%H%M%S"))
+    while os.path.exists(os.path.join(_WP_POINTS, pid + ".txt")):         # jamais deux points sous le même nom : le second effacerait le premier
+        maintenant += timedelta(seconds=1)
+        pid = "%s-%s" % (site["domaine"], maintenant.strftime("%Y%m%d-%H%M%S"))
+    rc, sql = _wp(site, ["db", "export", "-"], timeout=300)
+    if rc != 0 or not sql.strip():
+        raise RuntimeError("export de la base impossible : %s" % sql.decode("utf-8", "replace")[:120])
+    with gzip.open(os.path.join(_WP_POINTS, pid + ".sql.gz"), "wb") as f:
+        f.write(sql)
+    with tarfile.open(os.path.join(_WP_POINTS, pid + ".fichiers.tar.gz"), "w:gz") as t:
+        for d in ("plugins", "themes"):
+            chemin = os.path.join(site["chemin"], "wp-content", d)
+            if os.path.isdir(chemin):
+                t.add(chemin, arcname=d)
+    for suf in (".sql.gz", ".fichiers.tar.gz"):
+        os.chmod(os.path.join(_WP_POINTS, pid + suf), 0o600)
+    with open(os.path.join(_WP_POINTS, pid + ".txt"), "w", encoding="utf-8") as f:
+        f.write(raison[:200])
+    # on garde les cinq derniers de ce site
+    anciens = sorted(x[:-len(".txt")] for x in os.listdir(_WP_POINTS) if x.startswith(site["domaine"] + "-") and x.endswith(".txt"))
+    for vieux in anciens[:-5]:
+        for suf in (".sql.gz", ".fichiers.tar.gz", ".txt"):
+            try:
+                os.remove(os.path.join(_WP_POINTS, vieux + suf))
+            except OSError:
+                pass
+    return pid
+
+
+def _wp_revenir(site: dict, pid: str) -> tuple:
+    """Restaure un point : la base, puis les dossiers plugins/thèmes (l'ancien dossier est mis de côté, pas effacé)."""
+    import tarfile, gzip, shutil
+    if not re.match(r"^[a-z0-9.-]+-\d{8}-\d{6}$", pid or "") or not pid.startswith(site["domaine"] + "-"):
+        return False, "point de restauration illisible"
+    sql_f = os.path.join(_WP_POINTS, pid + ".sql.gz")
+    tar_f = os.path.join(_WP_POINTS, pid + ".fichiers.tar.gz")
+    if not (os.path.isfile(sql_f) and os.path.isfile(tar_f)):
+        return False, "point de restauration introuvable : %s" % pid
+    with gzip.open(sql_f, "rb") as f:
+        rc, sortie = _wp(site, ["db", "import", "-"], timeout=300, entree=f.read())
+    if rc != 0:
+        return False, "import de la base impossible : %s" % sortie.decode("utf-8", "replace")[:120]
+    contenu = os.path.join(site["chemin"], "wp-content")
+    stamp = datetime.utcnow().strftime("%H%M%S%f")        # unique : deux retours dans la même seconde ne se marchent pas dessus
+    import pwd
+    pw = pwd.getpwnam(site["user"])
+    with tarfile.open(tar_f, "r:gz") as t:
+        tmp = os.path.join(contenu, ".restauration-%s" % stamp)
+        os.makedirs(tmp)
+        for m in t.getmembers():                      # rien ne sort du dossier de restauration
+            if m.name.startswith("/") or ".." in m.name.split("/") or m.issym() or m.islnk():
+                shutil.rmtree(tmp, ignore_errors=True)
+                return False, "archive refusée : chemin suspect"
+        t.extractall(tmp)
+    for d in ("plugins", "themes"):
+        neuf = os.path.join(tmp, d)
+        if not os.path.isdir(neuf):
+            continue
+        for racine, dossiers, fichiers in os.walk(neuf):
+            for n in dossiers + fichiers:
+                try:
+                    os.chown(os.path.join(racine, n), pw.pw_uid, pw.pw_gid)
+                except OSError:
+                    pass
+        cible = os.path.join(contenu, d)
+        if os.path.isdir(cible):
+            os.rename(cible, cible + ".avant-restauration-%s" % stamp)
+        os.rename(neuf, cible)
+        try:
+            os.chown(cible, pw.pw_uid, pw.pw_gid)
+        except OSError:
+            pass
+    shutil.rmtree(tmp, ignore_errors=True)
+    _wp(site, ["cache", "flush"])
+    return True, "base et dossiers restaurés depuis %s" % pid
+
+
+def _aut_wp_cache(dom: str) -> tuple:
+    site = _wp_site(dom)
+    if not site:
+        return False, "site WordPress inconnu : %s" % dom
+    rc, out = _wp(site, ["cache", "flush"])
+    if rc != 0:
+        return False, "cache non vidé : %s" % out.decode("utf-8", "replace")[:120]
+    _wp(site, ["transient", "delete", "--expired"])
+    pr = _http_probe(site["domaine"]) or {}
+    return (True, "cache vidé, le site répond (%s)" % pr.get("code")) if pr.get("ok") else (False, "cache vidé mais le site ne répond pas (%s)" % pr.get("code"))
+
+
+def _aut_wp_plugin(dom: str, slug: str) -> tuple:
+    """Désactive UN plugin, puis prouve que le site répond. Réactivable : `wp plugin activate <slug>`."""
+    site = _wp_site(dom)
+    if not site or not _WP_SLUG_RE.match(slug or ""):
+        return False, "site ou plugin illisible"
+    actifs = _wp_json(site, ["plugin", "list", "--status=active", "--fields=name"]) or []
+    if slug not in {x.get("name") for x in actifs}:
+        return False, "le plugin « %s » n'est pas actif sur %s" % (slug, dom)
+    rc, out = _wp(site, ["plugin", "deactivate", slug])
+    if rc != 0:
+        return False, "désactivation impossible : %s" % out.decode("utf-8", "replace")[:120]
+    _wp(site, ["cache", "flush"])
+    pr = _http_probe(site["domaine"]) or {}
+    if pr.get("ok"):
+        return True, "plugin « %s » désactivé, le site répond de nouveau (%s) · réactivable : wp plugin activate %s" % (slug, pr.get("code"), slug)
+    _wp(site, ["plugin", "activate", slug])             # ça n'a rien réparé : on remet comme c'était
+    return False, "plugin « %s » désactivé mais le site ne répond toujours pas (%s) : réactivé" % (slug, pr.get("code"))
+
+
+def _aut_wp_maj(dom: str) -> tuple:
+    """Met à jour le cœur et les plugins/thèmes. Point de restauration D'ABORD (obligatoire) ; le site doit répondre après, sinon retour en arrière."""
+    site = _wp_site(dom)
+    if not site:
+        return False, "site WordPress inconnu : %s" % dom
+    avant = _wp_json(site, ["plugin", "list", "--update=available", "--fields=name,version,update_version"]) or []
+    coeur = _wp_json(site, ["core", "check-update"]) or []
+    themes = _wp_json(site, ["theme", "list", "--update=available", "--fields=name"]) or []
+    if not (avant or coeur or themes):
+        return True, "rien à mettre à jour sur %s" % dom
+    try:
+        pid = _wp_point(site, "avant mise à jour : %d plugin(s), %d thème(s), cœur %s" % (len(avant), len(themes), "oui" if coeur else "non"))
+    except Exception as e:
+        return False, "pas de point de restauration, pas de mise à jour : %s" % str(e)[:120]
+    faits = []
+    for etape, args in (("cœur", ["core", "update"]), ("base du cœur", ["core", "update-db"]),
+                        ("plugins", ["plugin", "update", "--all"]), ("thèmes", ["theme", "update", "--all"])):
+        if etape == "cœur" and not coeur:
+            continue
+        if etape == "plugins" and not avant:
+            continue
+        if etape == "thèmes" and not themes:
+            continue
+        rc, out = _wp(site, args, timeout=600)
+        if rc != 0:
+            ok_r, det_r = _wp_revenir(site, pid)
+            return False, "échec à l'étape « %s » : %s · retour au point %s : %s" % (etape, out.decode("utf-8", "replace")[:100], pid, det_r)
+        faits.append(etape)
+    _wp(site, ["cache", "flush"])
+    pr = _http_probe(site["domaine"]) or {}
+    if not pr.get("ok"):
+        ok_r, det_r = _wp_revenir(site, pid)
+        return False, "le site ne répond plus après la mise à jour (%s) · retour au point %s : %s" % (pr.get("code"), pid, det_r)
+    return True, "mis à jour (%s), le site répond (%s) · point de restauration %s" % (", ".join(faits), pr.get("code"), pid)
+
+
+def _aut_wp_restaurer(dom: str) -> tuple:
+    """Restaure le site depuis son dernier point de restauration (moins de 24 h). L'état ACTUEL est gardé avant d'être écrasé, et si le
+    site ne répond pas mieux après, on revient à cet état-là."""
+    site = _wp_site(dom)
+    if not site:
+        return False, "site WordPress inconnu : %s" % dom
+    pts = sorted(x[:-len(".txt")] for x in (os.listdir(_WP_POINTS) if os.path.isdir(_WP_POINTS) else [])
+                 if x.startswith(site["domaine"] + "-") and x.endswith(".txt"))
+    pts = [x for x in pts if (datetime.utcnow() - datetime.strptime(x[-15:], "%Y%m%d-%H%M%S")).total_seconds() < 86400]
+    if not pts:
+        return False, "aucun point de restauration de moins de 24 h pour %s" % dom
+    try:
+        actuel = _wp_point(site, "état avant restauration")
+    except Exception as e:
+        return False, "l'état actuel n'a pas pu être gardé, rien n'est écrasé : %s" % str(e)[:100]
+    ok, det = _wp_revenir(site, pts[-1])
+    if not ok:
+        _wp_revenir(site, actuel)
+        return False, "restauration impossible (%s) · état d'avant remis" % det
+    pr = _http_probe(site["domaine"]) or {}
+    if pr.get("ok"):
+        return True, "site restauré depuis %s, il répond (%s) · état d'avant gardé : %s" % (pts[-1], pr.get("code"), actuel)
+    _wp_revenir(site, actuel)
+    return False, "restauré depuis %s mais le site ne répond toujours pas (%s) · état d'avant remis" % (pts[-1], pr.get("code"))
+
+
+def _detect_wordpress() -> list:
+    """Règles « Sites WordPress » : une mise à jour disponible (relevé toutes les 6 h) ; un plugin qui plante le site (erreur fatale
+    qui le nomme dans le journal ET site qui ne répond plus)."""
+    out = []
+    try:
+        sites = _wp_sites()
+    except Exception:
+        return out
+    for site in sites:
+        dom = site["domaine"]
+        t, v = _WP_CACHE_MAJ.get(dom, (0, None))
+        if time.time() - t > 6 * 3600 or v is None:
+            v = {"coeur": _wp_json(site, ["core", "check-update"]) or [],
+                 "plugins": _wp_json(site, ["plugin", "list", "--update=available", "--fields=name"]) or [],
+                 "themes": _wp_json(site, ["theme", "list", "--update=available", "--fields=name"]) or []}
+            _WP_CACHE_MAJ[dom] = (time.time(), v)
+        n = len(v["coeur"]) + len(v["plugins"]) + len(v["themes"])
+        if n:
+            out.append({"fkey": "wp_maj_%s" % dom, "category": "wordpress", "severity": "info",
+                        "title": "WordPress %s : %d mise(s) à jour disponible(s)" % (dom, n),
+                        "detail": "Cœur : %s · plugins : %s · thèmes : %s. Point de restauration pris avant, retour en arrière si le site ne répond plus."
+                                  % (", ".join(x.get("version", "?") for x in v["coeur"]) or "à jour",
+                                     ", ".join(x.get("name", "?") for x in v["plugins"]) or "à jour",
+                                     ", ".join(x.get("name", "?") for x in v["themes"]) or "à jour"),
+                        "suggested_action": "maj-wordpress %s" % dom, "action_kind": "wp.maj"})
+        # le plugin fautif : seulement si le site est en panne MAINTENANT
+        try:
+            pr = _http_probe(dom) or {}
+            if pr.get("ok"):
+                continue
+            actifs = {x.get("name") for x in (_wp_json(site, ["plugin", "list", "--status=active", "--fields=name"]) or [])}
+            for nom_log in ("%s-backend.error.log" % dom, "%s-frontend.error.log" % dom):
+                chemin = os.path.join(site["logs"], nom_log)
+                if not os.path.isfile(chemin):
+                    continue
+                with open(chemin, "rb") as f:
+                    f.seek(max(0, os.path.getsize(chemin) - 60000))
+                    fin = f.read().decode("utf-8", "replace").splitlines()[-300:]
+                coupables = {}
+                for l in fin:
+                    m = re.search(r"PHP (?:Fatal error|Parse error).*?/wp-content/plugins/([a-z0-9._-]+)/", l)
+                    if m and m.group(1) in actifs:
+                        coupables[m.group(1)] = l[:200]
+                for slug, ligne in coupables.items():
+                    out.append({"fkey": "wp_plugin_%s_%s" % (dom, slug), "category": "wordpress", "severity": "critical",
+                                "title": "WordPress %s : le plugin « %s » plante le site" % (dom, slug),
+                                "detail": "Le site ne répond plus et le journal nomme ce plugin : %s" % ligne,
+                                "suggested_action": "desactiver-plugin %s %s" % (dom, slug), "action_kind": "wp.plugin"})
+            if not any(o["fkey"].startswith("wp_plugin_%s_" % dom) for o in out):
+                rc_i, _ = _wp(site, ["core", "is-installed"])
+                rc_d, _ = _wp(site, ["db", "check"], timeout=120)
+                if rc_i != 0 or rc_d != 0:
+                    out.append({"fkey": "wp_restaurer_%s" % dom, "category": "wordpress", "severity": "critical",
+                                "title": "WordPress %s : la base est cassée" % dom,
+                                "detail": "Le site ne répond plus et sa base ne passe pas le contrôle. Restauration depuis le dernier point (moins de 24 h), l'état actuel gardé avant.",
+                                "suggested_action": "restaurer-wordpress %s" % dom, "action_kind": "wp.restaurer"})
+        except Exception as e:
+            logging.info("[WORDPRESS] plugin fautif de %s : %s", dom, e)
     return out
 
 
@@ -73949,6 +74236,7 @@ _PF_DETECTEURS = (
     ("ssh", "Clés SSH", "proactive_watch_ssh", "_detect_cles_ssh_anciennes"),
     ("conteneurs", "Conteneurs", "proactive_watch_containers", "_detect_conteneurs"),
     ("domaines", "Domaines", "proactive_watch_domaines", "_detect_domaines_expiration"),
+    ("wordpress", "Sites WordPress", "proactive_watch_wp", "_detect_wordpress"),
 )
 
 
@@ -74253,16 +74541,19 @@ _AUT_CATALOGUE = [
    ('poser-une-question-aux-agents-invites-par-le-jou', 'Poser une question aux agents invités par le journal des agents', 'ok', 'oui', "ils répondent s'ils sont connectés, rien n'attend leur réponse"),
  ]),
  ('sites-wordpress', 'Sites WordPress', 'Cœur, plugins, cache, restauration.', [
-   ('vider-le-cache', 'Vider le cache', 'ecrire', 'oui', 'aucune'),
-   ('desactiver-un-plugin-fautif', 'Désactiver un plugin fautif', 'ecrire', 'oui', 'réactivable'),
-   ('mettre-a-jour-le-cur-et-les-plugins', 'Mettre à jour le cœur et les plugins', 'ecrire', 'part', 'point de restauration obligatoire'),
-   ('restaurer-le-site-depuis-une-sauvegarde', 'Restaurer le site depuis une sauvegarde', 'ecrire', 'part', 'état actuel gardé avant écrasement'),
+   ('vider-le-cache', 'Vider le cache', 'ok', 'oui', 'aucune'),
+   ('desactiver-un-plugin-fautif', 'Désactiver un plugin fautif', 'ok', 'oui', 'réactivable'),
+   ('mettre-a-jour-le-cur-et-les-plugins', 'Mettre à jour le cœur et les plugins', 'ok', 'part', 'point de restauration obligatoire'),
+   ('restaurer-le-site-depuis-une-sauvegarde', 'Restaurer le site depuis une sauvegarde', 'ok', 'part', 'état actuel gardé avant écrasement'),
  ]),
 ]
 
 # Le geste du catalogue que sait déclencher chaque action_kind du moteur proactif. Les autres restent au
 # palier global, sans disjoncteur : l'ancien comportement.
 _AUT_GESTE_DE_KIND = {
+    "wp.maj": "sites-wordpress/mettre-a-jour-le-cur-et-les-plugins",
+    "wp.plugin": "sites-wordpress/desactiver-un-plugin-fautif",
+    "wp.restaurer": "sites-wordpress/restaurer-le-site-depuis-une-sauvegarde",
     "disque.purger": "machine/purger-journaux-et-caches",
     "conteneur.relancer": "conteneurs/relancer-un-conteneur",
     "ssh.rotation": "rotation-des-secrets/faire-tourner-une-cle-ssh","service.restart": "machine/relancer-un-service",
@@ -76503,6 +76794,29 @@ def proactive_act(fid, auto: bool = False, acteur: str = "") -> dict:
         if not _m:
             return {"ok": False, "error": "commande de relance de conteneur illisible"}
         _ok, out = _aut_relancer_conteneur(_m.group(1))
+        try:
+            log_action("proactive", cmd, out, 0, True, False)
+        except Exception:
+            pass
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            conn.execute("UPDATE proactive_findings SET status='acted', acted_at=datetime('now'), action_result=? WHERE id=?",
+                         (("auto • " if auto else "") + str(out)[:1500], int(fid)))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+        return {"ok": bool(_ok), "output": str(out)[:2000], "gate": ""}
+    if kind in ("wp.maj", "wp.plugin", "wp.restaurer"):
+        _m = (re.match(r"^\s*maj-wordpress\s+([a-z0-9.-]+)\s*$", cmd) if kind == "wp.maj"
+              else (re.match(r"^\s*restaurer-wordpress\s+([a-z0-9.-]+)\s*$", cmd) if kind == "wp.restaurer"
+                    else re.match(r"^\s*desactiver-plugin\s+([a-z0-9.-]+)\s+([a-z0-9._-]+)\s*$", cmd)))
+        if not _m:
+            return {"ok": False, "error": "commande WordPress illisible"}
+        _ok, out = (_aut_wp_maj(_m.group(1)) if kind == "wp.maj" else
+                    (_aut_wp_restaurer(_m.group(1)) if kind == "wp.restaurer" else _aut_wp_plugin(_m.group(1), _m.group(2))))
+        if _ok and kind == "wp.maj" and aut_porte(_WP_CLE_CACHE, _m.group(1), "Vider le cache de %s" % _m.group(1)).get("ok"):
+            _ok2, det2 = _aut_wp_cache(_m.group(1))
+            out += " · cache : " + det2
         try:
             log_action("proactive", cmd, out, 0, True, False)
         except Exception:
