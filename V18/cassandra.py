@@ -73315,7 +73315,7 @@ def _wp_sites() -> list:
         except Exception:
             continue
         if _WP_DOM_RE.match(dom) and user != "root":
-            out.append({"domaine": dom, "chemin": chemin, "user": user, "logs": os.path.dirname(os.path.dirname(os.path.dirname(chemin))) + "/logs"})
+            out.append({"domaine": dom, "chemin": chemin, "user": user, "logs": os.path.dirname(os.path.dirname(chemin)) + "/logs"})
     return out
 
 
