@@ -4506,6 +4506,70 @@ def collect_dns_local() -> list:
         len(noms), "s" if len(noms) > 1 else "", "s" if len(noms) > 1 else "", attendu, " et ".join(ecoutes)))]
 
 
+def collect_outils_securite() -> list:
+    """LES OUTILS DE SÉCURITÉ (10-10) — Lynis, Trivy, ClamAV, CrowdSec, s'ils sont installés : ce qu'ils ont
+    trouvé à leur dernier passage (<données>/securite/<outil>.json, écrit par tools/cassandra_securite_outils.py).
+    Un outil absent n'a pas de mesure ; un résultat trop vieux dit que l'outil ne repasse plus."""
+    dossier = os.path.join(os.environ.get("CASSANDRA_DATA_DIR") or "/var/lib/cassandra", "securite")
+    out = []
+    bin_de = {"lynis": "lynis", "trivy": "trivy", "clamav": "clamscan", "crowdsec": "cscli"}
+    vieux_de = {"lynis": 10, "trivy": 10, "clamav": 10, "crowdsec": 1}       # jours : une semaine de marge
+    for o, b in bin_de.items():
+        if not _qui(b):
+            continue
+        cle = "outil_secu." + o
+        try:
+            with open(os.path.join(dossier, o + ".json"), encoding="utf-8") as f:
+                r = json.load(f)
+        except Exception:
+            out.append(_mesure(cle, "securite", "installé · premier passage à venir"))
+            continue
+        try:
+            age = (datetime.now() - datetime.strptime(r.get("quand", ""), "%Y-%m-%d %H:%M:%S")).days
+        except ValueError:
+            age = 0
+        sev, val = "info", ""
+        if o == "lynis":
+            av = r.get("avertissements") or []
+            val = "score %s/100 · %d avertissement%s · %d conseil%s" % (r.get("score"), len(av), "s" if len(av) > 1 else "",
+                                                                       r.get("suggestions_n", 0), "s" if r.get("suggestions_n", 0) > 1 else "")
+            if av:
+                sev, val = "warning", val + " : " + " ; ".join(a.get("texte", "")[:80] for a in av[:3])
+        elif o == "trivy":
+            I = [i for i in r.get("images") or [] if not i.get("erreur")]
+            crit = sum(i.get("critiques", 0) for i in I)
+            corr = sum(i.get("corrigeables", 0) for i in I)
+            pires = sorted(I, key=lambda i: -i.get("critiques", 0))[:3]
+            val = "%d image%s · %d faille%s critique%s · %d corrigeable%s" % (len(I), "s" if len(I) > 1 else "", crit, "s" if crit > 1 else "",
+                                                                          "s" if crit > 1 else "", corr, "s" if corr > 1 else "")
+            if crit:
+                sev, val = "warning", val + " : " + ", ".join("%s (%d)" % (i["image"], i["critiques"]) for i in pires if i.get("critiques"))
+        elif o == "clamav":
+            inf = r.get("infectes") or []
+            if inf:
+                sev, val = "critical", "%d FICHIER%s INFECTÉ%s : %s" % (len(inf), "S" if len(inf) > 1 else "", "S" if len(inf) > 1 else "",
+                                                                     " ; ".join("%s (%s)" % (x["fichier"], x["menace"]) for x in inf[:3]))
+            else:
+                val = "%s fichiers analysés · aucune menace · signatures du %s" % (r.get("analyses") or "?", r.get("signatures") or "?")
+                try:
+                    if (datetime.now() - datetime.strptime(r.get("signatures") or "", "%Y-%m-%d %H:%M")).days > 3:
+                        sev, val = "warning", val + " (PÉRIMÉES : freshclam ne les met plus à jour)"
+                except ValueError:
+                    pass
+        elif o == "crowdsec":
+            if not (r.get("moteur") and r.get("videur")):
+                sev = "warning"
+                val = "moteur %s · videur %s" % ("actif" if r.get("moteur") else "ARRÊTÉ", "actif" if r.get("videur") else "ARRÊTÉ")
+            else:
+                val = "%d bannie%s ici · %d dans la liste communautaire · %d alerte%s en 24 h" % (
+                    r.get("decisions_locales", 0), "s" if r.get("decisions_locales", 0) > 1 else "", r.get("liste_communautaire", 0),
+                    r.get("alertes_24h", 0), "s" if r.get("alertes_24h", 0) > 1 else "")
+        if age > vieux_de[o]:
+            sev, val = ("warning" if sev == "info" else sev), val + " — dernier passage il y a %d jours : il ne repasse plus" % age
+        out.append(_mesure(cle, "securite", val, sev))
+    return out
+
+
 _DOMAINES_CACHE = {"t": 0, "d": []}
 _DKIM_SELECTEURS = ("default", "dkim", "mail", "selector1", "selector2", "google", "k1", "s1", "s2",
                     "ovhmo-selector-1", "ovhmo-selector-2", "ovhex", "fm1", "mxvault")
@@ -4788,7 +4852,7 @@ def collect_mesures_diverses() -> list:
     rows = []
     for fn in (collect_file_courriel, collect_ssh_echecs, collect_docker_ressources, collect_certbot, collect_journaux_poids,
                collect_sante_applicative, collect_box, collect_tailnet, collect_fail2ban_prisons,
-               collect_courriel_domaines, collect_images_docker, collect_dns_local):
+               collect_courriel_domaines, collect_images_docker, collect_dns_local, collect_outils_securite):
         try:
             rows.extend(fn() or [])
         except Exception as e:
@@ -5458,7 +5522,7 @@ def build_world_model():
         def _diverses(lignes, vus):
             for r in lignes:
                 U(r["cle"], r["categorie"] or "divers", r["valeur"], vus, r["severite"] or "info")
-        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux.", "trafic.", "mysql.", "cassandra.", "box.", "tailnet.", "prison.", "domaine_courriel.", "image.", "dns_local"):
+        for _pref in ("courriel.", "ssh.", "conteneur_ressources.", "certbot.", "journaux.", "trafic.", "mysql.", "cassandra.", "box.", "tailnet.", "prison.", "domaine_courriel.", "image.", "dns_local", "outil_secu."):
             _famille(_pref, _q("SELECT cle, categorie, valeur, severite FROM mesures_diverses WHERE cle LIKE ?", _pref + "%"), _diverses)
 
         # Clés SSH autorisées, une par une : une clé ajoutée ou retirée entre au journal des changements

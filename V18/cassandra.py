@@ -78767,7 +78767,7 @@ def _flotte_sensorium_boucle() -> None:
 SENSORIUM_NOTIF_APRES_S = 600
 # La sécurité n'attend pas dix minutes : une clé SSH apparue se dit tout de suite.
 _SENSORIUM_IMMEDIAT = ("cle_ssh.", "box.redirection.", "box.upnp", "box.dmz", "box.acces_distant",
-                       "tailnet.nouveau.", "tailnet.partage", "pare_feu.socle")   # ce qui ouvre la maison : tout de suite
+                       "tailnet.nouveau.", "tailnet.partage", "pare_feu.socle", "outil_secu.clamav")   # ce qui ouvre la maison, un virus : tout de suite
 SENSORIUM_FERMER_APRES_S = 120
 _SENSORIUM_CRITIQUES = ("stockage.", "montage.", "web.", "controle.tls.", "systemd.failed_units")
 
@@ -78902,6 +78902,9 @@ def _sensorium_libelle(wkey: str) -> str:
         return "%s — %s" % (m.capitalize(), _sn_mots(quoi)) if quoi else m.capitalize()
     if fam == "tailnet" and reste.startswith("nouveau."):
         return "Tailnet — nouvel appareil %s" % reste.split(".", 1)[1]
+    if fam == "outil_secu":
+        return {"lynis": "Lynis — audit de durcissement", "trivy": "Trivy — failles des images Docker",
+                "clamav": "ClamAV — antivirus", "crowdsec": "CrowdSec — attaquants bloqués"}.get(reste, "Outil de sécurité " + reste)
     if fam in ("prison", "domaine_courriel", "image"):
         return "%s %s" % (noms[fam], reste)
     if fam == "box" and reste.startswith("appareil."):
@@ -88201,6 +88204,79 @@ def _sec_cage() -> dict:
     return out
 
 
+# LES OUTILS DE SÉCURITÉ (10-10) — Lynis, Trivy, ClamAV, CrowdSec : optionnels, jamais requis. Un seul programme
+# les installe et les fait passer (tools/cassandra_securite_outils.py, appelé aussi par install.sh) ; Cassandra
+# lit ce qu'ils déposent dans <données>/securite/<outil>.json.
+_SECU_OUTILS = {
+    "lynis": {"nom": "Lynis", "role": "Audit de durcissement du système, chaque semaine : un score et des conseils."},
+    "trivy": {"nom": "Trivy", "role": "Failles connues dans les images Docker, chaque semaine."},
+    "clamav": {"nom": "ClamAV", "role": "Antivirus des fichiers venus de l'extérieur (sites, documents, dossiers personnels), chaque semaine."},
+    "crowdsec": {"nom": "CrowdSec", "role": "Bloque les attaquants repérés ici et ceux que sa communauté signale ; réseaux de confiance jamais bannis."},
+}
+
+
+def _secu_outils_chemin() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "cassandra_securite_outils.py")
+
+
+def _secu_outils_dossier() -> str:
+    return os.path.join(CASSANDRA_DATA_DIR, "securite")
+
+
+def secu_outils_etat() -> dict:
+    """{outil: {nom, role, installe, version, convient, pourquoi, services, minuterie, en_cours, resultat: {...}}}"""
+    out = {k: dict(v, installe=False, present=False) for k, v in _SECU_OUTILS.items()}
+    chemin = _secu_outils_chemin()
+    if not os.path.exists(chemin):
+        return out
+    ok, sortie = _sec_sortie(["python3", chemin, "etat"], timeout=40)
+    try:
+        etat = json.loads(sortie.strip().splitlines()[-1]) if ok else {}
+    except (ValueError, IndexError):
+        etat = {}
+    for k in out:
+        out[k]["present"] = True
+        out[k].update(etat.get(k) or {})
+        try:
+            with open(os.path.join(_secu_outils_dossier(), k + ".json"), encoding="utf-8") as f:
+                out[k]["resultat"] = json.load(f)
+        except Exception:
+            out[k]["resultat"] = None
+    return out
+
+
+def _secu_outils_resume(k: str, o: dict) -> tuple:
+    """(niveau, texte) de l'outil `k`, pour l'écran et le verdict."""
+    if not o.get("installe"):
+        return ("", "non installé" + (" · " + o["pourquoi"] if not o.get("convient", True) and o.get("pourquoi") else ""))
+    r = o.get("resultat") or {}
+    if not r:
+        return ("pas_encore", "installé · premier passage à venir")
+    if k == "lynis":
+        av = len(r.get("avertissements") or [])
+        return ("regarder" if av else "ok", "score %s/100 · %d avertissement%s · %d conseil%s" % (
+            r.get("score") if r.get("score") is not None else "?", av, "s" if av > 1 else "", r.get("suggestions_n", 0), "s" if r.get("suggestions_n", 0) > 1 else ""))
+    if k == "trivy":
+        I = r.get("images") or []
+        crit = sum(i.get("critiques", 0) for i in I)
+        corr = sum(i.get("corrigeables", 0) for i in I)
+        return ("regarder" if crit else "ok", "%d image%s · %d faille%s critique%s · %d corrigeable%s par une mise à jour" % (
+            len(I), "s" if len(I) > 1 else "", crit, "s" if crit > 1 else "", "s" if crit > 1 else "", corr, "s" if corr > 1 else ""))
+    if k == "clamav":
+        n = len(r.get("infectes") or [])
+        if n:
+            return ("panne", "%d FICHIER%s INFECTÉ%s" % (n, "S" if n > 1 else "", "S" if n > 1 else ""))
+        return ("regarder" if r.get("erreur") else "ok", "%s fichiers analysés · aucune menace · signatures du %s" % (
+            r.get("analyses") if r.get("analyses") is not None else "?", r.get("signatures") or "?"))
+    if k == "crowdsec":
+        if not (r.get("moteur") and r.get("videur")):
+            return ("panne", "moteur %s · videur %s" % ("actif" if r.get("moteur") else "ARRÊTÉ", "actif" if r.get("videur") else "ARRÊTÉ"))
+        return ("ok", "%d adresse%s bannie%s ici · %d de la liste communautaire · %d alerte%s en 24 h" % (
+            r.get("decisions_locales", 0), "s" if r.get("decisions_locales", 0) > 1 else "", "s" if r.get("decisions_locales", 0) > 1 else "",
+            r.get("liste_communautaire", 0), r.get("alertes_24h", 0), "s" if r.get("alertes_24h", 0) > 1 else ""))
+    return ("", "")
+
+
 def _sec_verdict(d: dict) -> dict:
     """Le verdict se CALCULE sur les mesures ; le modèle n'y touche pas."""
     expo = d["exposition"]
@@ -88282,6 +88358,19 @@ def _sec_verdict(d: dict) -> dict:
              maj["securite_en_attente"], "s" if maj["securite_en_attente"] > 1 else "",
              "correctifs automatiques" if maj["auto_actif"] else "rien d'automatique",
              "conforme" if not maj["noyau_ecarts"] else "%d écart%s" % (len(maj["noyau_ecarts"]), "s" if len(maj["noyau_ecarts"]) > 1 else ""))}]
+    O = d.get("outils") or {}
+    if O:
+        inst = [k for k, o in O.items() if o.get("installe")]
+        pire = "panne" if any(O[k].get("niveau") == "panne" for k in inst) else \
+               "regarder" if any(O[k].get("niveau") == "regarder" for k in inst) else ("ok" if inst else "")
+        familles.append({"page": "outils", "niveau": pire, "lib": "Outils de sécurité", "n": len(inst),
+                         "dit": "%d sur %d installé%s%s" % (len(inst), len(O), "s" if len(inst) > 1 else "",
+                                                           (" · " + ", ".join(_SECU_OUTILS[k]["nom"] for k in inst)) if inst else " · Lynis, Trivy, ClamAV, CrowdSec")})
+        if pire == "panne":
+            sous.insert(0, " ".join("%s : %s." % (_SECU_OUTILS[k]["nom"], O[k]["dit"]) for k in inst if O[k].get("niveau") == "panne"))
+            if niveau != "panne":
+                niveau = "panne"
+                titre = "Un outil de sécurité a trouvé un problème."
     return {"niveau": niveau, "titre": titre, "sous": " ".join(sous), "chiffres": chiffres, "familles": familles}
 
 
@@ -88304,10 +88393,13 @@ def securite_etat(compte: str = "", force: bool = False, ip: str = "") -> dict:
             conf = {}
         d = {"ok": True, "machine": machine, "parefeu": fw, "exposition": _sec_exposition(_sec_ecoutes(), machine, fw),
              "box_redirections": _sec_box_redirections() if not machine.get("public_v4") else None,
+             "outils": secu_outils_etat(),
              "ssh": _sec_ssh(), "comptes": comptes, "cles_fichiers": _sec_cles_de(sorted(set(["root"] + comptes["sudo"]))),
              "cles": cles, "fail2ban": _sec_fail2ban(), "maj": _sec_maj(), "cage": _sec_cage(),
              "confinement": conf, "mesure": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
              "hote": socket.gethostname()}
+        for _k, _o in d["outils"].items():
+            _o["niveau"], _o["dit"] = _secu_outils_resume(_k, _o)
         d["verdict"] = _sec_verdict(d)
         _SEC_CACHE.update({"t": maintenant, "d": d})
         d = dict(d)
@@ -88450,6 +88542,20 @@ def securite_geste(data: dict, sid: str, user: str) -> dict:
                                      "apt-get install -y unattended-upgrades\n"
                                      "printf 'APT::Periodic::Update-Package-Lists \"1\";\\nAPT::Periodic::Unattended-Upgrade \"1\";\\n'"
                                      " > /etc/apt/apt.conf.d/20auto-upgrades\n")
+    elif g.startswith("outil:"):
+        # « outil:installer:clamav », « outil:lancer:lynis » — par le même programme qu'install.sh, hors de la cage.
+        _x, quoi, outil = (g.split(":") + ["", ""])[:3]
+        chemin = _secu_outils_chemin()
+        if quoi not in ("installer", "lancer") or outil not in _SECU_OUTILS:
+            r = {"ok": False, "error": "geste d'outil inconnu"}
+        elif not os.path.exists(chemin):
+            r = {"ok": False, "error": "programme des outils absent (%s) : relancez install.sh" % chemin}
+        else:
+            import shlex
+            r = _sys_detache("secu-%s-%s" % (quoi, outil),
+                             "export CASSANDRA_DATA_DIR=%s CASSANDRA_CONF_DIR=%s\n/usr/bin/python3 %s %s %s\n" % (
+                                 shlex.quote(CASSANDRA_DATA_DIR), shlex.quote(CASSANDRA_CONF_DIR),
+                                 shlex.quote(chemin), quoi, outil))
     elif g == "debannir":
         jail, ip = str(data.get("jail") or ""), str(data.get("ip") or "")
         valide = False
@@ -105678,6 +105784,7 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
           <button class="mx-item sc-item" type="button" data-page="parefeu" onclick="scAller('parefeu')" title="Pare-feu"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="1.5"/><path d="M3 10h18M3 15h18M9 5v5M15 10v5M9 15v4"/></svg></span><span class="nm">Pare-feu</span><span class="mx-st" id="sc-n-parefeu"></span><span class="mx-dot" id="sc-d-parefeu"></span></button>
           <button class="mx-item sc-item" type="button" data-page="acces" onclick="scAller('acces')" title="Accès"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="12" r="3.5"/><path d="M11.5 12H21M17 12v3M20 12v2"/></svg></span><span class="nm">Accès</span><span class="mx-st" id="sc-n-acces"></span><span class="mx-dot" id="sc-d-acces"></span></button>
           <button class="mx-item sc-item" type="button" data-page="defenses" onclick="scAller('defenses')" title="Défenses"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 5-3.5 8-7 10-3.5-2-7-5-7-10V6z"/></svg></span><span class="nm">Défenses</span><span class="mx-st" id="sc-n-defenses"></span><span class="mx-dot" id="sc-d-defenses"></span></button>
+          <button class="mx-item sc-item" type="button" data-page="outils" onclick="scAller('outils')" title="Outils de sécurité"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/></svg></span><span class="nm">Outils</span><span class="mx-st" id="sc-n-outils"></span><span class="mx-dot" id="sc-d-outils"></span></button>
           <button class="mx-item sc-item" type="button" data-page="maj" onclick="scAller('maj')" title="Mises à jour et noyau"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7a8 8 0 0 0-14.5 1M4 17a8 8 0 0 0 14.5-1"/><path d="M20 3v4h-4M4 21v-4h4"/></svg></span><span class="nm">Mises à jour et noyau</span><span class="mx-st" id="sc-n-maj"></span><span class="mx-dot" id="sc-d-maj"></span></button>
           <button class="mx-item sc-item" type="button" data-page="journal" onclick="scAller('journal')" title="Journal"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h14v16H5z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg></span><span class="nm">Journal</span><span class="mx-st" id="sc-n-journal"></span><span class="mx-dot" id="sc-d-journal"></span></button>
           <button class="mx-item sc-item" type="button" data-page="audit" onclick="scAller('audit')" title="Audit commenté"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v11H9l-5 4z"/><path d="M8 9h8M8 12h5"/></svg></span><span class="nm">Audit commenté</span><span class="mx-st" id="sc-n-audit"></span><span class="mx-dot" id="sc-d-audit"></span></button>
@@ -105766,6 +105873,14 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
           </section>
           <section class="mx-sec" id="sc-s-cage"><div class="mx-chart-h"><h2>La cage</h2><span class="mx-meta">24 dernières heures</span></div><dl class="mx-paires" id="sc-cage"></dl></section>
         </div>
+
+        <section class="mx-sec" data-page="outils" id="sc-s-outils" hidden>
+          <div class="mx-chart-h"><h2>Outils de sécurité</h2><span class="mx-meta" id="sc-outils-meta">open source · optionnels</span></div>
+          <p class="mx-prose">Des outils éprouvés que Cassandra installe, programme et lit — jamais requis : sans eux, elle dit simplement « non installé ». Le même programme sert à l’installeur. Rien n’est jamais supprimé : un fichier infecté est signalé, la décision vous revient.</p>
+          <div class="mx-rows" id="sc-outils"></div>
+          <span class="s-hint" id="sc-outils-msg"></span>
+          <div id="sc-outils-det"></div>
+        </section>
 
         <section class="mx-sec" data-page="maj" id="sc-s-maj" hidden>
           <div class="mx-chart-h"><h2>Mises à jour et noyau</h2><span class="mx-meta">apt · unattended-upgrades · sysctl</span></div>
@@ -115438,7 +115553,7 @@ function cronPollBadge(){
 // Une page par entrée du rail. Tout se lit dans /api/securite (mesuré, en cache 45 s côté serveur) ;
 // chaque geste passe par /api/securite/geste derrière le mot de passe administrateur.
 const SC = {d: null, page: 'verdict', filtre: 'tout', flux: null, audits: null, veille: null};
-const SC_PAGES = ['verdict','exposition','parefeu','acces','defenses','maj','journal','audit','ailleurs'];
+const SC_PAGES = ['verdict','exposition','parefeu','acces','defenses','outils','maj','journal','audit','ailleurs'];
 const SC_NIV = {ok: 'ok', regarder: 'warn', panne: 'danger', stable: 'ok'};
 function scP(niv, txt){ return '<span class="mx-pill ' + ({ok:'ok', stable:'ok', regarder:'regarder', panne:'panne', info:'pas_encore'}[niv] || '') + '">' + mxE(txt) + '</span>'; }
 function scL(pill, titre, sous, gest){ return '<div class="mx-row">' + pill + '<div class="mx-rt"><b>' + titre + '</b><span>' + (sous || '') + '</span></div><div class="mx-gest">' + (gest || '') + '</div></div>'; }
@@ -115502,7 +115617,7 @@ function scPeindre(){
     dot('verdict', V.niveau, 0);
     fam.forEach(function(f){ dot(f.page, f.niveau, f.niveau === 'ok' ? 0 : f.n); });
     dot('ailleurs', (A.mes_cles ? '' : 'regarder'), 0);
-    scExposition(); scParefeu(); scAcces(); scDefenses(); scMaj(); scAilleurs();
+    scExposition(); scParefeu(); scAcces(); scDefenses(); scOutils(); scMaj(); scAilleurs();
     scTexte('sc-audit-go', d.audit_en_cours ? 'Rédaction en cours…' : 'Rédiger un nouvel audit');
     const go = document.getElementById('sc-audit-go'); if (go) go.disabled = !!d.audit_en_cours;
 }
@@ -115738,6 +115853,57 @@ function scDefenses(){
     scHtml('sc-cage', '<dt>Commandes en cage</dt><dd class="mono">' + (cg.commandes_24h || 0) + '</dd><dt>Vetos</dt><dd class="mono">' + (cg.vetos_24h || 0) + (cg.vetos_24h ? ' · <a class="sc-lien" onclick="scFiltre(\'cage\'); scAller(\'journal\')">voir</a>' : '') + '</dd>'
         + '<dt>Sorties caviardées</dt><dd class="mono">' + (cg.caviardages_24h || 0) + '</dd><dt>Gestes d’invités</dt><dd class="mono">' + (cg.gestes_invites_24h || 0) + '</dd>');
 }
+// LES OUTILS DE SÉCURITÉ (10-10) : chacun installé par le même programme qu'install.sh, puis lu ici.
+const SC_OUTILS_X = {
+    lynis: 'Lynis s’installe depuis les paquets du système et audite la machine chaque dimanche nuit. Il ne change rien : il note et conseille.',
+    trivy: 'Trivy s’installe depuis le dépôt officiel d’Aqua Security et analyse chaque dimanche les images Docker présentes. Il ne change rien.',
+    clamav: 'ClamAV s’installe depuis les paquets du système ; son démon garde environ 1,5 Go de mémoire. Il analyse chaque samedi nuit les sites, les dossiers personnels et les données de Cassandra. Rien n’est supprimé : il signale.',
+    crowdsec: 'CrowdSec s’installe depuis son dépôt officiel, avec son « videur » dans le pare-feu. Il bannit les adresses qui attaquent ici et applique la liste de sa communauté ; en échange, les adresses des attaquants repérés ici lui sont signalées. Les réseaux locaux, Tailscale et votre adresse publique ne sont jamais bannis.'};
+['lynis', 'trivy', 'clamav', 'crowdsec'].forEach(function(k){
+    const nom = {lynis: 'Lynis', trivy: 'Trivy', clamav: 'ClamAV', crowdsec: 'CrowdSec'}[k];
+    SC_GESTES['outil:installer:' + k] = {t: 'Installer ' + nom, x: SC_OUTILS_X[k] + ' L’installation tourne en arrière-plan (quelques minutes) ; l’écran se relit seul.', ok: 'Installer', fb: 'sc-outils-msg'};
+    SC_GESTES['outil:lancer:' + k] = {t: 'Lancer ' + nom + ' maintenant', x: 'Un passage tout de suite, sans attendre le prochain programmé. Il tourne en arrière-plan.', ok: 'Lancer', fb: 'sc-outils-msg'};
+});
+function scOutils(){
+    const O = SC.d.outils || {}, K = ['lynis', 'trivy', 'clamav', 'crowdsec'];
+    const lib = {ok: 'BON', regarder: 'À REGARDER', panne: 'ALERTE', pas_encore: 'INSTALLÉ'};
+    const inst = K.filter(function(k){ return (O[k] || {}).installe; });
+    scTexte('sc-outils-meta', inst.length + ' sur ' + K.length + ' installé' + (inst.length > 1 ? 's' : '') + ' · open source');
+    scHtml('sc-outils', K.map(function(k){
+        const o = O[k] || {}; if (!o.nom) return '';
+        let g = '';
+        if (o.present && !o.installe) g = o.convient === false
+                ? '<span class="s-hint" style="margin:0">' + mxE(o.pourquoi || 'ne convient pas à cette machine') + '</span>' + scB('Installer quand même', "scGeste('outil:installer:" + k + "')")
+                : scB('Installer', "scGeste('outil:installer:" + k + "')", 'primary');
+        else if (o.installe) g = o.en_cours ? '<span class="s-hint" style="margin:0">passage en cours…</span>' : scB('Lancer maintenant', "scGeste('outil:lancer:" + k + "')");
+        const r = o.resultat || {};
+        return scL(scP(o.installe ? (o.niveau || 'pas_encore') : '', o.installe ? (lib[o.niveau] || 'INSTALLÉ') : 'ABSENT'),
+                   mxE(o.nom) + (o.version ? ' <span class="sc-mono">' + mxE(o.version) + '</span>' : ''),
+                   mxE(o.role || '') + '<br>' + mxE(o.dit || '') + (r.quand ? ' · <i>dernier passage ' + mxE(String(r.quand).slice(0, 16)) + '</i>' : '')
+                   + (o.present ? '' : '<br><i>Programme des outils absent : relancez install.sh.</i>'), g);
+    }).join(''));
+    let h = '';
+    const ly = (O.lynis || {}).resultat;
+    if (ly && ((ly.avertissements || []).length || (ly.suggestions || []).length))
+        h += '<details class="sc-details"' + ((ly.avertissements || []).length ? ' open' : '') + '><summary>Lynis — ' + (ly.avertissements || []).length + ' avertissement(s), ' + (ly.suggestions_n || 0) + ' conseil(s)</summary><div class="mx-rows">'
+           + (ly.avertissements || []).map(function(a){ return scL(scP('regarder', a.id), mxE(a.texte), mxE(a.detail || ''), ''); }).join('')
+           + (ly.suggestions || []).slice(0, 15).map(function(a){ return scL(scP('', a.id), mxE(a.texte), mxE(a.detail || ''), ''); }).join('') + '</div></details>';
+    const tv = (O.trivy || {}).resultat;
+    if (tv && (tv.images || []).length)
+        h += '<details class="sc-details"><summary>Trivy — failles par image</summary><div class="mx-rows">' + tv.images.map(function(i){
+            return i.erreur ? scL(scP('regarder', 'ILLISIBLE'), mxE(i.image), mxE(i.erreur), '')
+                 : scL(scP(i.critiques ? 'regarder' : 'ok', i.critiques + ' CRIT.'), mxE(i.image), i.hautes + ' haute(s) · ' + i.corrigeables + ' corrigeable(s)'
+                       + ((i.exemples || []).length ? '<br><span class="sc-mono">' + mxE(i.exemples.slice(0, 4).map(function(e){ return e.id + ' ' + e.paquet + (e.corrigee_en ? ' → ' + e.corrigee_en : ''); }).join(' · ')) + '</span>' : ''), ''); }).join('') + '</div></details>';
+    const cl = (O.clamav || {}).resultat;
+    if (cl && (cl.infectes || []).length)
+        h += '<details class="sc-details" open><summary>ClamAV — fichiers infectés (rien n’a été supprimé)</summary><div class="mx-rows">' + cl.infectes.map(function(f){ return scL(scP('panne', 'MENACE'), '<span class="sc-mono">' + mxE(f.fichier) + '</span>', mxE(f.menace), ''); }).join('') + '</div></details>';
+    const cs = (O.crowdsec || {}).resultat;
+    if (cs && ((cs.bannies || []).length || (cs.scenarios_24h || []).length))
+        h += '<details class="sc-details"><summary>CrowdSec — bannies ici et attaques des dernières 24 h</summary><div class="mx-rows">'
+           + (cs.scenarios_24h || []).map(function(x){ return scL(scP('', x.n + '×'), mxE(x.scenario), 'alertes en 24 h', ''); }).join('')
+           + (cs.bannies || []).slice(0, 30).map(function(b){ return scL(scP('regarder', 'BANNIE'), '<span class="sc-mono">' + mxE(b.ip) + '</span>', mxE(b.raison + (b.expire ? ' · encore ' + b.expire : '')), ''); }).join('') + '</div></details>';
+    scHtml('sc-outils-det', h);
+}
 function scMaj(){
     const m = SC.d.maj || {}, N = m.noyau || [], ec = m.noyau_ecarts || [], fe = m.services_en_echec || [];
     scHtml('sc-maj',
@@ -115840,7 +116006,7 @@ const SN_FAMILLES = [
   ['reseau','Réseau','interface.|port.'], ['stockage','Stockage','stockage.'], ['securite','Sécurité','security.'],
   ['maj','Mises à jour','maj.'], ['courriel','Courriel','courriel.|domaine_courriel.'], ['acces','Accès et pare-feu','ssh.|cle_ssh.|pare_feu.|fail2ban.|prison.'],
   ['cron','Tâches planifiées','cron.'], ['fastpanel','FastPanel','fastpanel.'], ['erreurs','Erreurs des journaux','erreurs.|journaux.'],
-  ['certbot','Renouvellement des certificats','certbot.'], ['box','La box','box.|dns_local'], ['tailnet','Tailnet','tailnet.'], ['capteur','Capteurs','capteur.'], ['sante','Santé','health.']
+  ['certbot','Renouvellement des certificats','certbot.'], ['box','La box','box.|dns_local'], ['outils','Outils de sécurité','outil_secu.'], ['tailnet','Tailnet','tailnet.'], ['capteur','Capteurs','capteur.'], ['sante','Santé','health.']
 ];
 function _snE(t){ return (typeof flE==='function') ? flE(t) : String(t==null?'':t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function _snFam(wk){ for(const f of SN_FAMILLES){ if(f[2].split('|').some(p=>wk.startsWith(p))) return f[0]; } return 'autre'; }

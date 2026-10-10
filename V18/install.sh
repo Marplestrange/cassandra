@@ -21,6 +21,8 @@
 #                         port libre auto, URL renseignée dans la config. Zéro manip YAML.
 #     WIPE_ALL=1        → EFFACE TOUT (code + clés + mémoire + coffre Vaultwarden).
 #     KEEP_VAULT=1      → avec WIPE_ALL : CONSERVE le coffre Vaultwarden et ses secrets.
+#     WITH_SECU=...     → outils de sécurité sans question : defaut | aucun | lynis,trivy,clamav,crowdsec
+#                         (par défaut, l'installeur DEMANDE, outil par outil)
 #
 #  L'agent se configure ensuite dans le navigateur (http://IP:9000).
 # ============================================================
@@ -69,7 +71,7 @@ run_spin() {
 }
 fmt_elapsed() { local s=$(( $(date +%s) - _T0 )); printf "%dm%02ds" $(( s / 60 )) $(( s % 60 )); }
 
-STEP_N=0; STEP_TOTAL="${STEP_TOTAL:-9}"
+STEP_N=0; STEP_TOTAL="${STEP_TOTAL:-11}"
 step() {
   STEP_N=$((STEP_N + 1))
   local filled=$(( STEP_N * 18 / STEP_TOTAL )) bar="" j=0
@@ -1371,6 +1373,67 @@ PYSX
   fi
 else
   say "WITH_SEARXNG=0 → recherche web d'Itare non déployée (active-la : sudo WITH_SEARXNG=1 bash install.sh)."
+fi
+
+step "Outils de sécurité (open source, optionnels)"
+# LES OUTILS DE SÉCURITÉ (10-10) — Lynis, Trivy, ClamAV, CrowdSec. Le MÊME programme que le bouton « Installer »
+# de l'onglet Sécurité (tools/cassandra_securite_outils.py) : une seule façon de les installer. Aucun n'est
+# requis : sans eux, Cassandra dit « non installé ». Déjà installés, ils sont remis à jour sans question.
+# Réponse forçable : WITH_SECU=defaut (les choix par défaut) · WITH_SECU=aucun · WITH_SECU=lynis,trivy,…
+SECU_TOOL="$APP_DIR/tools/cassandra_securite_outils.py"
+if [ ! -f "$SECU_TOOL" ] || [ "$APT_OK" -ne 1 ]; then
+  warn "Outils de sécurité ignorés (programme absent ou apt indisponible)."
+else
+  _secu_env=(env CASSANDRA_DATA_DIR="$DATA_DIR" CASSANDRA_CONF_DIR="$CFG_DIR")
+  _secu_deja="$("${_secu_env[@]}" python3 "$SECU_TOOL" etat 2>/dev/null \
+    | python3 -c 'import json,sys; print(" ".join(k for k, v in json.load(sys.stdin).items() if v.get("installe")))' 2>/dev/null || true)"
+  _secu_defaut() {   # 1 si l'outil est coché par défaut sur cette machine
+    case "$1" in
+      lynis)  echo 1 ;;
+      trivy)  command -v docker >/dev/null 2>&1 && echo 1 || echo 0 ;;
+      clamav) "${_secu_env[@]}" python3 "$SECU_TOOL" convient clamav >/dev/null 2>&1 && echo 1 || echo 0 ;;
+      *)      echo 0 ;;
+    esac
+  }
+  _secu_role() {
+    case "$1" in
+      lynis)    echo "Lynis — audit de durcissement chaque semaine (score + conseils, ne change rien)" ;;
+      trivy)    echo "Trivy — failles connues dans les images Docker, chaque semaine" ;;
+      clamav)   echo "ClamAV — antivirus des sites, dossiers personnels et données (~1,5 Go de mémoire)" ;;
+      crowdsec) echo "CrowdSec — bloque les attaquants ; partage leurs adresses avec sa communauté" ;;
+    esac
+  }
+  SECU_CHOIX=""
+  for _o in lynis trivy clamav crowdsec; do
+    _d="$(_secu_defaut "$_o")"
+    case " $_secu_deja " in *" $_o "*) SECU_CHOIX="$SECU_CHOIX $_o"; continue ;; esac
+    if [ -n "${WITH_SECU:-}" ]; then
+      case ",${WITH_SECU}," in
+        *,aucun,*) ;;
+        *,defaut,*) [ "$_d" = "1" ] && SECU_CHOIX="$SECU_CHOIX $_o" ;;
+        *",$_o,"*) SECU_CHOIX="$SECU_CHOIX $_o" ;;
+      esac
+    elif [ -e /dev/tty ]; then
+      _ans=""
+      if [ "$_d" = "1" ]; then _q="[O/n]"; else _q="[o/N]"; fi
+      read -r -p "   > $(_secu_role "$_o") ? $_q " _ans </dev/tty 2>/dev/tty || _ans=""
+      case "${_ans:-}" in
+        [oOyY]*) SECU_CHOIX="$SECU_CHOIX $_o" ;;
+        [nN]*)   ;;
+        *)       [ "$_d" = "1" ] && SECU_CHOIX="$SECU_CHOIX $_o" ;;
+      esac
+    else
+      [ "$_d" = "1" ] && SECU_CHOIX="$SECU_CHOIX $_o"
+    fi
+  done
+  if [ -z "${SECU_CHOIX// /}" ]; then
+    say "Aucun outil de sécurité choisi — ils s'installent plus tard depuis l'onglet Sécurité › Outils."
+  fi
+  for _o in $SECU_CHOIX; do
+    run_spin "$(_secu_role "$_o" | cut -d' ' -f1) : installation, programmation, premier passage" \
+      "${_secu_env[@]}" python3 "$SECU_TOOL" installer "$_o" \
+      || warn "$_o non installé — réessayez depuis l'onglet Sécurité › Outils."
+  done
 fi
 
 step "Ressources : swap, tuning mémoire, sémantique"
