@@ -73426,7 +73426,7 @@ def secure_execute(cmd: str) -> str:
 #   disque / SSL / sécurité = détection + investigation + action sur clic.
 # ============================================================
 _PROACTIVE_LAST = [0.0]
-_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer", "disque.purger", "wp.maj", "wp.plugin", "wp.restaurer", "secret.rotation", "sauvegarde.plan")   # seules actions auto-remédiables (réversibles)
+_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer", "disque.purger", "wp.maj", "wp.plugin", "wp.restaurer", "secret.rotation", "sauvegarde.plan", "sauvegarde.horssite")   # seules actions auto-remédiables (réversibles)
 
 
 def _detect_disk() -> list:
@@ -73947,6 +73947,123 @@ def _aut_creer_plan_sauvegarde() -> tuple:
         threading.Thread(target=_premier, daemon=True, name="premiere-sauvegarde").start()
         notes.append("première exécution lancée en arrière-plan")
     return True, " · ".join(x for x in notes if x)
+
+
+# ── Sauvegarde HORS SITE : une copie sur Athena (10-11, destination choisie par Drisse : le partage « Sauvegarde ») ─────
+# Une sauvegarde sur le même disque que les sites n'est qu'un filet. Ici, les copies du panneau et les points de restauration
+# WordPress partent par rsync, par SSH (avec la clé de la Flotte), vers le NAS. Jamais de --delete : une copie effacée ici ne
+# s'efface pas là-bas ; seules les copies de plus de 30 jours le sont, côté NAS, dans NOTRE dossier.
+_HORS_CLE = "sauvegardes-preuve-et-hors-site/envoyer-une-sauvegarde-hors-site"
+_HORS_RACINE_RE = re.compile(r"^/volume\d+/[A-Za-z0-9 _.\-]+(?:/[A-Za-z0-9 _.\-]+)*$")
+
+
+def _preuve_lire(cle: str) -> float:
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+        conn.execute("CREATE TABLE IF NOT EXISTS autonomie_preuves (cle TEXT PRIMARY KEY, ts REAL)")
+        r = conn.execute("SELECT ts FROM autonomie_preuves WHERE cle=?", (cle,)).fetchone()
+        conn.close()
+        return float(r[0]) if r else 0.0
+    except Exception:
+        return 0.0
+
+
+def _preuve_ecrire(cle: str) -> None:
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+        conn.execute("CREATE TABLE IF NOT EXISTS autonomie_preuves (cle TEXT PRIMARY KEY, ts REAL)")
+        conn.execute("INSERT OR REPLACE INTO autonomie_preuves (cle, ts) VALUES (?,?)", (cle, time.time()))
+        conn.commit(); conn.close()
+    except Exception as e:
+        logging.info("[HORS-SITE] preuve : %s", e)
+
+
+def _hors_sources() -> list:
+    """(dossier local, sous-dossier distant) pour ce qui existe et n'est pas vide."""
+    out = []
+    for loc, sub_ in (("/var/backups/fastpanel", "fastpanel"), (_WP_POINTS, "points-wordpress")):
+        try:
+            if os.path.isdir(loc) and os.listdir(loc):
+                out.append((loc.rstrip("/") + "/", sub_))
+        except Exception:
+            pass
+    return out
+
+
+def _aut_envoyer_hors_site() -> tuple:
+    """(ok, détail). rsync vers le NAS, puis PREUVE : un second passage à blanc ne doit plus rien trouver à envoyer."""
+    import tempfile
+    machine = str(_mem_cfg("sauv_horssite_machine", "athena") or "athena")
+    racine = str(_mem_cfg("sauv_horssite_chemin", "/volume1/Sauvegarde/Orion") or "").rstrip("/")
+    if not _HORS_RACINE_RE.match(racine) or ".." in racine:
+        return False, "destination illisible : %s (attendu : /volume1/<partage>/…)" % racine[:80]
+    srv = _flotte_serveur(machine)
+    if not srv:
+        return False, "la machine « %s » n'est pas dans la Flotte" % machine
+    ok_ssh, det_ssh = _flotte_tester(srv)
+    if not ok_ssh:
+        return False, "« %s » ne répond pas en SSH : %s" % (machine, str(det_ssh)[:100])
+    sources = _hors_sources()
+    if not sources:
+        return False, "rien à envoyer : aucune copie locale"
+    cle_priv = _ms_decrypt_token(srv.get("ssh_key", "")) if srv.get("ssh_auth") == "key" else ""
+    if not cle_priv:
+        return False, "pas de clé SSH pour « %s » dans la Flotte" % machine
+    d = tempfile.mkdtemp(prefix="horssite-")
+    try:
+        kf = os.path.join(d, "cle")
+        with open(kf, "w") as f:
+            f.write(cle_priv if cle_priv.endswith("\n") else cle_priv + "\n")
+        os.chmod(kf, 0o600)
+        ssh = "ssh -i %s -p %s -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s/known_hosts" % (
+            kf, int(srv.get("ssh_port", 22)), d)
+        cible = "%s@%s" % (srv.get("ssh_user", "root"), srv.get("ssh_host"))
+        notes, octets = [], 0
+        for loc, sub_ in sources:
+            dist = "%s/%s/" % (racine, sub_)
+            out, err, rc = _ms_ssh_exec(srv, "mkdir -p %s" % _sh_quote(dist), timeout=30)
+            if rc != 0:
+                return False, "dossier %s impossible côté NAS : %s" % (dist, " ".join(((err or "") + (out or "")).split())[:100])
+            base = ["rsync", "-a", "--no-o", "--no-g", "--partial", "--protect-args", "--stats", "-e", ssh]
+            p = subprocess.run(base + [loc, "%s:%s" % (cible, dist)], capture_output=True, text=True, timeout=3600)
+            if p.returncode != 0:
+                return False, "rsync a échoué sur %s (code %d) : %s" % (sub_, p.returncode, " ".join((p.stderr or p.stdout or "").split())[:140])
+            m = re.search(r"Total transferred file size:\s*([\d,.]+)", p.stdout or "")
+            if m:
+                try:
+                    octets += int(re.sub(r"[^\d]", "", m.group(1)))
+                except ValueError:
+                    pass
+            v = subprocess.run(["rsync", "-rtn", "--protect-args", "--itemize-changes", "-e", ssh, loc, "%s:%s" % (cible, dist)],
+                               capture_output=True, text=True, timeout=1800)
+            reste = [l for l in (v.stdout or "").splitlines() if l.strip() and not l.startswith(".d")]
+            if v.returncode != 0 or reste:
+                return False, "vérification : %d fichier(s) de « %s » différent(s) côté NAS après l'envoi" % (len(reste), sub_)
+            notes.append(sub_)
+            # le ménage côté NAS : les copies de plus de 30 jours, dans NOTRE dossier seulement
+            _ms_ssh_exec(srv, "find %s -type f -mtime +30 -delete; find %s -mindepth 1 -type d -empty -delete" % (_sh_quote(dist), _sh_quote(dist)), timeout=120)
+        _preuve_ecrire("horssite")
+        return True, "envoyé et vérifié sur %s:%s (%s ; %.1f Mo transférés)" % (machine, racine, ", ".join(notes), octets / 1048576.0)
+    except subprocess.TimeoutExpired:
+        return False, "rsync trop long (plus d'une heure) : interrompu"
+    except Exception as e:
+        return False, "envoi hors site impossible : %s" % str(e)[:120]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _detect_hors_site() -> list:
+    """Règle « Sauvegardes › Envoyer une sauvegarde hors site » : des copies locales existent et la dernière preuve d'envoi date de plus de 26 h."""
+    if not _hors_sources():
+        return []
+    if time.time() - _preuve_lire("horssite") < 26 * 3600:
+        return []
+    return [{"fkey": "hors_site_retard", "category": "backup", "severity": "warning",
+             "title": "Les copies ne sont pas encore parties hors d'Orion",
+             "detail": "Les sauvegardes sont sur le même disque que les sites. Cassandra peut les envoyer sur %s (%s), vérifiées après coup." % (
+                 str(_mem_cfg("sauv_horssite_machine", "athena")), str(_mem_cfg("sauv_horssite_chemin", "/volume1/Sauvegarde/Orion"))),
+             "suggested_action": "envoyer-hors-site", "action_kind": "sauvegarde.horssite"}]
 
 
 def _detect_pieces() -> list:
@@ -74684,6 +74801,7 @@ _PF_DETECTEURS = (
     ("wordpress", "Sites WordPress", "proactive_watch_wp", "_detect_wordpress"),
     ("surface", "Surface exposée", "proactive_watch_surface", "_detect_surface"),
     ("plan_sauvegarde", "Plan de sauvegarde", "proactive_watch_plan", "_detect_sauvegardes_absentes"),
+    ("hors_site", "Copie hors site", "proactive_watch_horssite", "_detect_hors_site"),
 )
 
 
@@ -74955,7 +75073,7 @@ _AUT_CATALOGUE = [
  ('sauvegardes-preuve-et-hors-site', 'Sauvegardes : preuve et hors site', 'Restaurer pour de vrai, envoyer ailleurs, purger.', [
    ('tester-une-restauration-en-bac-a-sable', 'Tester une restauration en bac à sable', 'ok', 'oui', 'bac isolé, rien en production'),
    ('verifier-les-empreintes-des-sauvegardes', 'Vérifier les empreintes des sauvegardes', 'ok', 'oui', 'lecture seule'),
-   ('envoyer-une-sauvegarde-hors-site', 'Envoyer une sauvegarde hors site', 'ecrire', 'oui', 'destination à décider'),
+   ('envoyer-une-sauvegarde-hors-site', 'Envoyer une sauvegarde hors site', 'ok', 'oui', 'destination à décider'),
    ('purger-les-sauvegardes-hors-retention', 'Purger les sauvegardes hors rétention', 'dur', 'non', 'suppression irréversible'),
  ]),
  ('rotation-des-secrets', 'Rotation des secrets', 'Clés SSH, jetons, mots de passe de service.', [
@@ -74998,6 +75116,7 @@ _AUT_CATALOGUE = [
 # Le geste du catalogue que sait déclencher chaque action_kind du moteur proactif. Les autres restent au
 # palier global, sans disjoncteur : l'ancien comportement.
 _AUT_GESTE_DE_KIND = {
+    "sauvegarde.horssite": "sauvegardes-preuve-et-hors-site/envoyer-une-sauvegarde-hors-site",
     "sauvegarde.plan": "hebergement/creer-ou-modifier-un-plan-de-sauvegarde",
     "secret.rotation": "rotation-des-secrets/remplacer-un-mot-de-passe-de-service",
     "wp.maj": "sites-wordpress/mettre-a-jour-le-cur-et-les-plugins",
@@ -77285,6 +77404,22 @@ def proactive_act(fid, auto: bool = False, acteur: str = "") -> dict:
             conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
             conn.execute("UPDATE proactive_findings SET status='acted', acted_at=datetime('now'), action_result=? WHERE id=?",
                          (("auto • " if auto else "") + str(out)[:1500], int(fid)))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+        return {"ok": bool(_ok), "output": str(out)[:2000], "gate": ""}
+    if kind == "sauvegarde.horssite":
+        if cmd.strip() != "envoyer-hors-site":
+            return {"ok": False, "error": "commande d'envoi illisible"}
+        _ok, out = _aut_envoyer_hors_site()
+        try:
+            log_action("proactive", cmd, out, 0, True, False)
+        except Exception:
+            pass
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            conn.execute("UPDATE proactive_findings SET status=?, acted_at=datetime('now'), action_result=? WHERE id=?",
+                         ("acted" if _ok else "open", ("auto • " if auto else "") + str(out)[:1500], int(fid)))
             conn.commit(); conn.close()
         except Exception:
             pass
