@@ -11491,7 +11491,7 @@ def fp_ssl_autorenew_pass() -> dict:
         return etat
     faits, echecs = [], []
     for d in proches:
-        # La règle « Hébergement › Renouveler un certificat » (10-10) : palier, ombre, fenêtre, disjoncteur.
+        # La règle « Hébergement › Renouveler un certificat » (10-10) : palier, fenêtre, disjoncteur.
         # Un renouvellement qui échoue en boucle ronge le quota de l'autorité : le disjoncteur l'arrête.
         _porte = aut_porte("hebergement/renouveler-un-certificat", str(d["domain"]), "Renouveler le certificat de %s" % d["domain"])
         if not _porte.get("ok"):
@@ -74453,7 +74453,7 @@ def aut_porte(cle: str, sujet: str = "", titre: str = "") -> dict:
     """La porte des mécanismes autonomes qui ne passent PAS par le moteur proactif (renouvellement SSL…).
 
     Un geste que le catalogue ne connaît pas ne bloque jamais. Un geste SANS réglage propre (palier hérité du
-    global) garde son comportement d'avant : seuls un réglage explicite de palier, le mode ombre, la fenêtre et le
+    global) garde son comportement d'avant : seuls un réglage explicite de palier, la fenêtre et le
     disjoncteur le retiennent. Le disjoncteur, lui, s'applique toujours : c'est lui qui protège un quota externe."""
     eff = aut_effectif(cle)
     if not eff:
@@ -74465,8 +74465,6 @@ def aut_porte(cle: str, sujet: str = "", titre: str = "") -> dict:
         return _non("l'autonomie de Cassandra est gelée")
     if eff.get("origine") != "global" and eff.get("palier") in ("observer", "proposer"):
         return _non("palier « %s » sur « %s » : elle ne le fait pas seule" % (eff["palier"], eff.get("libelle", cle)))
-    if eff.get("ombre"):
-        return _non("mode ombre sur « %s » : elle dit ce qu'elle aurait fait" % eff.get("libelle", cle))
     if not _aut_fenetre_ok(eff):
         return _non("hors de la fenêtre réglée pour « %s » (%s)" % (eff.get("libelle", cle), eff.get("fen")))
     motif = aut_retenue(eff, sujet, titre, "", "planifie")
@@ -74582,8 +74580,6 @@ def pf_autorise(signature: str, action_kind: str, cmd: str, fkey: str = "",
         return _non("palier « observer » : elle ne fait rien seule")
     if palier == "proposer":
         return _non("palier « proposer » : elle attend un appui")
-    if eff.get("ombre"):
-        return _non("mode ombre sur « %s » : elle dit ce qu'elle aurait fait" % eff.get("libelle", cle))
     if a["reversible"] and not (sav or {}).get("reversible", 1):
         return _non("ce geste n'est pas réversible")
     if palier == "maitrise":
@@ -114968,7 +114964,7 @@ async function pfAutonomie(){
 }
 
 // ── LES RÈGLES PAR DOMAINE ET PAR GESTE (10-10) ─────────────────────────────────
-// Un réglage « actif » est lu par la porte (`pf_autorise`) : le palier, le mode ombre, la fenêtre, le disjoncteur.
+// Un réglage « actif » est lu par la porte (`pf_autorise`) : le palier, la fenêtre, le disjoncteur.
 // Les autres s'enregistrent déjà et s'appliqueront au fil du câblage de chaque geste : l'écran le dit.
 const AUT_LV=[['observer','Observer'],['proposer','Proposer'],['maitrise','Agir'],['raconter','Agir + raconter']];
 const AUT_ST={ok:'var(--ok)',brancher:'var(--violet)',ecrire:'var(--txt-ghost)',dur:'var(--danger)'};
@@ -115037,7 +115033,6 @@ function autRendre(){
             if(gouv[g.cle]){
                 const k='g:'+g.cle;
                 pan='<div class="aut-pan"><div class="aut-grp">Appliqués par la porte</div><div class="aut-grid">'
-                 +autChamp('Mode ombre', autTog(k,'ombre',v('ombre')), 'Elle dit ce qu\u2019elle aurait fait, sans le faire.')
                  +autChamp('Fenêtre horaire', '<div class="aut-r">'+autSel(k,'fen',ch.fen||[],v('fen'))+autTps(k,'fd',v('fd'))+'<span class="t">à</span>'+autTps(k,'ff',v('ff'))+'</div>', 'La plage ne compte que si « Plage horaire » est choisie.', true)
                  +autChamp('Disjoncteur', '<div class="aut-r">'+autNum(k,'ech',v('ech'),1,5)+'<span class="t"> échecs d\u2019affilée, ou</span>'+autNum(k,'boucle',v('boucle'),1,10)+'<span class="t"> actions sur le même sujet en</span>'+autSel(k,'boucleh',ch.boucleh||[],v('boucleh'))+'</div>', 'Il arrête le geste seul. Toi seul le débloques.', true)
                  +autChamp('Exclusions', '<input class="bu-inp mono" type="text" value="'+escapeAttr(v('excl')||'')+'" placeholder="ex. boheme-shop, 10.0.0.0/24" aria-label="excl" onchange="autSet(\''+k+'\',\'excl\',this)">','Ce qu\u2019elle ne touche jamais avec ce geste, en plus des intouchables. Séparés par des virgules.', true)
@@ -115052,9 +115047,9 @@ function autRendre(){
             }
             return '<div class="aut-g"><div class="co"><b>'+escapeHtml(g.nom)+'</b><div class="aut-tags">'
                 +autTag(g.statut,AUT_ST[g.st])+autTag(AUT_REV[g.rev][0],AUT_REV[g.rev][1])+autTag('garde : '+g.garde)
-                +(ouvert?autTag('disjoncteur déclenché','var(--warn)'):'')+'</div>'
+                +(ouvert?autTag('disjoncteur déclenché','var(--warn)'):(g.st==='ok'?'<span title="Après '+escapeAttr(String(v('ech')||2))+' échecs d’affilée, ou '+escapeAttr(String(v('boucle')||3))+' actions sur le même sujet en '+escapeAttr(String(v('boucleh')||'1 h'))+', la règle s’arrête seule et attend ton déblocage.">'+autTag('disjoncteur armé','var(--ok)')+'</span>':''))+'</div>'
                 +(ouvert?'<div class="aut-h" style="color:var(--warn)">'+escapeHtml(dj.raison||'')+'</div>':'')+'</div>'
-                +'<div class="aut-dr"><select class="bu-inp" aria-label="Palier : '+escapeAttr(g.nom)+'" onchange="autSet(\'g:'+g.cle+'\',\'lv\',this)">'+opts+'</select>'
+                +'<div class="aut-dr"><span class="aut-i" tabindex="0" style="cursor:help;color:var(--txt-soft)" title="Hérite : ce geste n’a pas de réglage à lui. Il suit le palier de son domaine (les boutons de la ligne du domaine) ; si le domaine n’en a pas non plus, il suit le palier par défaut de la carte du haut. Choisir un niveau ici l’en détache.">ⓘ</span><select class="bu-inp" aria-label="Palier : '+escapeAttr(g.nom)+'" onchange="autSet(\'g:'+g.cle+'\',\'lv\',this)">'+opts+'</select>'
                 +autTag(effet,(g.palier==='maitrise'||g.palier==='raconter')&&g.st==='ok'?'var(--ok)':'')
                 +(ouvert?'<button class="btn-x mini" style="border-color:var(--warn);color:var(--warn)" onclick="autDebloquer(\''+g.cle+'\')">Débloquer</button>':'')
                 +'<button class="btn-x mini" onclick="autBasc(\''+g.cle+'\')">Réglages '+(gouv[g.cle]?'\u25b4':'\u25be')+(nReg?' · '+nReg:'')+'</button></div>'+pan+'</div>';
