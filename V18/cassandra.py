@@ -11936,7 +11936,8 @@ def fp_infra_pass() -> dict:
                     ("php", fp_php_pass), ("ssl", fp_ssl_autorenew_pass),
                     ("databases", fp_db_autolink), ("websocket", ws_proxy_watch),
                     ("fleet", fleet_pass), ("sites", site_pass),
-                    ("scans", fp_scan_watch), ("liens", fp_liens_watch)):
+                    ("scans", fp_scan_watch), ("liens", fp_liens_watch),
+                    ("rotation", aut_rotation_pass)):
         try:
             res[nom] = fn()
         except Exception as e:
@@ -71326,15 +71327,26 @@ def _flotte_cle_neuve(s: dict) -> tuple:
         shutil.copy2(MULTISERVER_CONFIG_FILE, MULTISERVER_CONFIG_FILE + ".bak.%d" % int(time.time()))
     except Exception:
         pass
+    ancienne = ""
     for x in servers:
         if x.get("name") != nom:
             continue
         if ok_neuve:
-            x.update(ssh_auth="key", ssh_key=_ms_encrypt_token(priv))
+            if x.get("ssh_auth") == "key" and x.get("ssh_key"):
+                ancienne = _aut_rot_corps_pub(_ms_decrypt_token(x.get("ssh_key", "")))
+            x.update(ssh_auth="key", ssh_key=_ms_encrypt_token(priv), ssh_key_date=time.time())
             x.pop("ssh_key_attente", None); x.pop("ssh_pub_attente", None)
         else:
             x.update(ssh_key_attente=_ms_encrypt_token(priv), ssh_pub_attente=pub)
     _ms_save(servers)   # vide aussi le cache des serveurs
+    if ok_neuve and ancienne and ancienne not in pub:
+        # L'ancienne clé reste valide sur la machine pendant la garde (12 h par défaut) : si la neuve se révèle fautive,
+        # la copie de sûreté du registre permet de revenir. Elle est retirée ensuite, après un essai de la neuve.
+        try:
+            _aut_rot_programmer(nom, ancienne)
+            pose += ", ancienne clé retirée dans %g h" % float(_mem_cfg("rotation_garde_h", 12) or 12)
+        except Exception as e:
+            logging.warning("[ROTATION] retrait de l'ancienne clé de %s non programmé : %s", nom, e)
     if ok_neuve:
         return 0, "%s : clé neuve posée (%s), essayée et adoptée par le registre. Clé publique : %s" % (nom, pose, pub)
     ligne = ("Windows admin : ajouter la ligne à C:\\ProgramData\\ssh\\administrators_authorized_keys ; "
@@ -71342,6 +71354,120 @@ def _flotte_cle_neuve(s: dict) -> tuple:
     return 1, ("%s : la clé neuve n'ouvre pas encore la machine (%s). Elle attend dans le registre ; "
                "une fois la ligne posée sur la machine, relancer cle_neuve l'essaie et l'adopte.\n%s\nLigne : %s"
                % (nom, pose, ligne, pub))
+
+
+def _aut_rot_corps_pub(priv: str) -> str:
+    """Le corps (base64) de la clé publique d'une clé privée : de quoi retrouver sa ligne dans authorized_keys."""
+    import paramiko as _pk, io as _io
+    for K in (_pk.Ed25519Key, _pk.RSAKey, _pk.ECDSAKey):
+        try:
+            return K.from_private_key(_io.StringIO(priv)).get_base64()
+        except Exception:
+            continue
+    return ""
+
+
+_AUT_ROT_SQL = ("CREATE TABLE IF NOT EXISTS autonomie_rotations (id INTEGER PRIMARY KEY AUTOINCREMENT, machine TEXT, "
+                "corps TEXT, echeance REAL, etat TEXT DEFAULT 'attente', note TEXT DEFAULT '', ts REAL)")
+_AUT_ROT_CLE = "rotation-des-secrets/faire-tourner-une-cle-ssh"
+
+
+def _aut_rot_programmer(machine: str, corps: str) -> None:
+    garde = float(_mem_cfg("rotation_garde_h", 12) or 12) * 3600
+    def _e(conn):
+        conn.execute(_AUT_ROT_SQL)
+        conn.execute("INSERT INTO autonomie_rotations (machine, corps, echeance, ts) VALUES (?,?,?,?)",
+                     (machine, corps, time.time() + garde, time.time()))
+    _aut_ecrire(_e)
+
+
+def _aut_rot_retirer(s: dict, corps: str) -> tuple:
+    """Retire de la machine la ligne de l'ancienne clé. Jamais un fichier vidé : on ne réécrit que s'il reste des lignes."""
+    if not re.match(r"^[A-Za-z0-9+/=]{20,}$", corps or ""):
+        return False, "corps de clé illisible"
+    if _flotte_est_windows(s):
+        ps = ("$b='%s';$r='';foreach($f in @('C:\\ProgramData\\ssh\\administrators_authorized_keys',(Join-Path $env:USERPROFILE '.ssh\\authorized_keys')))"
+              "{if(Test-Path $f){$l=@(Get-Content $f);$k=@($l|Where-Object{$_ -notlike ('*'+$b+'*')});"
+              "if($k.Count -gt 0 -and $k.Count -lt $l.Count){Set-Content -Path $f -Value $k -Encoding ascii;$r='retiree'}}};$r" % corps)
+        cmd = 'powershell -NoProfile -NonInteractive -Command "%s"' % ps
+    else:
+        cmd = ("f=\"$HOME/.ssh/authorized_keys\"; grep -vF '%s' \"$f\" > \"$f.rot\"; "
+               "if [ -s \"$f.rot\" ] && [ \"$(wc -l < \"$f.rot\")\" -lt \"$(wc -l < \"$f\")\" ]; then cat \"$f.rot\" > \"$f\"; echo retiree; fi; rm -f \"$f.rot\"" % corps)
+    out, err, rc = _ms_ssh_exec(s, cmd, timeout=40)
+    if rc != 0:
+        return False, "retrait impossible : %s" % " ".join(((err or "") + (out or "")).split())[:160]
+    return True, "ancienne clé retirée" if "retiree" in (out or "") else "l'ancienne clé n'y était déjà plus"
+
+
+def aut_rotation_pass() -> dict:
+    """Retire les anciennes clés SSH dont la garde est écoulée — APRÈS avoir essayé la neuve. Si la neuve ne répond pas,
+    l'ancienne reste et on le dit : mieux vaut une clé de trop qu'une machine perdue."""
+    now = time.time()
+    try:
+        def _lire(conn):
+            conn.execute(_AUT_ROT_SQL)
+            return [dict(r) for r in conn.execute("SELECT * FROM autonomie_rotations WHERE etat='attente' AND echeance <= ?", (now,)).fetchall()]
+        dues = _aut_ecrire(_lire)
+    except Exception as e:
+        return {"ok": False, "reason": str(e)[:120]}
+    faites = []
+    for r in dues:
+        s = _flotte_serveur(r["machine"])
+        etat, note, ok = "faite", "", True
+        if not s:
+            etat, note, ok = "abandon", "machine retirée du registre", True
+        else:
+            ok_neuve, det = _flotte_tester(s)
+            if not ok_neuve:
+                etat, note, ok = "bloque", "la clé neuve ne répond pas (%s) : l'ancienne est gardée" % str(det)[:100], False
+            else:
+                ok, note = _aut_rot_retirer(s, r["corps"])
+                etat = "faite" if ok else "bloque"
+        def _e(conn, i=r["id"], et=etat, nt=note):
+            conn.execute("UPDATE autonomie_rotations SET etat=?, note=? WHERE id=?", (et, nt, i))
+        try:
+            _aut_ecrire(_e)
+        except Exception as e:
+            logging.warning("[ROTATION] %s", e)
+        eff = aut_effectif(_AUT_ROT_CLE)
+        try:
+            aut_journaliser(_AUT_ROT_CLE, r["machine"], ok, "retrait de l'ancienne clé après la garde", note, eff)
+            if not ok:
+                notif("Rotation de clé SSH : l'ancienne clé de %s est restée" % r["machine"], note, source="veille", niveau="avoir",
+                      cle="aut:rotation:%s" % r["machine"])
+        except Exception as e:
+            logging.info("[ROTATION] journal : %s", e)
+        faites.append({"machine": r["machine"], "etat": etat, "note": note})
+    return {"ok": True, "traitees": faites}
+
+
+def _detect_cles_ssh_anciennes() -> list:
+    """Règle « Rotation des secrets › Faire tourner une clé SSH » : une clé de la Flotte plus vieille que le seuil
+    (180 jours) est à faire tourner. Une clé sans date reçoit la date du jour : on part de maintenant, on n'invente rien."""
+    seuil = int(_mem_cfg("cle_ssh_age_jours", 180) or 180)
+    servers = _ms_load() or []
+    now, datees, out = time.time(), False, []
+    for sv in servers:
+        if sv.get("type") != "ssh" or sv.get("ssh_auth") != "key" or not sv.get("ssh_key"):
+            continue
+        d = sv.get("ssh_key_date")
+        if not d:
+            sv["ssh_key_date"] = now; datees = True
+            continue
+        jours = int((now - float(d)) // 86400)
+        if jours >= seuil:
+            nom = str(sv.get("name") or "")
+            out.append({"fkey": "ssh_cle_%s" % nom, "category": "flotte", "severity": "info",
+                        "title": "Clé SSH de %s : %d jours sans changement" % (nom, jours),
+                        "detail": "La clé dédiée à %s a %d jours (seuil %d). La neuve est posée et essayée avant d'être adoptée ; "
+                                  "l'ancienne reste valide pendant la garde, puis est retirée." % (nom, jours, seuil),
+                        "suggested_action": "rotation-cle-ssh %s" % nom, "action_kind": "ssh.rotation"})
+    if datees:
+        try:
+            _ms_save(servers)
+        except Exception as e:
+            logging.warning("[ROTATION] dates de clés non écrites : %s", e)
+    return out
 
 
 def _flotte_fichier(p: dict) -> tuple:
@@ -72855,7 +72981,7 @@ def secure_execute(cmd: str) -> str:
 #   disque / SSL / sécurité = détection + investigation + action sur clic.
 # ============================================================
 _PROACTIVE_LAST = [0.0]
-_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer")   # seules actions auto-remédiables (réversibles)
+_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation")   # seules actions auto-remédiables (réversibles)
 
 
 def _detect_disk() -> list:
@@ -73461,6 +73587,7 @@ _PF_DETECTEURS = (
     ("updates", "Mises à jour", "proactive_watch_updates", "_detect_updates"),
     ("db", "Bases de données", "proactive_watch_db", "_detect_db"),
     ("collector", "Collecteur", "proactive_watch_collector", "_detect_collector"),
+    ("ssh", "Clés SSH", "proactive_watch_ssh", "_detect_cles_ssh_anciennes"),
 )
 
 
@@ -73737,7 +73864,7 @@ _AUT_CATALOGUE = [
  ]),
  ('rotation-des-secrets', 'Rotation des secrets', 'Clés SSH, jetons, mots de passe de service.', [
    ('signaler-un-secret-trop-ancien', 'Signaler un secret trop ancien', 'ok', 'oui', 'lecture seule'),
-   ('faire-tourner-une-cle-ssh', 'Faire tourner une clé SSH', 'ecrire', 'part', 'ancienne clé valide 24 h'),
+   ('faire-tourner-une-cle-ssh', 'Faire tourner une clé SSH', 'ok', 'part', 'ancienne clé valide 24 h'),
    ('regenerer-un-jeton-d-api', "Régénérer un jeton d'API", 'ecrire', 'part', 'service vérifié après coup'),
    ('remplacer-un-mot-de-passe-de-service', 'Remplacer un mot de passe de service', 'ecrire', 'part', 'écrit dans le coffre avant usage'),
  ]),
@@ -73774,7 +73901,8 @@ _AUT_CATALOGUE = [
 
 # Le geste du catalogue que sait déclencher chaque action_kind du moteur proactif. Les autres restent au
 # palier global, sans disjoncteur : l'ancien comportement.
-_AUT_GESTE_DE_KIND = {"service.restart": "machine/relancer-un-service",
+_AUT_GESTE_DE_KIND = {
+    "ssh.rotation": "rotation-des-secrets/faire-tourner-une-cle-ssh","service.restart": "machine/relancer-un-service",
                       "securite.bannir": "reseau-et-acces/bannir-ou-debannir-une-adresse-ou-un-pays",
                       "site.relancer": "hebergement/relancer-un-site",
                       "sauvegarde.relancer": "hebergement/relancer-une-sauvegarde-en-echec"}
@@ -75907,6 +76035,26 @@ def proactive_act(fid, auto: bool = False, acteur: str = "") -> dict:
         except Exception:
             pass
         return {"ok": bool(_ok), "output": str(out)[:2000], "gate": ""}
+    if kind == "ssh.rotation":
+        _m = re.match(r"^\s*rotation-cle-ssh\s+([A-Za-z0-9._-]+)\s*$", cmd)
+        if not _m:
+            return {"ok": False, "error": "commande de rotation illisible"}
+        _sv = _flotte_serveur(_m.group(1))
+        if not _sv:
+            return {"ok": False, "error": "machine inconnue du registre"}
+        _rc, out = _flotte_cle_neuve(_sv)
+        try:
+            log_action("proactive", cmd, out, 0, True, False)
+        except Exception:
+            pass
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            conn.execute("UPDATE proactive_findings SET status='acted', acted_at=datetime('now'), action_result=? WHERE id=?",
+                         (("auto • " if auto else "") + str(out)[:1500], int(fid)))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+        return {"ok": _rc == 0, "output": str(out)[:2000], "gate": ""}
     if kind == "sauvegarde.relancer":
         _m = re.match(r"^\s*relancer-sauvegarde\s+(\d+)\s*$", cmd)
         if not _m:
