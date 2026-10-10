@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sécurité en images</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#eef1f5;--halo:#e9edf3;--surface:rgba(255,255,255,.66);--surface-solid:#fff;
+  --txt-strong:#101828;--txt:#2b3646;--txt-soft:#5a6675;--txt-faint:#76808e;
+  --line:rgba(16,24,40,.09);--grid:rgba(16,24,40,.07);
+  --accent:#0a726b;--ok:#047857;--warn:#b45309;--danger:#be123c;
+  --s1:#0369a1;--s2:#7c3aed;            /* catégoriel : effractions, mots de passe (validé, clair) */
+  --ring1:#0a726b;--ring2:rgba(10,114,107,.55);--ring3:rgba(10,114,107,.3);--ring4:rgba(10,114,107,.12);
+  --shadow:0 1px 2px rgba(16,24,40,.04),0 8px 24px rgba(16,24,40,.06);
+}
+:root[data-theme="dark"]{
+  --bg:#1c2128;--halo:#22272e;--surface:rgba(45,51,59,.72);--surface-solid:#2d333b;
+  --txt-strong:#e6edf3;--txt:#c9d1d9;--txt-soft:#adbac7;--txt-faint:#768390;
+  --line:rgba(173,186,199,.12);--grid:rgba(173,186,199,.09);
+  --accent:#3ddbb0;--ok:#27c168;--warn:#e8c660;--danger:#ff4757;
+  --s1:#1d9bd1;--s2:#8b5cf6;            /* catégoriel : pas retourné — ses propres teintes, validées sur #2d333b */
+  --ring1:#3ddbb0;--ring2:rgba(61,219,176,.55);--ring3:rgba(61,219,176,.3);--ring4:rgba(61,219,176,.12);
+  --shadow:0 1px 2px rgba(0,0,0,.2),0 8px 24px rgba(0,0,0,.25);
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#1c2128;--halo:#22272e;--surface:rgba(45,51,59,.72);--surface-solid:#2d333b;
+  --txt-strong:#e6edf3;--txt:#c9d1d9;--txt-soft:#adbac7;--txt-faint:#768390;
+  --line:rgba(173,186,199,.12);--grid:rgba(173,186,199,.09);
+  --accent:#3ddbb0;--ok:#27c168;--warn:#e8c660;--danger:#ff4757;--s1:#1d9bd1;--s2:#8b5cf6;
+  --ring1:#3ddbb0;--ring2:rgba(61,219,176,.55);--ring3:rgba(61,219,176,.3);--ring4:rgba(61,219,176,.12);
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg) radial-gradient(ellipse at 50% -25%,var(--halo),transparent 60%) no-repeat;color:var(--txt);
+  font:14px/1.5 Inter,system-ui,sans-serif;padding:24px 16px 48px}
+.page{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.mono{font-family:"JetBrains Mono",ui-monospace,monospace}
+.tete{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap}
+.tete h1{margin:0;font:600 22px "JetBrains Mono",monospace;color:var(--txt-strong)}
+.tete p{margin:2px 0 0;color:var(--txt-soft)}
+.bascule{border:1px solid var(--line);background:var(--surface);color:var(--txt);border-radius:10px;padding:6px 12px;cursor:pointer;font:500 12px "JetBrains Mono",monospace}
+.note{font-size:12px;color:var(--txt-faint)}
+.carte{background:var(--surface);backdrop-filter:blur(18px) saturate(160%);-webkit-backdrop-filter:blur(18px) saturate(160%);
+  border-radius:16px;box-shadow:var(--shadow);padding:18px 20px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.carte h2{margin:0;font:600 12px "JetBrains Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--txt-soft)}
+.carte .sous{margin:-6px 0 0;font-size:12.5px;color:var(--txt-faint)}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+@media (max-width:860px){.g2,.g4{grid-template-columns:1fr}}
+/* verdict */
+.verdict{display:grid;grid-template-columns:180px 1fr;gap:20px;align-items:center}
+@media (max-width:640px){.verdict{grid-template-columns:1fr;justify-items:center}}
+.verdict .titre{font:600 20px Inter,sans-serif;color:var(--txt-strong);margin:0}
+.fams{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-top:10px}
+.fam{border:1px solid var(--line);border-radius:12px;padding:8px 10px;display:flex;gap:8px;align-items:center;cursor:default}
+.fam b{font-weight:600;color:var(--txt);font-size:13px}
+.fam span{display:block;font-size:11.5px;color:var(--txt-faint)}
+.pt{width:10px;height:10px;border-radius:50%;flex:none}
+.pt.ok{background:var(--ok)}.pt.warn{background:var(--warn)}.pt.danger{background:var(--danger)}.pt.acc{background:transparent;border:2px solid var(--ok)}
+/* légende */
+.leg{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:var(--txt-soft)}
+.leg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+svg text{font-family:"JetBrains Mono",monospace;fill:var(--txt-faint);font-size:11px}
+svg .val{fill:var(--txt);font-weight:600}
+.tip{position:fixed;pointer-events:none;background:var(--surface-solid);color:var(--txt);border:1px solid var(--line);box-shadow:var(--shadow);
+  border-radius:10px;padding:8px 10px;font-size:12.5px;line-height:1.45;opacity:0;transition:opacity .08s;z-index:10;max-width:260px}
+.tip b{color:var(--txt-strong)}
+.tuile .chiffre{font:600 30px "JetBrains Mono",monospace;color:var(--txt-strong);line-height:1}
+.tuile .lib{font-size:12.5px;color:var(--txt-soft)}
+.pastille{display:inline-block;font:600 10.5px "JetBrains Mono",monospace;letter-spacing:.05em;padding:2px 7px;border-radius:999px;border:1px solid currentColor}
+.pastille.ok{color:var(--ok)}.pastille.warn{color:var(--warn)}.pastille.danger{color:var(--danger)}
+details{font-size:12.5px;color:var(--txt-soft)} summary{cursor:pointer;color:var(--txt-faint)}
+table{border-collapse:collapse;width:100%;margin-top:6px} td,th{padding:3px 6px;border-bottom:1px solid var(--line);text-align:right} td:first-child,th:first-child{text-align:left}
+.mq{border:1px dashed var(--line);border-radius:12px;padding:10px 12px;font-size:12.5px;color:var(--txt-soft)}
+
+.kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}
+@media (max-width:1000px){.kpis{grid-template-columns:repeat(3,1fr)}} @media (max-width:560px){.kpis{grid-template-columns:repeat(2,1fr)}}
+.kpi{background:var(--surface);backdrop-filter:blur(18px) saturate(160%);-webkit-backdrop-filter:blur(18px) saturate(160%);border-radius:16px;box-shadow:var(--shadow);padding:14px 14px 12px;display:flex;flex-direction:column;gap:4px;cursor:default}
+.kpi b{font:600 24px "JetBrains Mono",monospace;color:var(--txt-strong);line-height:1.1}
+.kpi em{font-style:normal;font-size:12px;color:var(--txt-soft)}
+.kpi small{font-size:11px;color:var(--txt-faint)}
+.kpi .pt{display:inline-block;margin-right:6px;vertical-align:1px}
+.matrice{display:grid;grid-template-columns:auto repeat(3,1fr);gap:6px;font-size:12.5px;align-items:center}
+.matrice .h{font:600 11px "JetBrains Mono",monospace;color:var(--txt-faint);text-align:center}
+.matrice .d{color:var(--txt-soft);font-family:"JetBrains Mono",monospace;font-size:12px}
+.cel{border-radius:8px;padding:6px 8px;text-align:center;border:1px solid var(--line);color:var(--txt)}
+.cel i{font-style:normal;font-weight:700;margin-right:4px}
+.cel.ok i{color:var(--ok)} .cel.warn i{color:var(--warn)} .cel.danger i{color:var(--danger)}
+.liste{display:grid;grid-template-columns:1fr 1fr;gap:6px 18px;font-size:13px}
+@media (max-width:640px){.liste{grid-template-columns:1fr}}
+.liste div{display:flex;gap:8px;align-items:baseline}
+.liste span{color:var(--txt-faint);font-size:12px}
+.trouvaille{border-left:3px solid var(--warn);padding:6px 10px;font-size:12.5px;color:var(--txt-soft);background:transparent}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="tete">
+    <div><h1>Sécurité — en images</h1><p>MAQUETTE · données réelles d’Orion au 10-10 · nouvel onglet du rail Sécurité</p></div>
+    <button class="bascule" onclick="theme()">clair / sombre</button>
+  </div>
+
+  <!-- 1. Le verdict d'un coup d'œil -->
+  <section class="carte">
+    <h2>D’un coup d’œil</h2>
+    <div class="verdict">
+      <svg id="jauge" viewBox="0 0 180 180" width="180" height="180" role="img" aria-label="Indice de sécurité 94 sur 100"></svg>
+      <div>
+        <p class="titre">Rien d’ouvert au-delà de ce qui doit l’être.</p>
+        <p class="note">L’indice part de 100 et retire des points par famille : « à regarder » −6, « à faire » −15. Il ne remplace pas le verdict mesuré ; il le résume.</p>
+        <div class="fams" id="fams"></div>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- 1 bis. Les indices -->
+  <div class="kpis" id="kpis"></div>
+
+  <!-- 2. Les attaques jour par jour -->
+  <section class="carte">
+    <h2>Les attaques, jour par jour</h2>
+    <p class="sous">Tentatives repoussées sur les sites publics (journaux nginx, 12 jours), hors maison et Tailscale. Le trafic des robots d’indexation n’est pas une attaque : il est donné à part, au survol.</p>
+    <div class="leg"><span><i style="background:var(--s1)"></i>Sondes d’effraction (.env, .git, greffons piratés…)</span><span><i style="background:var(--s2)"></i>Mots de passe refusés (WordPress, Cassandra, coffre)</span></div>
+    <svg id="barres" viewBox="0 0 1100 260" width="100%" role="img" aria-label="Attaques par jour"></svg>
+    <details><summary>Voir en tableau</summary><table id="t-barres"></table></details>
+  </section>
+
+  <!-- 2 bis. Quand ça frappe -->
+  <section class="carte">
+    <h2>Quand ça frappe</h2>
+    <p class="sous">Attaques repoussées, heure par heure, sur les 7 derniers jours. Plus la case est foncée, plus il y en a.</p>
+    <svg id="chaleur" viewBox="0 0 1100 230" width="100%" role="img" aria-label="Carte de chaleur des attaques"></svg>
+  </section>
+
+  <div class="g2">
+    <!-- 3a. Qui peut joindre quoi -->
+    <section class="carte">
+      <h2>Qui peut joindre quoi</h2>
+      <p class="sous">Les 25 services d’Orion, placés sur l’anneau le plus lointain qui peut les atteindre — pare-feu et box compris.</p>
+      <svg id="anneaux" viewBox="0 0 520 300" width="100%" role="img" aria-label="Exposition des services"></svg>
+    </section>
+    <!-- 3b. D'où viennent les attaques -->
+    <section class="carte">
+      <h2>D’où viennent les attaques</h2>
+      <p class="sous">CrowdSec, depuis son installation ce matin : pays d’origine des alertes, et ce qu’elles tentaient.</p>
+      <svg id="pays" viewBox="0 0 520 170" width="100%" role="img" aria-label="Pays d'origine"></svg>
+      <div id="scen" class="note"></div>
+    </section>
+  </div>
+
+
+  <div class="g2">
+    <section class="carte">
+      <h2>Ce qu’ils cherchent</h2>
+      <p class="sous">Les chemins les plus sondés, 10 jours.</p>
+      <svg id="chemins" viewBox="0 0 520 230" width="100%" role="img" aria-label="Chemins sondés"></svg>
+      <div class="trouvaille"><b>Trouvaille :</b> /xmlrpc.php — 61 906 appels sur maisonboheme.org. C’est la porte de la force brute contre WordPress (des centaines de mots de passe par requête). Le couper dans nginx ne gêne pas le site.</div>
+    </section>
+    <section class="carte">
+      <h2>Robots et humains</h2>
+      <p class="sous">Part des robots dans le trafic de chaque site, 10 jours.</p>
+      <svg id="robots" viewBox="0 0 520 230" width="100%" role="img" aria-label="Part des robots par site"></svg>
+    </section>
+  </div>
+
+  <div class="g2">
+    <section class="carte">
+      <h2>Certificats</h2>
+      <p class="sous">Jours avant expiration ; renouvellement automatique à 30 jours, alerte sous 21.</p>
+      <svg id="certs" viewBox="0 0 520 210" width="100%" role="img" aria-label="Jours restants par certificat"></svg>
+    </section>
+    <section class="carte">
+      <h2>Courriel des domaines</h2>
+      <p class="sous">Qui peut envoyer en votre nom. Relu toutes les heures.</p>
+      <div class="matrice" id="courriel"></div>
+      <p class="note">SPF dit quels serveurs envoient pour vous ; DKIM signe chaque message ; DMARC dit quoi faire d’un faux.</p>
+    </section>
+  </div>
+
+  <section class="carte">
+    <h2>La maison (la box)</h2>
+    <p class="sous">Ce qui ouvre la maison sur Internet, lu par l’API de la Freebox.</p>
+    <div class="liste" id="box"></div>
+  </section>
+
+  <!-- 4. Failles des images -->
+  <section class="carte">
+    <h2>Failles des images Docker</h2>
+    <p class="sous">Trivy, dimanche dernier. Une faille « corrigée en amont » disparaît quand l’éditeur publie une nouvelle image.</p>
+    <div class="leg"><span><i style="background:var(--danger)"></i>Critiques</span><span><i style="background:var(--warn)"></i>Hautes</span></div>
+    <svg id="trivy" viewBox="0 0 1100 220" width="100%" role="img" aria-label="Failles par image"></svg>
+  </section>
+
+  <!-- 5. Les gardiens -->
+  <div class="g4">
+    <section class="carte tuile"><h2>Lynis</h2><svg id="lynis" viewBox="0 0 160 96" width="160" height="96" role="img" aria-label="Score Lynis 68"></svg><div class="lib">durcissement · 0 avertissement · 56 conseils</div></section>
+    <section class="carte tuile"><h2>ClamAV</h2><div class="chiffre">0</div><div class="lib">menace · balayage complet en 46 min</div><span class="pastille ok">BON</span></section>
+    <section class="carte tuile"><h2>CrowdSec</h2><div class="chiffre">8</div><div class="lib">bannies ici · 14 999 dans la liste communautaire · 12 alertes en 24 h</div><span class="pastille ok">ACTIF</span></section>
+    <section class="carte tuile"><h2>fail2ban</h2><div class="chiffre">5</div><div class="lib">prisons · 24 bannissements depuis le démarrage · 0 en cours</div><span class="pastille ok">ACTIF</span></section>
+  </div>
+
+  <div class="mq"><b>À trancher sur cette maquette :</b> l’ordre des cartes et celles à retirer ; garder ou non l’indice chiffré ; couper /xmlrpc.php sur maisonboheme.org (trouvaille de cette maquette) ; la période des attaques (12 jours = ce que gardent les journaux nginx ; Cassandra peut garder plus en les relevant chaque nuit).</div>
+</div>
+<div class="tip" id="tip"></div>
+
+<script>
+// ── Les données (réelles, Orion, 10-10) ─────────────────────────────────────
+const FAM = [["Exposition","ok","3 ouverts au réseau local · 1 public"],["Pare-feu","ok","refuse par défaut, IPv4 et IPv6"],
+  ["Accès","ok","SSH par clé seulement"],["Défenses","ok","fail2ban : 5 prisons"],["Outils","acc","4/4 · Trivy accepté"],
+  ["Mises à jour","ok","0 correctif en attente"],["Sauvegarde","acc","acceptée : pas encore de copie hors machine"],["Courriel","warn","2 contrôles sur 6 au vert"]];
+const JOURS = [["29-09",2892,386,33778,25902],["30-09",28333,2,73963,41721],["01-10",2903,152,111897,105505],["02-10",2380,281,173238,162357],
+  ["03-10",3567,338,138701,108673],["04-10",2667,280,140110,110368],["05-10",7837,681,218596,113710],["06-10",3655,434,166269,106074],
+  ["07-10",6808,324,271061,212230],["08-10",4685,1160,218697,186543],["09-10",4245,247,236617,223234],["10-10",16,7,49797,48762]];
+const PAYS = [["Corée du Sud",3],["Japon",2],["États-Unis",2],["Indonésie",1],["Canada",1],["Hong Kong",1]];
+const IMAGES = [["vaultwarden/server",4,62],["goauthentik/server 2026.8.3",3,68],["postgres:16-alpine",1,24],["searxng/searxng",0,0],["valkey/valkey:8",0,0]];
+const ANNEAUX = [["Internet",1,"Sites web (80/443, redirigés par la box)"],["Réseau local",3,"DNS local, sites, Tailscale"],
+  ["Le parc et Tailscale",9,"SSH, courriel, FastPanel, Cassandra, Grafana, OmniRoute, FTP, avahi"],["La machine seule",12,"MySQL, Ollama, Prometheus, Docker, CUPS, SNMP…"]];
+
+const NS = "http://www.w3.org/2000/svg", tip = document.getElementById("tip");
+const el = (n, a, p) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); if (p) p.appendChild(e); return e; };
+const fr = n => n.toLocaleString("fr-FR");
+function survol(node, html){ node.addEventListener("mousemove", e => { tip.innerHTML = html; tip.style.opacity = 1;
+  tip.style.left = Math.min(e.clientX + 14, innerWidth - 270) + "px"; tip.style.top = (e.clientY + 14) + "px"; });
+  node.addEventListener("mouseleave", () => tip.style.opacity = 0); }
+
+// ── 1. jauge + familles ────────────────────────────────────────────────────
+function jauge(){
+  const s = document.getElementById("jauge"); s.innerHTML = "";
+  const score = 100 - FAM.reduce((t, f) => t + (f[1] === "warn" ? 6 : f[1] === "danger" ? 15 : 0), 0);
+  const r = 70, c = 2 * Math.PI * r;
+  el("circle", {cx: 90, cy: 90, r, fill: "none", stroke: "var(--grid)", "stroke-width": 14}, s);
+  el("circle", {cx: 90, cy: 90, r, fill: "none", stroke: score >= 85 ? "var(--ok)" : score >= 60 ? "var(--warn)" : "var(--danger)",
+    "stroke-width": 14, "stroke-linecap": "round", "stroke-dasharray": (c * score / 100) + " " + c, transform: "rotate(-90 90 90)"}, s);
+  const t = el("text", {x: 90, y: 92, "text-anchor": "middle", class: "val", style: "font-size:38px;fill:var(--txt-strong)"}, s); t.textContent = score;
+  const u = el("text", {x: 90, y: 116, "text-anchor": "middle"}, s); u.textContent = "/ 100";
+  document.getElementById("fams").innerHTML = FAM.map(f => '<div class="fam" title="' + f[2] + '"><span class="pt ' + f[1] + '"></span><div><b>' + f[0] +
+    '</b><span>' + f[2] + '</span></div></div>').join("");
+}
+// ── 2. barres empilées ─────────────────────────────────────────────────────
+function barres(){
+  const s = document.getElementById("barres"); s.innerHTML = "";
+  const W = 1100, H = 260, g = {l: 56, r: 12, t: 22, b: 34}, iw = W - g.l - g.r, ih = H - g.t - g.b;
+  // Échelle plafonnée : un pic (30-09 : 28 335) écraserait tous les autres jours ; il est coupé, sa valeur écrite.
+  const max = 10000, pas = [0, 2500, 5000, 7500, 10000];
+  pas.forEach(v => { const y = g.t + ih - ih * v / max; el("line", {x1: g.l, x2: W - g.r, y1: y, y2: y, stroke: "var(--grid)"}, s);
+    const t = el("text", {x: g.l - 8, y: y + 4, "text-anchor": "end"}, s); t.textContent = v ? fr(v) : "0"; });
+  const bw = iw / JOURS.length, larg = Math.min(46, bw * .62);
+  JOURS.forEach((j, i) => {
+    const coupe = j[1] + j[2] > max;
+    const x = g.l + bw * i + (bw - larg) / 2, base = g.t + ih;
+    const h2 = coupe ? Math.max(3, ih * j[2] / (j[1] + j[2])) : ih * j[2] / max, h1 = coupe ? ih - h2 - 2 : ih * j[1] / max;
+    const grp = el("g", {}, s);
+    el("rect", {x: x - 6, y: g.t, width: larg + 12, height: ih, fill: "transparent"}, grp);               // cible de survol
+    el("path", {d: barre(x, base - h1, larg, h1, h2 < 1), fill: "var(--s1)"}, grp);
+    if (h2 >= 1) el("path", {d: barre(x, base - h1 - h2 - 2, larg, h2, true), fill: "var(--s2)"}, grp);  // 2 px d'écart
+    const lab = el("text", {x: x + larg / 2, y: H - 12, "text-anchor": "middle"}, s); lab.textContent = j[0];
+    if (coupe) {
+      el("rect", {x: x - 2, y: g.t + ih * .18, width: larg + 4, height: 5, fill: "var(--surface-solid)", transform: "skewY(-8)", "transform-origin": (x + larg / 2) + "px " + (g.t + ih * .18) + "px"}, grp);
+      const v = el("text", {x: x + larg / 2, y: g.t - 4, "text-anchor": "middle", class: "val"}, s); v.textContent = fr(j[1] + j[2]) + " ↑";
+    }
+    survol(grp, "<b>" + j[0] + (j[0] === "10-10" ? " (journée en cours)" : "") + "</b><br>Sondes d’effraction : " + fr(j[1]) + "<br>Mots de passe refusés : " + fr(j[2]) +
+      "<br><span style='color:var(--txt-faint)'>" + fr(j[3]) + " requêtes, dont " + Math.round(100 * j[4] / j[3]) + " % de robots</span>");
+  });
+  el("line", {x1: g.l, x2: W - g.r, y1: g.t + ih, y2: g.t + ih, stroke: "var(--txt-faint)", "stroke-opacity": .4}, s);
+  document.getElementById("t-barres").innerHTML = "<tr><th>Jour</th><th>Sondes</th><th>Mots de passe</th><th>Requêtes</th><th>Robots</th></tr>" +
+    JOURS.map(j => "<tr><td>" + j[0] + "</td><td>" + fr(j[1]) + "</td><td>" + fr(j[2]) + "</td><td>" + fr(j[3]) + "</td><td>" + fr(j[4]) + "</td></tr>").join("");
+}
+// une barre dont seul le bout est arrondi (4 px), posée sur sa base
+function barre(x, y, w, h, haut){ const r = haut ? Math.min(4, h) : 0;
+  return "M" + x + "," + (y + h) + "V" + (y + r) + (r ? "Q" + x + "," + y + " " + (x + r) + "," + y : "") + "H" + (x + w - r) + (r ? "Q" + (x + w) + "," + y + " " + (x + w) + "," + (y + r) : "") + "V" + (y + h) + "Z"; }
+// ── 3a. anneaux ────────────────────────────────────────────────────────────
+function anneaux(){
+  const s = document.getElementById("anneaux"); s.innerHTML = "";
+  const cx = 150, cy = 150, R = [140, 104, 68, 32], coul = ["var(--ring4)", "var(--ring3)", "var(--ring2)", "var(--ring1)"];
+  ANNEAUX.forEach((a, i) => {
+    const c = el("circle", {cx, cy, r: R[i], fill: coul[i], stroke: "var(--surface-solid)", "stroke-width": 2}, s);
+    survol(c, "<b>" + a[0] + " — " + a[1] + " service" + (a[1] > 1 ? "s" : "") + "</b><br>" + a[2]);
+  });
+  const nb = el("text", {x: cx, y: cy + 6, "text-anchor": "middle", class: "val", style: "font-size:16px;fill:var(--surface-solid)"}, s); nb.textContent = ANNEAUX[3][1];
+  ANNEAUX.forEach((a, i) => {
+    const y = 40 + i * 66, yr = cy - (i < 3 ? (R[i] + R[i + 1]) / 2 : 0);
+    el("line", {x1: cx + 6, y1: yr, x2: 310, y2: y - 4, stroke: "var(--txt-faint)", "stroke-opacity": .5}, s);
+    if (i < 3) { const n = el("text", {x: cx, y: yr + 5, "text-anchor": "middle", class: "val", style: "font-size:13px"}, s); n.textContent = a[1]; }
+    const t = el("text", {x: 316, y, class: "val", style: "font-size:12.5px"}, s); t.textContent = a[0] + " · " + a[1];
+    const d = el("text", {x: 316, y: y + 16, style: "font-size:10.5px"}, s); d.textContent = a[2].length > 30 ? a[2].slice(0, 29) + "…" : a[2];
+  });
+}
+// ── 3b. pays ───────────────────────────────────────────────────────────────
+function pays(){
+  const s = document.getElementById("pays"); s.innerHTML = "";
+  const max = 3, x0 = 120, w = 360;
+  PAYS.forEach((p, i) => { const y = 8 + i * 26, l = w * p[1] / max;
+    const t = el("text", {x: x0 - 10, y: y + 13, "text-anchor": "end", style: "fill:var(--txt-soft)"}, s); t.textContent = p[0];
+    const r = el("path", {d: "M" + x0 + "," + y + "H" + (x0 + l - 4) + "Q" + (x0 + l) + "," + y + " " + (x0 + l) + "," + (y + 4) + "V" + (y + 14) + "Q" + (x0 + l) + "," + (y + 18) + " " + (x0 + l - 4) + "," + (y + 18) + "H" + x0 + "Z", fill: "var(--accent)"}, s);
+    const v = el("text", {x: x0 + l + 6, y: y + 13, class: "val"}, s); v.textContent = p[1];
+    survol(r, "<b>" + p[0] + "</b><br>" + p[1] + " alerte" + (p[1] > 1 ? "s" : "") + " en 24 h"); });
+  document.getElementById("scen").innerHTML = "Le plus tenté : <b>sonder des chemins</b> (4) · <b>chercher une page d’administration</b> (3) · <b>outils d’attaque reconnus</b> (2) · technologie, proxy ouvert, fichiers sensibles (1 chacun).";
+}
+// ── 4. trivy ───────────────────────────────────────────────────────────────
+function trivy(){
+  const s = document.getElementById("trivy"); s.innerHTML = "";
+  const x0 = 250, w = 760, max = 80;
+  IMAGES.forEach((im, i) => { const y = 10 + i * 40, lc = w * im[1] / max, lh = w * im[2] / max;
+    const t = el("text", {x: x0 - 12, y: y + 17, "text-anchor": "end", style: "fill:var(--txt-soft);font-size:12px"}, s); t.textContent = im[0];
+    const g = el("g", {}, s);
+    el("rect", {x: x0, y: y, width: w, height: 24, fill: "transparent"}, g);
+    if (lc) el("rect", {x: x0, y, width: lc, height: 24, fill: "var(--danger)", rx: 0}, g);
+    if (lh) el("path", {d: "M" + (x0 + lc + (lc ? 2 : 0)) + "," + y + "H" + (x0 + lc + lh - 4) + "Q" + (x0 + lc + lh) + "," + y + " " + (x0 + lc + lh) + "," + (y + 4) + "V" + (y + 20) + "Q" + (x0 + lc + lh) + "," + (y + 24) + " " + (x0 + lc + lh - 4) + "," + (y + 24) + "H" + (x0 + lc + (lc ? 2 : 0)) + "Z", fill: "var(--warn)"}, g);
+    const v = el("text", {x: x0 + lc + lh + 10, y: y + 17, class: "val"}, s);
+    v.textContent = im[1] + im[2] ? im[1] + " critique" + (im[1] > 1 ? "s" : "") + " · " + im[2] + " hautes" : "aucune faille";
+    survol(g, "<b>" + im[0] + "</b><br>" + im[1] + " critique(s), " + im[2] + " haute(s)" + (im[1] ? "<br>acceptée : attend une nouvelle image" : ""));
+  });
+}
+// ── 5. lynis ───────────────────────────────────────────────────────────────
+function lynis(){
+  const s = document.getElementById("lynis"); s.innerHTML = ""; const sc = 68, r = 62, c = Math.PI * r;
+  el("path", {d: "M18,84 A62,62 0 0 1 142,84", fill: "none", stroke: "var(--grid)", "stroke-width": 12, "stroke-linecap": "round"}, s);
+  el("path", {d: "M18,84 A62,62 0 0 1 142,84", fill: "none", stroke: "var(--warn)", "stroke-width": 12, "stroke-linecap": "round", "stroke-dasharray": (c * sc / 100) + " " + c}, s);
+  const t = el("text", {x: 80, y: 80, "text-anchor": "middle", class: "val", style: "font-size:24px;fill:var(--txt-strong)"}, s); t.textContent = sc;
+}
+
+// ── les indices ────────────────────────────────────────────────────────────
+const KPI = [["3", "ports ouverts sur Internet", "80, 443 (sites) · 49153 (Plex)", "ok"],
+  ["773", "adresses attaquantes", "10 jours · les 10 plus actives font 45 %", "warn"],
+  ["79 j", "avant le 1er certificat", "coffre et maisonboheme.org", "ok"],
+  ["2 / 6", "contrôles courriel au vert", "SPF, DKIM, DMARC × 2 domaines", "warn"],
+  ["0", "correctif en attente", "correctifs automatiques chaque nuit", "ok"],
+  ["4 / 4", "gardiens en service", "Lynis, Trivy, ClamAV, CrowdSec", "ok"]];
+function kpis(){ document.getElementById("kpis").innerHTML = KPI.map(k => '<div class="kpi" title="' + k[2] + '"><b>' + k[0] + '</b><em><span class="pt ' + k[3] + '"></span>' + k[1] + '</em><small>' + k[2] + '</small></div>').join(""); }
+// ── carte de chaleur (une teinte, du clair au foncé) ───────────────────────
+const CH_J = ["04-10","05-10","06-10","07-10","08-10","09-10","10-10"];
+const CH = [[4,28,0,1,5,0,1,9,41,12,1271,218,85,7,6,79,182,323,81,273,90,9,7,215],[141,45,113,5,317,152,45,122,306,57,105,39,382,238,214,5,336,1956,215,311,148,59,1604,1603],
+  [3,5,4,156,0,1614,29,78,19,149,67,279,6,249,3,64,209,432,36,1,126,436,123,1],[59,94,3,1,76,14,3,317,189,65,222,24,150,74,105,68,316,4729,215,38,206,5,6,153],
+  [266,70,78,316,19,255,258,14,44,230,162,389,271,100,12,20,1772,257,169,292,63,266,353,169],[148,49,8,191,12,93,10,205,357,365,14,365,1909,222,168,5,4,67,218,57,6,10,5,4],
+  [2,9,3,3,5,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]];
+function chaleur(){
+  const s = document.getElementById("chaleur"); s.innerHTML = "";
+  const x0 = 60, y0 = 8, cw = (1100 - x0 - 10) / 24, chh = 26, pas = [0, 50, 200, 1000, Infinity], op = [.16, .38, .62, .9];
+  CH.forEach((ligne, j) => {
+    const t = el("text", {x: x0 - 8, y: y0 + j * chh + 17, "text-anchor": "end"}, s); t.textContent = CH_J[j];
+    ligne.forEach((v, h) => {
+      const k = v === 0 ? -1 : pas.findIndex((b, i) => v > b && v <= pas[i + 1]);
+      const r = el("rect", {x: x0 + h * cw + 1, y: y0 + j * chh + 1, width: cw - 2, height: chh - 2, rx: 3,
+        fill: k < 0 ? "var(--grid)" : "var(--accent)", "fill-opacity": k < 0 ? 1 : op[k]}, s);
+      survol(r, "<b>" + CH_J[j] + " · " + h + " h</b><br>" + fr(v) + " attaque" + (v > 1 ? "s" : "") + " repoussée" + (v > 1 ? "s" : ""));
+    });
+  });
+  for (let h = 0; h < 24; h += 3) { const t = el("text", {x: x0 + h * cw + cw / 2, y: y0 + 7 * chh + 16, "text-anchor": "middle"}, s); t.textContent = h + " h"; }
+  ["0", "1–50", "51–200", "201–1 000", "> 1 000"].forEach((l, i) => {
+    const x = x0 + i * 120, y = y0 + 7 * chh + 30;
+    el("rect", {x, y, width: 14, height: 14, rx: 3, fill: i ? "var(--accent)" : "var(--grid)", "fill-opacity": i ? op[i - 1] : 1}, s);
+    const t = el("text", {x: x + 20, y: y + 11}, s); t.textContent = l; });
+}
+// ── barres horizontales génériques ─────────────────────────────────────────
+function hbarres(id, rows, max, couleur, suffixe, x0){
+  const s = document.getElementById(id); s.innerHTML = ""; const w = 520 - x0 - 70;
+  rows.forEach((r, i) => { const y = 6 + i * 27, l = Math.max(3, w * r[1] / max);
+    const t = el("text", {x: x0 - 10, y: y + 13, "text-anchor": "end", style: "fill:var(--txt-soft)"}, s); t.textContent = r[0];
+    const b = el("path", {d: "M" + x0 + "," + y + "H" + (x0 + l - 4) + "Q" + (x0 + l) + "," + y + " " + (x0 + l) + "," + (y + 4) + "V" + (y + 14) + "Q" + (x0 + l) + "," + (y + 18) + " " + (x0 + l - 4) + "," + (y + 18) + "H" + x0 + "Z", fill: r[2] || couleur}, s);
+    const v = el("text", {x: x0 + l + 6, y: y + 13, class: "val"}, s); v.textContent = (r[3] || fr(r[1])) + (suffixe || "");
+    survol(b, "<b>" + r[0] + "</b><br>" + (r[4] || fr(r[1]) + (suffixe || ""))); });
+}
+function chemins(){
+  // xmlrpc écraserait tout : échelle plafonnée, la barre coupée porte sa vraie valeur
+  hbarres("chemins", [["/xmlrpc.php", 1200, "var(--warn)", "61 906 ↑", "61 906 appels — force brute WordPress"], ["/.git", 558], ["/.env", 370], ["/api", 321], ["/@fs", 266],
+    ["/cgi-bin", 251], ["/.env.local", 194], ["/.env.production", 190]], 1200, "var(--s1)", "", 130);
+}
+function robots(){
+  hbarres("robots", [["maisonboheme.org", 92, "", "92 %", "1 565 262 requêtes, dont 1 446 651 de robots"], ["auth", 27, "", "27 %", "2 439 requêtes"],
+    ["coffre", 2, "", "2 %", "4 651 requêtes"], ["app", 1, "", "1 %", "171 119 requêtes"], ["search", 1, "", "1 %", "5 801 requêtes"], ["omniroute", 0, "", "0 %", "87 194 requêtes"]],
+    100, "var(--s2)", "", 130);
+}
+function certs(){
+  const s = document.getElementById("certs"); s.innerHTML = "";
+  const C = [["coffre", 79], ["maisonboheme.org", 79], ["app", 81], ["search", 82], ["omniroute", 83], ["auth", 85]], x0 = 130, w = 330, max = 90;
+  [21, 30].forEach(j => { const x = x0 + w * j / max; el("line", {x1: x, x2: x, y1: 0, y2: 168, stroke: j === 21 ? "var(--danger)" : "var(--txt-faint)", "stroke-dasharray": "3 3", "stroke-opacity": .6}, s);
+    const t = el("text", {x, y: 184, "text-anchor": "middle"}, s); t.textContent = j + " j"; });
+  C.forEach((c, i) => { const y = 4 + i * 27, l = w * c[1] / max;
+    const t = el("text", {x: x0 - 10, y: y + 13, "text-anchor": "end", style: "fill:var(--txt-soft)"}, s); t.textContent = c[0];
+    const b = el("rect", {x: x0, y, width: l, height: 18, rx: 4, fill: "var(--ok)", "fill-opacity": .85}, s);
+    const v = el("text", {x: x0 + l + 6, y: y + 13, class: "val"}, s); v.textContent = c[1] + " j";
+    survol(b, "<b>" + c[0] + "</b><br>Let’s Encrypt · expire dans " + c[1] + " jours"); });
+}
+function courriel(){
+  const C = [["cassandra.center", ["warn", "souple, sans cette machine"], ["ok", "signé (dkim)"], ["warn", "surveillance seule"]],
+             ["maisonboheme.org", ["ok", "souple (~all)"], ["danger", "aucune signature"], ["warn", "surveillance seule"]]];
+  const ic = {ok: "✓", warn: "!", danger: "✕"};
+  document.getElementById("courriel").innerHTML = '<div></div><div class="h">SPF</div><div class="h">DKIM</div><div class="h">DMARC</div>' +
+    C.map(d => '<div class="d">' + d[0] + '</div>' + d.slice(1).map(c => '<div class="cel ' + c[0] + '"><i>' + ic[c[0]] + '</i>' + c[1] + '</div>').join("")).join("");
+}
+function box(){
+  const B = [["ok", "Accès distant à Freebox OS", "fermé"], ["ok", "UPnP", "désactivé"], ["ok", "DMZ", "désactivée"], ["ok", "Pare-feu IPv6", "actif"],
+    ["ok", "Wi-Fi", "WPA2 (2,4 / 5 GHz) · WPA3 (6 GHz)"], ["warn", "WPS", "actif par le bouton"], ["ok", "Redirections", "3 : 80, 443 → Orion · 49153 → Plex"],
+    ["ok", "Appareils", "17 connectés sur 71 connus"], ["ok", "DNS de la maison", "le DNS local d’Orion, la box en secours"], ["ok", "Tailnet", "6 appareils · aucun partage ni Funnel"]];
+  document.getElementById("box").innerHTML = B.map(b => '<div><span class="pt ' + b[0] + '"></span><b>' + b[1] + '</b><span>' + b[2] + '</span></div>').join("");
+}
+function tout(){ jauge(); kpis(); barres(); chaleur(); chemins(); robots(); certs(); courriel(); box(); anneaux(); pays(); trivy(); lynis(); }
+function theme(){ const r = document.documentElement, sombre = r.dataset.theme ? r.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  r.dataset.theme = sombre ? "light" : "dark"; tout(); }
+tout();
+</script>
+</body>
+</html>

@@ -4365,9 +4365,8 @@ def _cassandra_demarrages() -> list:
     return out
 
 
-def collect_sante_applicative() -> list:
-    out = []
-    # Trafic et erreurs par site : journaux FastPanel (un par site), puis ceux de nginx et d'apache
+def _journaux_acces() -> dict:
+    """{site: chemin du journal d'accès} — ceux d'un panneau (un par site, FastPanel), puis nginx et apache."""
     journaux = {}
     for f in Path("/var/www").glob("*/data/logs/*-frontend.access.log"):
         journaux[f.name[:-len("-frontend.access.log")]] = str(f)
@@ -4376,6 +4375,165 @@ def collect_sante_applicative() -> list:
             nom = re.sub(r"[._-]?access\.log$", "", f.name) or f.name
             if nom not in journaux and nom not in ("", "access", "other_vhosts"):
                 journaux[nom] = str(f)
+    return journaux
+
+
+# ── L'HISTORIQUE DES ATTAQUES (10-10) ────────────────────────────────────────────────────────────────────
+# L'onglet Sécurité › En images trace les attaques jour par jour et heure par heure. Relire dix jours de
+# journaux prend deux minutes : le collecteur tient donc des totaux, en ne lisant que les lignes NOUVELLES de
+# chaque journal (inode + position gardés dans world_meta ; une rotation se finit dans le « .1 », même
+# inode). Au premier passage, les journaux archivés (.1, .N.gz) remplissent le passé, une fois.
+_SECU_LIGNE = re.compile(r'^(\S+) \S+ \S+ \[(\d\d)/(\w{3})/(\d{4}):(\d\d):[^\]]*\] "([^"]*)" (\d{3}) \S+ "[^"]*" "([^"]*)"')
+_SECU_GARDE_JOURS = 400
+_SECU_VERROU = threading.Lock()
+
+
+def _secu_tables(k):
+    k.execute("CREATE TABLE IF NOT EXISTS secu_jour (jour TEXT, site TEXT, requetes INTEGER DEFAULT 0, robots INTEGER DEFAULT 0, "
+              "sondes INTEGER DEFAULT 0, refus INTEGER DEFAULT 0, erreurs5 INTEGER DEFAULT 0, PRIMARY KEY (jour, site))")
+    k.execute("CREATE TABLE IF NOT EXISTS secu_heure (jour TEXT, heure INTEGER, attaques INTEGER DEFAULT 0, PRIMARY KEY (jour, heure))")
+    k.execute("CREATE TABLE IF NOT EXISTS secu_chemin (jour TEXT, chemin TEXT, n INTEGER DEFAULT 0, PRIMARY KEY (jour, chemin))")
+    k.execute("CREATE TABLE IF NOT EXISTS secu_ip (jour TEXT, ip TEXT, n INTEGER DEFAULT 0, PRIMARY KEY (jour, ip))")
+    k.execute("CREATE TABLE IF NOT EXISTS world_meta (cle TEXT PRIMARY KEY, valeur TEXT)")
+
+
+_SECU_MAISON = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16",
+                "::1/128", "fc00::/7", "fe80::/10")
+
+
+def _secu_maison(ip: str) -> bool:
+    """Les réseaux locaux, Tailscale, la boucle — nommés un à un : « is_private » de Python range aussi les
+    plages de documentation et quelques plages réservées parmi les privées."""
+    import ipaddress
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    return any(a in ipaddress.ip_network(n) for n in _SECU_MAISON if ipaddress.ip_network(n).version == a.version)
+
+
+def _secu_compter(site: str, lignes, acc: dict):
+    """Ajoute aux accumulateurs les lignes d'un journal (format combiné)."""
+    for l in lignes:
+        m = _SECU_LIGNE.match(l)
+        if not m:
+            continue
+        ip, dd, mo, yy, hh, req, c, ua = m.groups()
+        if _secu_maison(ip):
+            continue
+        jour = "%s-%02d-%s" % (yy, _MOIS.get(mo, 0), dd)
+        j = acc["jour"].setdefault((jour, site), [0, 0, 0, 0, 0])
+        j[0] += 1
+        if _ROBOT_RE.search(ua):
+            j[1] += 1
+        if c.startswith("5"):
+            j[4] += 1
+        attaque = False
+        if _EFFRACTION_RE.search(req):
+            j[2] += 1
+            attaque = True
+            p = req.split(" ")[1] if " " in req else req
+            p = "/" + p.split("?")[0].lstrip("/").split("/")[0][:60]
+            acc["chemin"][(jour, p)] = acc["chemin"].get((jour, p), 0) + 1
+        elif ((req.startswith("POST /wp-login.php") and c == "200") or (req.startswith("POST /api/login ") and c == "401")
+              or (req.startswith("POST /identity/connect/token") and c == "400") or (req.startswith("POST /admin") and c == "401")
+              or (req.startswith("POST /xmlrpc.php") and c in ("200", "403"))):
+            j[3] += 1
+            attaque = True
+        if attaque:
+            acc["heure"][(jour, int(hh))] = acc["heure"].get((jour, int(hh)), 0) + 1
+            acc["ip"][(jour, ip)] = acc["ip"].get((jour, ip), 0) + 1
+
+
+def _secu_ecrire(k, acc: dict):
+    for (jour, site), v in acc["jour"].items():
+        k.execute("INSERT INTO secu_jour (jour, site, requetes, robots, sondes, refus, erreurs5) VALUES (?,?,?,?,?,?,?) "
+                  "ON CONFLICT(jour, site) DO UPDATE SET requetes=requetes+excluded.requetes, robots=robots+excluded.robots, "
+                  "sondes=sondes+excluded.sondes, refus=refus+excluded.refus, erreurs5=erreurs5+excluded.erreurs5", (jour, site, *v))
+    for (jour, h), n in acc["heure"].items():
+        k.execute("INSERT INTO secu_heure (jour, heure, attaques) VALUES (?,?,?) ON CONFLICT(jour, heure) DO UPDATE SET attaques=attaques+excluded.attaques", (jour, h, n))
+    for (jour, p), n in acc["chemin"].items():
+        k.execute("INSERT INTO secu_chemin (jour, chemin, n) VALUES (?,?,?) ON CONFLICT(jour, chemin) DO UPDATE SET n=n+excluded.n", (jour, p, n))
+    for (jour, ip), n in acc["ip"].items():
+        k.execute("INSERT INTO secu_ip (jour, ip, n) VALUES (?,?,?) ON CONFLICT(jour, ip) DO UPDATE SET n=n+excluded.n", (jour, ip, n))
+
+
+def _secu_lire(chemin: str, debut: int = 0):
+    """(lignes, position de fin) — gzip lu en entier."""
+    import gzip
+    if chemin.endswith(".gz"):
+        with gzip.open(chemin, "rt", errors="replace") as f:
+            return f.read().splitlines(), 0
+    with open(chemin, "rb") as f:
+        f.seek(debut)
+        data = f.read()
+    fin = debut + len(data)
+    if data and not data.endswith(b"\n"):          # une ligne en cours d'écriture : relue au prochain passage
+        coupe = data.rfind(b"\n") + 1
+        data, fin = data[:coupe], debut + coupe
+    return data.decode("utf-8", "replace").splitlines(), fin
+
+
+def collect_securite_historique() -> list:
+    """Avance les totaux d'attaques avec les lignes nouvelles de chaque journal d'accès. Ne rend aucune mesure :
+    il nourrit secu_jour, secu_heure, secu_chemin et secu_ip, que lit l'onglet Sécurité › En images."""
+    import glob
+    if _SECU_VERROU is not None and not _SECU_VERROU.acquire(blocking=False):
+        return []
+    try:
+        k = get_conn()
+        try:
+            _secu_tables(k)
+            etat = {r[0][9:]: r[1] for r in k.execute("SELECT cle, valeur FROM world_meta WHERE cle LIKE 'secu_log:%'")}
+            premier = not etat
+            for site, chemin in _journaux_acces().items():
+                acc = {"jour": {}, "heure": {}, "chemin": {}, "ip": {}}
+                try:
+                    st = os.stat(chemin)
+                except OSError:
+                    continue
+                ino, pos = (etat.get(chemin) or "0:0").split(":")
+                ino, pos = int(ino), int(pos)
+                if premier or not etat.get(chemin):
+                    # Le passé, une fois : les archives (les plus vieilles d'abord), puis le journal en entier.
+                    for a in sorted(glob.glob(chemin + ".*"), key=lambda x: -int(re.findall(r"\.(\d+)", x)[-1]) if re.findall(r"\.(\d+)", x) else 0):
+                        try:
+                            _secu_compter(site, _secu_lire(a)[0], acc)
+                        except Exception:
+                            pass
+                    pos = 0
+                elif ino != st.st_ino:
+                    # Rotation : la fin de l'ancien journal est dans le « .1 » (même inode), puis le neuf depuis le début.
+                    un = chemin + ".1"
+                    try:
+                        if os.stat(un).st_ino == ino:
+                            _secu_compter(site, _secu_lire(un, pos)[0], acc)
+                    except OSError:
+                        pass
+                    pos = 0
+                elif st.st_size < pos:
+                    pos = 0                                  # tronqué sur place
+                lignes, fin = _secu_lire(chemin, pos)
+                _secu_compter(site, lignes, acc)
+                _secu_ecrire(k, acc)
+                k.execute("INSERT OR REPLACE INTO world_meta (cle, valeur) VALUES (?,?)", ("secu_log:" + chemin, "%d:%d" % (st.st_ino, fin)))
+                k.commit()
+            limite = (datetime.now() - timedelta(days=_SECU_GARDE_JOURS)).strftime("%Y-%m-%d")
+            for t in ("secu_jour", "secu_heure", "secu_chemin", "secu_ip"):
+                k.execute("DELETE FROM %s WHERE jour < ?" % t, (limite,))
+            k.commit()
+        finally:
+            k.close()
+    finally:
+        if _SECU_VERROU is not None:
+            _SECU_VERROU.release()
+    return []
+
+
+def collect_sante_applicative() -> list:
+    out = []
+    # Trafic et erreurs par site : journaux FastPanel (un par site), puis ceux de nginx et d'apache
+    journaux = _journaux_acces()
     for nom, chemin in sorted(journaux.items()):
         r = _trafic_heure(chemin)
         if not r or not r[0]:
@@ -4855,6 +5013,9 @@ def collect_box() -> list:
 
 def collect_mesures_diverses() -> list:
     rows = []
+    # L'historique des attaques tourne à côté : son premier passage relit des jours d'archives (minutes).
+    if not _SECU_VERROU.locked():
+        threading.Thread(target=collect_securite_historique, daemon=True, name="secu-historique").start()
     for fn in (collect_file_courriel, collect_ssh_echecs, collect_docker_ressources, collect_certbot, collect_journaux_poids,
                collect_sante_applicative, collect_box, collect_tailnet, collect_fail2ban_prisons,
                collect_courriel_domaines, collect_images_docker, collect_dns_local, collect_outils_securite):

@@ -88704,6 +88704,155 @@ def securite_geste(data: dict, sid: str, user: str) -> dict:
     return r
 
 
+# ── SÉCURITÉ › EN IMAGES (10-10) ─────────────────────────────────────────────────────────────────────────
+# Une page de diagrammes, validée sur maquette par Drisse (« garde tout »). Tout vient de mesures déjà prises :
+# l'état de l'onglet (en cache), les totaux d'attaques que tient le collecteur (secu_jour, secu_heure,
+# secu_chemin, secu_ip), les résultats des outils, et les mesures du Sensorium (courriel, box, tailnet).
+_SEC_PAYS = {"FR": "France", "US": "États-Unis", "CN": "Chine", "RU": "Russie", "KR": "Corée du Sud", "JP": "Japon", "DE": "Allemagne",
+             "NL": "Pays-Bas", "GB": "Royaume-Uni", "IN": "Inde", "BR": "Brésil", "SG": "Singapour", "HK": "Hong Kong", "ID": "Indonésie",
+             "CA": "Canada", "VN": "Viêt Nam", "TW": "Taïwan", "UA": "Ukraine", "IR": "Iran", "TR": "Turquie", "IT": "Italie",
+             "ES": "Espagne", "PL": "Pologne", "RO": "Roumanie", "BG": "Bulgarie", "SE": "Suède", "FI": "Finlande", "LT": "Lituanie",
+             "TH": "Thaïlande", "AR": "Argentine", "MX": "Mexique", "ZA": "Afrique du Sud", "AU": "Australie", "?": "inconnu"}
+_SEC_IMG_CACHE = {"t": 0.0, "d": None}
+
+
+def _sec_courriel_etats(valeur: str) -> list:
+    """[spf, dkim, dmarc] : (niveau, mot) lus dans la mesure du Sensorium d'un domaine."""
+    v = str(valeur or "")
+    if "AUCUN SPF" in v or "OUVERT À TOUS" in v:
+        spf = ("danger", "absent ou ouvert à tous")
+    elif "n'y est pas" in v:
+        spf = ("warn", "sans cette machine")
+    else:
+        spf = ("ok", "strict" if "strict" in v else "souple (~all)")
+    dk = re.search(r"DKIM : ([^·]+)", v)
+    dkim = ("danger", "aucune signature") if (not dk or "aucune" in dk.group(1)) else ("ok", "signé (%s)" % dk.group(1).strip()[:30])
+    if "AUCUN DMARC" in v:
+        dmarc = ("danger", "absent")
+    elif "p=none" in v or "surveillance" in v:
+        dmarc = ("warn", "surveillance seule")
+    else:
+        dmarc = ("ok", "rejette" if "rejette" in v else "quarantaine")
+    return [spf, dkim, dmarc]
+
+
+def securite_images(compte: str = "") -> dict:
+    if _SEC_IMG_CACHE["d"] and time.time() - _SEC_IMG_CACHE["t"] < 60:
+        return _SEC_IMG_CACHE["d"]
+    d = securite_etat(compte)
+    V = d.get("verdict") or {}
+
+    def q(sql, args=()):
+        try:
+            return query_db(sql, args) or []
+        except Exception:
+            return []
+    mesures = {r["cle"]: r for r in q("SELECT cle, valeur, severite FROM mesures_diverses WHERE cle LIKE 'domaine_courriel.%' "
+                                      "OR cle LIKE 'box.%' OR cle LIKE 'tailnet.%' OR cle = 'dns_local'")}
+    try:
+        acquits = sensorium_acquits()
+    except Exception:
+        acquits = {}
+
+    # Les familles : celles du verdict, plus le courriel et la sauvegarde (Sensorium), acceptations comprises.
+    fams = [{"lib": f["lib"], "niveau": f["niveau"] or "ok", "dit": f["dit"]} for f in (V.get("familles") or [])]
+    courriel = []
+    for cle in sorted(k for k in mesures if k.startswith("domaine_courriel.")):
+        courriel.append({"domaine": cle.split(".", 1)[1], "etats": _sec_courriel_etats(mesures[cle]["valeur"])})
+    verts = sum(1 for c in courriel for e in c["etats"] if e[0] == "ok")
+    total_c = sum(len(c["etats"]) for c in courriel)
+    if courriel:
+        fams.append({"lib": "Courriel", "niveau": "ok" if verts == total_c else ("panne" if any(e[0] == "danger" for c in courriel for e in c["etats"]) and verts == 0 else "regarder"),
+                     "dit": "%d contrôle%s sur %d au vert" % (verts, "s" if verts > 1 else "", total_c)})
+    sv = next((r for r in (world_model_from_socket() or []) if isinstance(r, dict) and r.get("wkey") == "sauvegarde.hors_machine"), None)
+    if sv:
+        acc = _sensorium_acquis(sv, acquits) if sv.get("severity") == "warning" else False
+        fams.append({"lib": "Sauvegarde", "niveau": "accepte" if acc else ("regarder" if sv.get("severity") == "warning" else "ok"),
+                     "dit": ("acceptée : " + (acquits.get("sauvegarde.hors_machine") or {}).get("raison", "")) if acc else str(sv.get("value") or "")[:80]})
+    indice = max(0, 100 - sum(6 if f["niveau"] == "regarder" else 15 if f["niveau"] == "panne" else 0 for f in fams))
+
+    # L'histoire des attaques (totaux du collecteur)
+    jours = q("SELECT jour, SUM(sondes) s, SUM(refus) r, SUM(requetes) n, SUM(robots) b FROM secu_jour "
+              "WHERE jour >= date('now','localtime','-13 days') GROUP BY jour ORDER BY jour")
+    heures = q("SELECT jour, heure, attaques FROM secu_heure WHERE jour >= date('now','localtime','-6 days')")
+    jours7 = sorted({h["jour"] for h in heures} | {(datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)})[-7:]
+    grille = {(h["jour"], h["heure"]): h["attaques"] for h in heures}
+    chemins = q("SELECT chemin, SUM(n) n FROM secu_chemin WHERE jour >= date('now','localtime','-9 days') GROUP BY chemin ORDER BY n DESC LIMIT 8")
+    ips = q("SELECT ip, SUM(n) n FROM secu_ip WHERE jour >= date('now','localtime','-9 days') GROUP BY ip ORDER BY n DESC")
+    tot_ip = sum(r["n"] for r in ips) or 1
+    sites = q("SELECT site, SUM(requetes) n, SUM(robots) b FROM secu_jour WHERE jour >= date('now','localtime','-9 days') "
+              "GROUP BY site HAVING n >= 100 ORDER BY n DESC LIMIT 8")
+
+    # Certificats : le dernier relevé de chaque site encore suivi
+    certs = []
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+        try:
+            certs = [{"domaine": r[0], "jours": r[1]} for r in conn.execute(
+                "SELECT domain, ssl_days FROM site_status WHERE id IN (SELECT MAX(id) FROM site_status GROUP BY domain) "
+                "AND ssl_days IS NOT NULL AND ts > datetime('now','-2 days') ORDER BY ssl_days")]
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+    # Qui peut joindre quoi : le service sur l'anneau le plus lointain qui l'atteint
+    E = d.get("exposition") or []
+    anneaux = [{"lib": "Internet", "services": [s["nom"] for s in E if s["internet"] == "oui"]},
+               {"lib": "Réseau local", "services": [s["nom"] for s in E if s["reseau"] and s["internet"] != "oui"]},
+               {"lib": "Le parc et Tailscale", "services": [s["nom"] for s in E if not s["reseau"] and s["internet"] != "oui" and (s.get("parc") or s["tailscale"])]},
+               {"lib": "La machine seule", "services": [s["nom"] for s in E if not s["reseau"] and s["internet"] != "oui" and not (s.get("parc") or s["tailscale"])]}]
+    redir = d.get("box_redirections")
+    ports_net = len(redir) if redir is not None else len(anneaux[0]["services"])
+
+    O = d.get("outils") or {}
+    R = lambda k: (O.get(k) or {}).get("resultat") or {}
+    cs, tv, ly, cl = R("crowdsec"), R("trivy"), R("lynis"), R("clamav")
+    f2b = d.get("fail2ban") or {}
+    maj = d.get("maj") or {}
+    box = []
+    for cle, lib in (("box.acces_distant", "Accès distant à la box"), ("box.upnp", "UPnP"), ("box.dmz", "DMZ"), ("box.ipv6", "Pare-feu IPv6"),
+                     ("box.wifi", "Wi-Fi"), ("box.redirections", "Redirections"), ("box.appareils", "Appareils"), ("dns_local", "DNS de la maison"),
+                     ("tailnet.appareils", "Tailnet"), ("tailnet.partage", "Partages du tailnet")):
+        m = mesures.get(cle)
+        if m:
+            box.append({"lib": lib, "dit": str(m["valeur"] or "")[:120], "niveau": "warn" if (m.get("severite") or "") in ("warning", "critical") else
+                        ("warn" if cle == "box.wifi" and "WPS actif" in str(m["valeur"]) else "ok")})
+    gardiens = [k for k, o in O.items() if o.get("installe")]
+    kpis = [
+        {"v": str(ports_net), "lib": "port%s ouvert%s sur Internet" % ("s" if ports_net > 1 else "", "s" if ports_net > 1 else ""),
+         "dit": " · ".join("%s %d" % (r["proto"].upper(), r["port"]) for r in (redir or [])) or "relevé sur la machine", "niveau": "ok"},
+        {"v": "%d" % len(ips), "lib": "adresses attaquantes", "dit": "10 jours · les 10 plus actives font %d %%" % round(100 * sum(r["n"] for r in ips[:10]) / tot_ip),
+         "niveau": "warn" if ips else "ok"},
+        {"v": ("%d j" % certs[0]["jours"]) if certs else "—", "lib": "avant le 1er certificat", "dit": certs[0]["domaine"] if certs else "aucun relevé",
+         "niveau": "danger" if certs and certs[0]["jours"] < 7 else "warn" if certs and certs[0]["jours"] < 21 else "ok"},
+        {"v": "%d / %d" % (verts, total_c) if total_c else "—", "lib": "contrôles courriel au vert", "dit": "SPF, DKIM, DMARC × %d domaine%s" % (len(courriel), "s" if len(courriel) > 1 else ""),
+         "niveau": "ok" if verts == total_c else "warn"},
+        {"v": str(maj.get("securite_en_attente", 0)), "lib": "correctif%s en attente" % ("s" if maj.get("securite_en_attente", 0) > 1 else ""),
+         "dit": "correctifs automatiques chaque nuit" if maj.get("auto_actif") else "rien d'automatique", "niveau": "warn" if maj.get("securite_en_attente") else "ok"},
+        {"v": "%d / %d" % (len(gardiens), len(O) or 4), "lib": "gardiens en service", "dit": ", ".join(_SECU_OUTILS[k]["nom"] for k in gardiens) or "aucun installé",
+         "niveau": "ok" if len(gardiens) == len(O) else "warn"}]
+    out = {
+        "ok": True, "mesure": d.get("mesure"), "titre": V.get("titre"), "niveau": V.get("niveau"), "indice": indice, "familles": fams, "kpis": kpis,
+        "jours": [{"jour": r["jour"], "sondes": r["s"] or 0, "refus": r["r"] or 0, "requetes": r["n"] or 0, "robots": r["b"] or 0} for r in jours],
+        "chaleur": {"jours": jours7, "grille": [[grille.get((j, h), 0) for h in range(24)] for j in jours7]},
+        "chemins": [{"chemin": r["chemin"], "n": r["n"]} for r in chemins],
+        "robots": [{"site": r["site"], "n": r["n"], "part": round(100 * (r["b"] or 0) / r["n"]) if r["n"] else 0} for r in sites],
+        "anneaux": anneaux, "certs": certs, "courriel": courriel, "box": box,
+        "pays": [{"pays": _SEC_PAYS.get(p["pays"], p["pays"]), "n": p["n"]} for p in (cs.get("pays_7j") or [])],
+        "scenarios": cs.get("scenarios_24h") or [],
+        "trivy": [{"image": i.get("image"), "critiques": i.get("critiques", 0), "hautes": i.get("hautes", 0)} for i in (tv.get("images") or []) if not i.get("erreur")],
+        "trivy_accepte": (O.get("trivy") or {}).get("niveau") == "accepte",
+        "gardiens": {"lynis": {"score": ly.get("score"), "avertissements": len(ly.get("avertissements") or []), "conseils": ly.get("suggestions_n", 0), "installe": (O.get("lynis") or {}).get("installe")},
+                     "clamav": {"menaces": len(cl.get("infectes") or []), "duree": cl.get("duree_min"), "installe": (O.get("clamav") or {}).get("installe")},
+                     "crowdsec": {"locales": cs.get("decisions_locales", 0), "communaute": cs.get("liste_communautaire", 0), "alertes": cs.get("alertes_24h", 0),
+                                  "actif": bool(cs.get("moteur") and cs.get("videur")), "installe": (O.get("crowdsec") or {}).get("installe")},
+                     "fail2ban": {"prisons": len(f2b.get("jails") or []), "total": sum(j.get("total", 0) for j in (f2b.get("jails") or [])),
+                                  "bannies": sum(j.get("bannies", 0) for j in (f2b.get("jails") or [])), "actif": bool(f2b.get("actif"))}}}
+    _SEC_IMG_CACHE.update({"t": time.time(), "d": out})
+    return out
+
+
 def securite_journal(limite: int = 120) -> dict:
     """Le journal fusionné : authentifications SSH, fail2ban, la cage, les actions d'administration."""
     ev = []
@@ -95165,7 +95314,7 @@ class CassandraHandler(BaseHTTPRequestHandler):
             self.send_json(wipe_for_prod("EFFACER")); return
         # L'ONGLET SÉCURITÉ (24-09) : lire est réservé à l'administrateur ; agir passe par la garde des gestes.
         if path in ("/api/securite", "/api/securite/journal", "/api/securite/audits", "/api/securite/audit/rediger",
-                    "/api/securite/parefeu/trancher"):
+                    "/api/securite/parefeu/trancher", "/api/securite/images"):
             _sid = self.headers.get("X-Session-Token", "") or str(data.get("session", "") or "")
             if not validate_session(_sid):
                 self.send_json({"ok": False, "error": "Non autorisé"}, 401); return
@@ -95174,6 +95323,8 @@ class CassandraHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "Réservé à l'administrateur"}, 403); return
             if path == "/api/securite":
                 self.send_json(securite_etat(_qui, bool(data.get("force")), self.client_address[0] if self.client_address else "")); return
+            if path == "/api/securite/images":
+                self.send_json(securite_images(_qui)); return
             if path == "/api/securite/parefeu/trancher":
                 # Garder ou défaire un réglage à l'essai : c'est l'administrateur qui vient de le poser, mot de passe
                 # déjà donné ; ne pas le redemander ici, où chaque seconde compte.
@@ -105329,6 +105480,48 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
   .settings-layout{padding:14px}
 }
 
+
+/* SÉCURITÉ › EN IMAGES (10-10) — la catégorielle (bleu, violet) est validée par thème ; l'état garde ok/warn/danger */
+.sc-img{--sc-s1:#0369a1;--sc-s2:#7c3aed;--sc-grille:rgba(16,24,40,.07);display:flex;flex-direction:column;gap:16px}
+:root[data-theme="dark"] .sc-img{--sc-s1:#1d9bd1;--sc-s2:#8b5cf6;--sc-grille:rgba(173,186,199,.09)}
+.sc-img[hidden]{display:none}
+.sc-i-carte{display:flex;flex-direction:column;gap:10px;min-width:0}
+.sc-i-sous{margin:-4px 0 0;font-size:12.5px;color:var(--txt-faint)}
+.sc-i-note{font-size:12px;color:var(--txt-faint);margin:4px 0 0}
+.sc-i-g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.sc-i-g4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.sc-i-kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}
+@media (max-width:1100px){.sc-i-kpis{grid-template-columns:repeat(3,1fr)}}
+@media (max-width:860px){.sc-i-g2,.sc-i-g4{grid-template-columns:1fr}.sc-i-kpis{grid-template-columns:repeat(2,1fr)}}
+.sc-i-kpi{background:var(--surface);border-radius:16px;box-shadow:var(--shadow-sm,0 1px 2px rgba(16,24,40,.05));padding:14px;display:flex;flex-direction:column;gap:4px}
+.sc-i-kpi b{font:600 24px var(--mono,"JetBrains Mono",monospace);color:var(--txt-strong,var(--txt));line-height:1.1}
+.sc-i-kpi em{font-style:normal;font-size:12px;color:var(--txt-soft)}
+.sc-i-kpi small{font-size:11px;color:var(--txt-faint)}
+.sc-i-pt{display:inline-block;width:10px;height:10px;border-radius:50%;flex:none;margin-right:6px;vertical-align:0}
+.sc-i-pt.ok{background:var(--ok)}.sc-i-pt.warn{background:var(--warn)}.sc-i-pt.danger{background:var(--danger)}.sc-i-pt.acc{border:2px solid var(--ok)}
+.sc-i-verdict{display:grid;grid-template-columns:170px 1fr;gap:20px;align-items:center}
+@media (max-width:640px){.sc-i-verdict{grid-template-columns:1fr;justify-items:center}}
+.sc-i-titre{font-size:19px;font-weight:600;color:var(--txt-strong,var(--txt));margin:0}
+.sc-i-fams{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;margin-top:10px}
+.sc-i-fam{border:1px solid var(--line);border-radius:12px;padding:8px 10px;display:flex;gap:8px;align-items:flex-start;font-size:13px}
+.sc-i-fam b{font-weight:600}.sc-i-fam span{display:block;font-size:11.5px;color:var(--txt-faint)}
+.sc-i-leg{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:var(--txt-soft)}
+.sc-i-leg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.sc-img svg text{font-family:var(--mono,"JetBrains Mono",monospace);fill:var(--txt-faint);font-size:11px}
+.sc-img svg .val{fill:var(--txt);font-weight:600}
+.sc-i-matrice{display:grid;grid-template-columns:auto repeat(3,1fr);gap:6px;font-size:12.5px;align-items:center}
+.sc-i-matrice .h{font:600 11px var(--mono,"JetBrains Mono",monospace);color:var(--txt-faint);text-align:center}
+.sc-i-matrice .d{color:var(--txt-soft);font-family:var(--mono,"JetBrains Mono",monospace);font-size:12px}
+.sc-i-cel{border-radius:8px;padding:6px 8px;text-align:center;border:1px solid var(--line)}
+.sc-i-cel i{font-style:normal;font-weight:700;margin-right:4px}
+.sc-i-cel.ok i{color:var(--ok)}.sc-i-cel.warn i{color:var(--warn)}.sc-i-cel.danger i{color:var(--danger)}
+.sc-i-liste{display:grid;grid-template-columns:1fr 1fr;gap:6px 18px;font-size:13px}
+@media (max-width:640px){.sc-i-liste{grid-template-columns:1fr}}
+.sc-i-liste div{display:flex;gap:6px;align-items:baseline}.sc-i-liste span{color:var(--txt-faint);font-size:12px}
+.sc-i-g4 .sc-i-carte .chiffre{font:600 30px var(--mono,"JetBrains Mono",monospace);color:var(--txt-strong,var(--txt));line-height:1}
+.sc-i-g4 .lib{font-size:12.5px;color:var(--txt-soft)}
+.sc-i-tip{position:fixed;pointer-events:none;background:var(--surface-solid);color:var(--txt);border:1px solid var(--line);box-shadow:0 8px 24px rgba(16,24,40,.12);
+  border-radius:10px;padding:8px 10px;font-size:12.5px;line-height:1.45;opacity:0;transition:opacity .08s;z-index:3000;max-width:260px}
 </style>
 <link rel="manifest" href="/manifest.json">
 <meta name="theme-color" content="var(--bg)">
@@ -105905,6 +106098,7 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
         <button class="set-plier sc-plier" id="sc-plier" type="button" onclick="scRailPlier()" aria-label="Replier le menu" title="Replier le menu">‹</button>
         <nav class="mx-list" id="sc-rail">
           <button class="mx-item sc-item" type="button" data-page="verdict" onclick="scAller('verdict')" title="Verdict"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 18 0"/><path d="M12 12l4-4"/><circle cx="12" cy="12" r="1.2"/></svg></span><span class="nm">Verdict</span><span class="mx-st" id="sc-n-verdict"></span><span class="mx-dot" id="sc-d-verdict"></span></button>
+          <button class="mx-item sc-item" type="button" data-page="images" onclick="scAller('images')" title="En images"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg></span><span class="nm">En images</span><span class="mx-st" id="sc-n-images"></span><span class="mx-dot" id="sc-d-images"></span></button>
           <button class="mx-item sc-item" type="button" data-page="exposition" onclick="scAller('exposition')" title="Exposition"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.2"/></svg></span><span class="nm">Exposition</span><span class="mx-st" id="sc-n-exposition"></span><span class="mx-dot" id="sc-d-exposition"></span></button>
           <button class="mx-item sc-item" type="button" data-page="parefeu" onclick="scAller('parefeu')" title="Pare-feu"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="1.5"/><path d="M3 10h18M3 15h18M9 5v5M15 10v5M9 15v4"/></svg></span><span class="nm">Pare-feu</span><span class="mx-st" id="sc-n-parefeu"></span><span class="mx-dot" id="sc-d-parefeu"></span></button>
           <button class="mx-item sc-item" type="button" data-page="acces" onclick="scAller('acces')" title="Accès"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="12" r="3.5"/><path d="M11.5 12H21M17 12v3M20 12v2"/></svg></span><span class="nm">Accès</span><span class="mx-st" id="sc-n-acces"></span><span class="mx-dot" id="sc-d-acces"></span></button>
@@ -105999,6 +106193,51 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
           <section class="mx-sec" id="sc-s-cage"><div class="mx-chart-h"><h2>La cage</h2><span class="mx-meta">24 dernières heures</span></div><dl class="mx-paires" id="sc-cage"></dl></section>
         </div>
 
+
+        <div class="sc-img" data-page="images" hidden>
+          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>D’un coup d’œil</h2><span class="mx-meta" id="sc-i-mesure">—</span></div>
+            <div class="sc-i-verdict"><svg id="sc-i-jauge" viewBox="0 0 180 180" width="170" height="170" role="img" aria-label="Indice de sécurité"></svg>
+              <div><p class="sc-i-titre" id="sc-i-titre">—</p>
+                <p class="sc-i-note">L’indice part de 100 et retire des points par famille : « à regarder » −6, « à faire » −15. Il résume le verdict mesuré, il ne le remplace pas.</p>
+                <div class="sc-i-fams" id="sc-i-fams"></div></div></div></section>
+          <div class="sc-i-kpis" id="sc-i-kpis"></div>
+          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Les attaques, jour par jour</h2><span class="mx-meta">journaux des sites · 14 jours</span></div>
+            <p class="sc-i-sous">Tentatives repoussées sur les sites publics, hors maison et Tailscale. Les robots d’indexation ne sont pas des attaques : ils sont donnés à part, au survol.</p>
+            <div class="sc-i-leg"><span><i style="background:var(--sc-s1)"></i>Sondes d’effraction (.env, .git, xmlrpc, greffons…)</span><span><i style="background:var(--sc-s2)"></i>Mots de passe refusés (WordPress, Cassandra, coffre)</span></div>
+            <svg id="sc-i-barres" viewBox="0 0 1100 260" width="100%" role="img" aria-label="Attaques par jour"></svg>
+            <details class="sc-details"><summary>Voir en tableau</summary><div class="sc-tbl"><table id="sc-i-t-barres"></table></div></details></section>
+          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Quand ça frappe</h2><span class="mx-meta">7 jours · heure par heure</span></div>
+            <p class="sc-i-sous">Plus la case est foncée, plus il y a eu d’attaques repoussées dans l’heure.</p>
+            <svg id="sc-i-chaleur" viewBox="0 0 1100 230" width="100%" role="img" aria-label="Carte de chaleur des attaques"></svg></section>
+          <div class="sc-i-g2">
+            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Qui peut joindre quoi</h2><span class="mx-meta">pare-feu et box compris</span></div>
+              <p class="sc-i-sous">Chaque service sur l’anneau le plus lointain qui peut l’atteindre.</p>
+              <svg id="sc-i-anneaux" viewBox="0 0 520 300" width="100%" role="img" aria-label="Exposition des services"></svg></section>
+            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>D’où viennent les attaques</h2><span class="mx-meta">CrowdSec · 7 jours</span></div>
+              <p class="sc-i-sous">Le pays d’origine des alertes, et ce qu’elles tentaient (24 h).</p>
+              <svg id="sc-i-pays" viewBox="0 0 520 170" width="100%" role="img" aria-label="Pays d'origine"></svg><div class="sc-i-note" id="sc-i-scen"></div></section>
+          </div>
+          <div class="sc-i-g2">
+            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Ce qu’ils cherchent</h2><span class="mx-meta">10 jours</span></div>
+              <p class="sc-i-sous">Les chemins les plus sondés.</p><svg id="sc-i-chemins" viewBox="0 0 520 230" width="100%" role="img" aria-label="Chemins sondés"></svg></section>
+            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Robots et humains</h2><span class="mx-meta">10 jours</span></div>
+              <p class="sc-i-sous">La part des robots dans le trafic de chaque site.</p><svg id="sc-i-robots" viewBox="0 0 520 230" width="100%" role="img" aria-label="Part des robots par site"></svg></section>
+          </div>
+          <div class="sc-i-g2">
+            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Certificats</h2><span class="mx-meta">jours avant expiration</span></div>
+              <p class="sc-i-sous">Renouvellement automatique à 30 jours, alerte sous 21.</p><svg id="sc-i-certs" viewBox="0 0 520 210" width="100%" role="img" aria-label="Certificats"></svg></section>
+            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Courriel des domaines</h2><span class="mx-meta">relu toutes les heures</span></div>
+              <p class="sc-i-sous">Qui peut envoyer en votre nom.</p><div class="sc-i-matrice" id="sc-i-courriel"></div>
+              <p class="sc-i-note">SPF dit quels serveurs envoient pour vous ; DKIM signe chaque message ; DMARC dit quoi faire d’un faux.</p></section>
+          </div>
+          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>La maison</h2><span class="mx-meta">box · DNS local · tailnet</span></div>
+            <div class="sc-i-liste" id="sc-i-box"></div></section>
+          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Failles des images Docker</h2><span class="mx-meta" id="sc-i-trivy-meta">Trivy</span></div>
+            <p class="sc-i-sous">Une faille « corrigée en amont » disparaît quand l’éditeur publie une nouvelle image.</p>
+            <div class="sc-i-leg"><span><i style="background:var(--danger)"></i>Critiques</span><span><i style="background:var(--warn)"></i>Hautes</span></div>
+            <svg id="sc-i-trivy" viewBox="0 0 1100 220" width="100%" role="img" aria-label="Failles par image"></svg></section>
+          <div class="sc-i-g4" id="sc-i-gardiens"></div>
+        </div>
         <section class="mx-sec" data-page="outils" id="sc-s-outils" hidden>
           <div class="mx-chart-h"><h2>Outils de sécurité</h2><span class="mx-meta" id="sc-outils-meta">open source · optionnels</span></div>
           <p class="mx-prose">Des outils éprouvés que Cassandra installe, programme et lit — jamais requis : sans eux, elle dit simplement « non installé ». Le même programme sert à l’installeur. Rien n’est jamais supprimé : un fichier infecté est signalé, la décision vous revient.</p>
@@ -115681,7 +115920,7 @@ function cronPollBadge(){
 // Une page par entrée du rail. Tout se lit dans /api/securite (mesuré, en cache 45 s côté serveur) ;
 // chaque geste passe par /api/securite/geste derrière le mot de passe administrateur.
 const SC = {d: null, page: 'verdict', filtre: 'tout', flux: null, audits: null, veille: null};
-const SC_PAGES = ['verdict','exposition','parefeu','acces','defenses','outils','maj','journal','audit','ailleurs'];
+const SC_PAGES = ['verdict','images','exposition','parefeu','acces','defenses','outils','maj','journal','audit','ailleurs'];
 const SC_NIV = {ok: 'ok', regarder: 'warn', panne: 'danger', stable: 'ok'};
 function scP(niv, txt){ return '<span class="mx-pill ' + ({ok:'ok', stable:'ok', accepte:'ok', regarder:'regarder', panne:'panne', info:'pas_encore'}[niv] || '') + '">' + mxE(txt) + '</span>'; }
 function scL(pill, titre, sous, gest){ return '<div class="mx-row">' + pill + '<div class="mx-rt"><b>' + titre + '</b><span>' + (sous || '') + '</span></div><div class="mx-gest">' + (gest || '') + '</div></div>'; }
@@ -115707,6 +115946,7 @@ function scAller(p, sansCharger){
     if (sansCharger) return;
     if (p === 'journal') scJournal();
     if (p === 'audit') scAuditLire(0);
+    if (p === 'images') scImages();
 }
 function scRailPlier(force){
     const c = document.getElementById('sc-corps'); if (!c) return;
@@ -115980,6 +116220,158 @@ function scDefenses(){
     }
     scHtml('sc-cage', '<dt>Commandes en cage</dt><dd class="mono">' + (cg.commandes_24h || 0) + '</dd><dt>Vetos</dt><dd class="mono">' + (cg.vetos_24h || 0) + (cg.vetos_24h ? ' · <a class="sc-lien" onclick="scFiltre(\'cage\'); scAller(\'journal\')">voir</a>' : '') + '</dd>'
         + '<dt>Sorties caviardées</dt><dd class="mono">' + (cg.caviardages_24h || 0) + '</dd><dt>Gestes d’invités</dt><dd class="mono">' + (cg.gestes_invites_24h || 0) + '</dd>');
+}
+// SÉCURITÉ › EN IMAGES (10-10) — à l'identique de la maquette validée (maquettes/securite-en-images.html).
+const SCI = {d: null};
+const SCI_NS = 'http://www.w3.org/2000/svg';
+function sciEl(n, a, p){ const e = document.createElementNS(SCI_NS, n); for (const k in a) e.setAttribute(k, a[k]); if (p) p.appendChild(e); return e; }
+function sciFr(n){ return Number(n || 0).toLocaleString('fr-FR'); }
+function sciTip(){ let t = document.getElementById('sc-i-tip'); if (!t){ t = document.createElement('div'); t.id = 'sc-i-tip'; t.className = 'sc-i-tip'; document.body.appendChild(t); } return t; }
+function sciSurvol(node, html){ node.addEventListener('mousemove', function(e){ const t = sciTip(); t.innerHTML = html; t.style.opacity = 1;
+    t.style.left = Math.min(e.clientX + 14, innerWidth - 270) + 'px'; t.style.top = (e.clientY + 14) + 'px'; });
+    node.addEventListener('mouseleave', function(){ sciTip().style.opacity = 0; }); }
+function sciBout(x, y, w, h){ const r = Math.min(4, h, w); return 'M' + x + ',' + (y + h) + 'V' + (y + r) + 'Q' + x + ',' + y + ' ' + (x + r) + ',' + y + 'H' + (x + w - r) + 'Q' + (x + w) + ',' + y + ' ' + (x + w) + ',' + (y + r) + 'V' + (y + h) + 'Z'; }
+function sciDroite(x, y, l, h){ const r = Math.min(4, l); return 'M' + x + ',' + y + 'H' + (x + l - r) + 'Q' + (x + l) + ',' + y + ' ' + (x + l) + ',' + (y + r) + 'V' + (y + h - r) + 'Q' + (x + l) + ',' + (y + h) + ' ' + (x + l - r) + ',' + (y + h) + 'H' + x + 'Z'; }
+function sciVider(id){ const s = document.getElementById(id); if (s) s.innerHTML = ''; return s; }
+function sciJourCourt(j){ return String(j || '').slice(8, 10) + '-' + String(j || '').slice(5, 7); }
+async function scImages(){
+    let d = null;
+    try { d = await apiPost('/api/securite/images', {}); } catch(e) { d = null; }
+    if (!d || !d.ok){ scTexte('sc-i-titre', 'Mesures illisibles : ' + ((d && d.error) || '?')); return; }
+    SCI.d = d; sciPeindre();
+}
+function sciPeindre(){
+    const d = SCI.d; if (!d) return;
+    scTexte('sc-i-mesure', 'mesuré à ' + String(d.mesure || '').slice(11, 16)); scTexte('sc-i-titre', d.titre || '—');
+    // jauge
+    const g = sciVider('sc-i-jauge'), r = 70, c = 2 * Math.PI * r, v = d.indice;
+    sciEl('circle', {cx: 90, cy: 90, r: r, fill: 'none', stroke: 'var(--sc-grille)', 'stroke-width': 14}, g);
+    sciEl('circle', {cx: 90, cy: 90, r: r, fill: 'none', stroke: v >= 85 ? 'var(--ok)' : v >= 60 ? 'var(--warn)' : 'var(--danger)', 'stroke-width': 14,
+                     'stroke-linecap': 'round', 'stroke-dasharray': (c * v / 100) + ' ' + c, transform: 'rotate(-90 90 90)'}, g);
+    const t1 = sciEl('text', {x: 90, y: 92, 'text-anchor': 'middle', class: 'val', style: 'font-size:38px'}, g); t1.textContent = v;
+    const t2 = sciEl('text', {x: 90, y: 116, 'text-anchor': 'middle'}, g); t2.textContent = '/ 100';
+    const cls = {ok: 'ok', regarder: 'warn', panne: 'danger', accepte: 'acc', '': 'ok'};
+    scHtml('sc-i-fams', (d.familles || []).map(function(f){ return '<div class="sc-i-fam" title="' + mxE(f.dit) + '"><span class="sc-i-pt ' + (cls[f.niveau] || 'ok') + '"></span><div><b>' + mxE(f.lib) + '</b><span>' + mxE(f.dit) + '</span></div></div>'; }).join(''));
+    scHtml('sc-i-kpis', (d.kpis || []).map(function(k){ return '<div class="sc-i-kpi" title="' + mxE(k.dit) + '"><b>' + mxE(k.v) + '</b><em><span class="sc-i-pt ' + mxE(k.niveau) + '"></span>' + mxE(k.lib) + '</em><small>' + mxE(k.dit) + '</small></div>'; }).join(''));
+    sciBarres(d); sciChaleur(d); sciAnneaux(d); sciPays(d); sciH('sc-i-chemins', (d.chemins || []).map(function(x){ return [x.chemin, x.n]; }), 'var(--sc-s1)', '');
+    sciH('sc-i-robots', (d.robots || []).map(function(x){ return [x.site.replace('.cassandra.center', ''), x.part, '', x.part + ' %', sciFr(x.n) + ' requêtes, ' + x.part + ' % de robots']; }), 'var(--sc-s2)', '', 100);
+    sciCerts(d); sciCourriel(d); sciBox(d); sciTrivy(d); sciGardiens(d);
+}
+function sciBarres(d){
+    const s = sciVider('sc-i-barres'), J = d.jours || [];
+    const W = 1100, H = 260, m = {l: 64, r: 12, t: 22, b: 34}, iw = W - m.l - m.r, ih = H - m.t - m.b;
+    // Échelle plafonnée au 2e plus gros jour (×1,25) : un pic hors norme est coupé, sa valeur écrite.
+    const tot = J.map(function(j){ return j.sondes + j.refus; }).sort(function(a, b){ return b - a; });
+    const max = Math.max(10, Math.ceil(((tot.length > 1 && tot[0] > 2 * tot[1]) ? tot[1] * 1.25 : (tot[0] || 10)) / 1000) * 1000);
+    [0, .25, .5, .75, 1].forEach(function(f){ const y = m.t + ih - ih * f; sciEl('line', {x1: m.l, x2: W - m.r, y1: y, y2: y, stroke: 'var(--sc-grille)'}, s);
+        const t = sciEl('text', {x: m.l - 8, y: y + 4, 'text-anchor': 'end'}, s); t.textContent = sciFr(Math.round(max * f)); });
+    const bw = iw / Math.max(1, J.length), larg = Math.min(46, bw * .62);
+    J.forEach(function(j, i){
+        const somme = j.sondes + j.refus, coupe = somme > max, base = m.t + ih, x = m.l + bw * i + (bw - larg) / 2;
+        const h2 = coupe ? Math.max(3, ih * j.refus / somme) : ih * j.refus / max, h1 = coupe ? ih - h2 - 2 : ih * j.sondes / max;
+        const grp = sciEl('g', {}, s);
+        sciEl('rect', {x: x - 6, y: m.t, width: larg + 12, height: ih, fill: 'transparent'}, grp);
+        if (h1 > 0) sciEl('path', {d: h2 >= 1 ? 'M' + x + ',' + base + 'V' + (base - h1) + 'H' + (x + larg) + 'V' + base + 'Z' : sciBout(x, base - h1, larg, h1), fill: 'var(--sc-s1)'}, grp);
+        if (h2 >= 1) sciEl('path', {d: sciBout(x, base - h1 - h2 - (h1 > 0 ? 2 : 0), larg, h2), fill: 'var(--sc-s2)'}, grp);
+        if (coupe){ sciEl('rect', {x: x - 2, y: m.t + ih * .18, width: larg + 4, height: 5, fill: 'var(--surface-solid)'}, grp);
+            const v = sciEl('text', {x: x + larg / 2, y: m.t - 6, 'text-anchor': 'middle', class: 'val'}, s); v.textContent = sciFr(somme) + ' ↑'; }
+        const l = sciEl('text', {x: x + larg / 2, y: H - 12, 'text-anchor': 'middle'}, s); l.textContent = sciJourCourt(j.jour);
+        sciSurvol(grp, '<b>' + sciJourCourt(j.jour) + '</b><br>Sondes d’effraction : ' + sciFr(j.sondes) + '<br>Mots de passe refusés : ' + sciFr(j.refus) +
+            '<br><span style="color:var(--txt-faint)">' + sciFr(j.requetes) + ' requêtes' + (j.requetes ? ', dont ' + Math.round(100 * j.robots / j.requetes) + ' % de robots' : '') + '</span>');
+    });
+    if (!J.length){ const t = sciEl('text', {x: W / 2, y: H / 2, 'text-anchor': 'middle'}, s); t.textContent = 'Le collecteur relit les journaux : les premiers jours arrivent dans quelques minutes.'; }
+    scHtml('sc-i-t-barres', '<tr><th>Jour</th><th>Sondes</th><th>Mots de passe</th><th>Requêtes</th><th>Robots</th></tr>' +
+        J.map(function(j){ return '<tr><td>' + j.jour + '</td><td>' + sciFr(j.sondes) + '</td><td>' + sciFr(j.refus) + '</td><td>' + sciFr(j.requetes) + '</td><td>' + sciFr(j.robots) + '</td></tr>'; }).join(''));
+}
+function sciChaleur(d){
+    const s = sciVider('sc-i-chaleur'), C = d.chaleur || {jours: [], grille: []};
+    const x0 = 64, y0 = 8, cw = (1100 - x0 - 10) / 24, ch = 26, pas = [0, 50, 200, 1000, Infinity], op = [.16, .38, .62, .9];
+    (C.grille || []).forEach(function(ligne, j){
+        const t = sciEl('text', {x: x0 - 8, y: y0 + j * ch + 17, 'text-anchor': 'end'}, s); t.textContent = sciJourCourt(C.jours[j]);
+        ligne.forEach(function(v, h){
+            const k = v === 0 ? -1 : pas.findIndex(function(b, i){ return v > b && v <= pas[i + 1]; });
+            const r = sciEl('rect', {x: x0 + h * cw + 1, y: y0 + j * ch + 1, width: cw - 2, height: ch - 2, rx: 3, fill: k < 0 ? 'var(--sc-grille)' : 'var(--accent)', 'fill-opacity': k < 0 ? 1 : op[k]}, s);
+            sciSurvol(r, '<b>' + sciJourCourt(C.jours[j]) + ' · ' + h + ' h</b><br>' + sciFr(v) + ' attaque' + (v > 1 ? 's' : '') + ' repoussée' + (v > 1 ? 's' : ''));
+        });
+    });
+    for (let h = 0; h < 24; h += 3){ const t = sciEl('text', {x: x0 + h * cw + cw / 2, y: y0 + 7 * ch + 16, 'text-anchor': 'middle'}, s); t.textContent = h + ' h'; }
+    ['0', '1–50', '51–200', '201–1 000', '> 1 000'].forEach(function(l, i){ const x = x0 + i * 120, y = y0 + 7 * ch + 30;
+        sciEl('rect', {x: x, y: y, width: 14, height: 14, rx: 3, fill: i ? 'var(--accent)' : 'var(--sc-grille)', 'fill-opacity': i ? op[i - 1] : 1}, s);
+        const t = sciEl('text', {x: x + 20, y: y + 11}, s); t.textContent = l; });
+}
+function sciAnneaux(d){
+    const s = sciVider('sc-i-anneaux'), A = d.anneaux || [], cx = 150, cy = 150, R = [140, 104, 68, 32];
+    const op = [.12, .3, .55, 1];      // une teinte (l'accent du thème), quatre intensités
+    A.forEach(function(a, i){ const c = sciEl('circle', {cx: cx, cy: cy, r: R[i], fill: 'var(--accent)', 'fill-opacity': op[i], stroke: 'var(--surface-solid)', 'stroke-width': 2}, s);
+        sciSurvol(c, '<b>' + mxE(a.lib) + ' — ' + a.services.length + '</b><br>' + mxE(a.services.join(', ') || 'aucun')); });
+    A.forEach(function(a, i){
+        const y = 40 + i * 66, yr = cy - (i < 3 ? (R[i] + R[i + 1]) / 2 : 0);
+        sciEl('line', {x1: cx + 6, y1: yr, x2: 310, y2: y - 4, stroke: 'var(--txt-faint)', 'stroke-opacity': .5}, s);
+        const n = sciEl('text', {x: cx, y: yr + (i < 3 ? 5 : 6), 'text-anchor': 'middle', class: 'val', style: i < 3 ? 'font-size:13px' : 'font-size:16px;fill:var(--surface-solid)'}, s); n.textContent = a.services.length;
+        const t = sciEl('text', {x: 316, y: y, class: 'val', style: 'font-size:12.5px'}, s); t.textContent = a.lib + ' · ' + a.services.length;
+        const l = a.services.join(', '), dd = sciEl('text', {x: 316, y: y + 16, style: 'font-size:10.5px'}, s); dd.textContent = l.length > 30 ? l.slice(0, 29) + '…' : (l || 'aucun');
+    });
+}
+function sciH(id, rows, couleur, suffixe, maxForce){
+    const s = sciVider(id), x0 = 130, w = 520 - x0 - 80;
+    if (!rows.length){ const t = sciEl('text', {x: 260, y: 60, 'text-anchor': 'middle'}, s); t.textContent = 'rien à montrer pour l’instant'; return; }
+    const vals = rows.map(function(r){ return r[1]; }).sort(function(a, b){ return b - a; });
+    const max = maxForce || ((vals.length > 1 && vals[0] > 4 * vals[1]) ? vals[1] * 1.6 : vals[0]) || 1;
+    rows.forEach(function(r, i){ const y = 6 + i * 27, coupe = r[1] > max, l = Math.max(3, w * Math.min(r[1], max) / max);
+        const t = sciEl('text', {x: x0 - 10, y: y + 13, 'text-anchor': 'end', style: 'fill:var(--txt-soft)'}, s); t.textContent = String(r[0]).length > 18 ? String(r[0]).slice(0, 17) + '…' : r[0];
+        const b = sciEl('path', {d: sciDroite(x0, y, l, 18), fill: coupe ? 'var(--warn)' : (r[2] || couleur)}, s);
+        const v = sciEl('text', {x: x0 + l + 6, y: y + 13, class: 'val'}, s); v.textContent = (r[3] || sciFr(r[1])) + (coupe ? ' ↑' : '') + (suffixe || '');
+        sciSurvol(b, '<b>' + mxE(r[0]) + '</b><br>' + (r[4] || sciFr(r[1]))); });
+}
+function sciPays(d){
+    sciH('sc-i-pays', (d.pays || []).slice(0, 6).map(function(p){ return [p.pays, p.n, 'var(--accent)', '', p.n + ' alerte' + (p.n > 1 ? 's' : '') + ' en 7 jours']; }), 'var(--accent)', '');
+    const S = d.scenarios || [];
+    scHtml('sc-i-scen', S.length ? 'Le plus tenté (24 h) : ' + S.slice(0, 4).map(function(x){ return '<b>' + mxE(String(x.scenario).replace('crowdsecurity/', '')) + '</b> (' + x.n + ')'; }).join(' · ') : 'CrowdSec n’a rien vu en 24 h.');
+}
+function sciCerts(d){
+    const s = sciVider('sc-i-certs'), C = (d.certs || []).slice(0, 7), x0 = 150, w = 300, max = 90;
+    [21, 30].forEach(function(j){ const x = x0 + w * j / max; sciEl('line', {x1: x, x2: x, y1: 0, y2: C.length * 27 + 2, stroke: j === 21 ? 'var(--danger)' : 'var(--txt-faint)', 'stroke-dasharray': '3 3', 'stroke-opacity': .6}, s);
+        const t = sciEl('text', {x: x, y: C.length * 27 + 16, 'text-anchor': 'middle'}, s); t.textContent = j + ' j'; });
+    C.forEach(function(c, i){ const y = 4 + i * 27, l = Math.max(3, w * Math.min(c.jours, max) / max), niv = c.jours < 7 ? 'var(--danger)' : c.jours < 21 ? 'var(--warn)' : 'var(--ok)';
+        const t = sciEl('text', {x: x0 - 10, y: y + 13, 'text-anchor': 'end', style: 'fill:var(--txt-soft)'}, s); t.textContent = c.domaine.replace('.cassandra.center', '');
+        const b = sciEl('path', {d: sciDroite(x0, y, l, 18), fill: niv, 'fill-opacity': .85}, s);
+        const v = sciEl('text', {x: x0 + l + 6, y: y + 13, class: 'val'}, s); v.textContent = c.jours + ' j';
+        sciSurvol(b, '<b>' + mxE(c.domaine) + '</b><br>expire dans ' + c.jours + ' jours'); });
+}
+function sciCourriel(d){
+    const ic = {ok: '✓', warn: '!', danger: '✕'};
+    scHtml('sc-i-courriel', '<div></div><div class="h">SPF</div><div class="h">DKIM</div><div class="h">DMARC</div>' + (d.courriel || []).map(function(c){
+        return '<div class="d">' + mxE(c.domaine) + '</div>' + c.etats.map(function(e){ return '<div class="sc-i-cel ' + e[0] + '"><i>' + ic[e[0]] + '</i>' + mxE(e[1]) + '</div>'; }).join(''); }).join(''));
+}
+function sciBox(d){
+    scHtml('sc-i-box', (d.box || []).map(function(b){ return '<div><span class="sc-i-pt ' + mxE(b.niveau) + '"></span><b>' + mxE(b.lib) + '</b><span>' + mxE(b.dit) + '</span></div>'; }).join('') || '<div class="empty-state">Aucune box lue.</div>');
+}
+function sciTrivy(d){
+    const s = sciVider('sc-i-trivy'), I = d.trivy || [], x0 = 260, w = 600;
+    scTexte('sc-i-trivy-meta', 'Trivy' + (d.trivy_accepte ? ' · accepté dans le Sensorium' : ''));
+    const max = Math.max(10, ...I.map(function(i){ return i.critiques + i.hautes; }));
+    I.forEach(function(im, i){ const y = 10 + i * 40, lc = w * im.critiques / max, lh = w * im.hautes / max;
+        const t = sciEl('text', {x: x0 - 12, y: y + 17, 'text-anchor': 'end', style: 'fill:var(--txt-soft);font-size:12px'}, s); t.textContent = String(im.image).replace(/^(ghcr\.io|docker\.io)\//, '');
+        const g = sciEl('g', {}, s); sciEl('rect', {x: x0, y: y, width: w, height: 24, fill: 'transparent'}, g);
+        if (lc) sciEl('rect', {x: x0, y: y, width: lc, height: 24, fill: 'var(--danger)'}, g);
+        if (lh) sciEl('path', {d: sciDroite(x0 + lc + (lc ? 2 : 0), y, lh, 24), fill: 'var(--warn)'}, g);
+        const v = sciEl('text', {x: x0 + lc + lh + 10, y: y + 17, class: 'val'}, s);
+        v.textContent = (im.critiques + im.hautes) ? im.critiques + ' critique' + (im.critiques > 1 ? 's' : '') + ' · ' + im.hautes + ' hautes' : 'aucune faille';
+        sciSurvol(g, '<b>' + mxE(im.image) + '</b><br>' + im.critiques + ' critique(s), ' + im.hautes + ' haute(s)'); });
+    if (!I.length){ const t = sciEl('text', {x: 550, y: 60, 'text-anchor': 'middle'}, s); t.textContent = 'Trivy n’est pas installé, ou n’a pas encore tourné (Sécurité › Outils).'; }
+}
+function sciGardiens(d){
+    const G = d.gardiens || {}, L = G.lynis || {}, C = G.clamav || {}, S = G.crowdsec || {}, F = G.fail2ban || {};
+    const p = function(ok, txt){ return '<span class="mx-pill ' + (ok ? 'ok' : 'regarder') + '">' + txt + '</span>'; };
+    const carte = function(t, corps){ return '<section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>' + t + '</h2></div>' + corps + '</section>'; };
+    const sc = L.score, arc = sc == null ? '' : '<svg viewBox="0 0 160 96" width="160" height="96"><path d="M18,84 A62,62 0 0 1 142,84" fill="none" stroke="var(--sc-grille)" stroke-width="12" stroke-linecap="round"/>' +
+        '<path d="M18,84 A62,62 0 0 1 142,84" fill="none" stroke="' + (sc >= 80 ? 'var(--ok)' : sc >= 60 ? 'var(--warn)' : 'var(--danger)') + '" stroke-width="12" stroke-linecap="round" stroke-dasharray="' + (Math.PI * 62 * sc / 100) + ' 999"/>' +
+        '<text x="80" y="80" text-anchor="middle" class="val" style="font-size:24px">' + sc + '</text></svg>';
+    scHtml('sc-i-gardiens',
+        carte('Lynis', L.installe ? arc + '<div class="lib">durcissement · ' + (L.avertissements || 0) + ' avertissement' + (L.avertissements > 1 ? 's' : '') + ' · ' + (L.conseils || 0) + ' conseils</div>' : '<div class="lib">non installé</div>') +
+        carte('ClamAV', C.installe ? '<div class="chiffre">' + (C.menaces || 0) + '</div><div class="lib">menace' + (C.menaces > 1 ? 's' : '') + (C.duree != null ? ' · balayage en ' + C.duree + ' min' : '') + '</div>' + p(!C.menaces, C.menaces ? 'ALERTE' : 'BON') : '<div class="lib">non installé</div>') +
+        carte('CrowdSec', S.installe ? '<div class="chiffre">' + sciFr(S.locales) + '</div><div class="lib">bannies ici · ' + sciFr(S.communaute) + ' dans la liste communautaire · ' + (S.alertes || 0) + ' alertes en 24 h</div>' + p(S.actif, S.actif ? 'ACTIF' : 'ARRÊTÉ') : '<div class="lib">non installé</div>') +
+        carte('fail2ban', '<div class="chiffre">' + (F.prisons || 0) + '</div><div class="lib">prisons · ' + sciFr(F.total) + ' bannissements depuis le démarrage · ' + (F.bannies || 0) + ' en cours</div>' + p(F.actif, F.actif ? 'ACTIF' : 'ABSENT')));
 }
 // LES OUTILS DE SÉCURITÉ (10-10) : chacun installé par le même programme qu'install.sh, puis lu ici.
 const SC_OUTILS_X = {

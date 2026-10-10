@@ -451,11 +451,22 @@ def lancer_crowdsec():
     for a in alertes:
         s = a.get("scenario") or "?"
         scen[s] = scen.get(s, 0) + 1
+    # D'où viennent les attaques : le pays d'origine des alertes de la semaine.
+    rc, o = sh(["cscli", "alerts", "list", "--since", "168h", "-o", "json"], timeout=120)
+    try:
+        semaine = json.loads(o) or []
+    except ValueError:
+        semaine = []
+    pays = {}
+    for a in semaine:
+        cn = ((a.get("source") or {}).get("cn") or "").upper() or "?"
+        pays[cn] = pays.get(cn, 0) + 1
     return ecrire("crowdsec", {
         "moteur": actif("crowdsec"), "videur": actif("crowdsec-firewall-bouncer"),
         "decisions_locales": len(locales), "liste_communautaire": sum(n for k, n in origines.items() if k not in ("crowdsec", "cscli")),
         "origines": origines, "bannies": locales[:50], "alertes_24h": len(alertes),
-        "scenarios_24h": sorted(({"scenario": k, "n": v} for k, v in scen.items()), key=lambda x: -x["n"])[:10]})
+        "scenarios_24h": sorted(({"scenario": k, "n": v} for k, v in scen.items()), key=lambda x: -x["n"])[:10],
+        "alertes_7j": len(semaine), "pays_7j": sorted(({"pays": k, "n": v} for k, v in pays.items()), key=lambda x: -x["n"])[:10]})
 
 
 # ── etat ───────────────────────────────────────────────────────────────────────
