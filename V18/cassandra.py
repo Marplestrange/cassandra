@@ -74114,7 +74114,7 @@ _AUT_GESTE_DE_KIND = {
 # Un constat précis qui relève d'un geste plus fin que son action_kind (testé en premier).
 _AUT_GESTE_DE_FKEY = {"collector_stale": "machine/relancer-le-collecteur"}
 _AUT_STATUTS = {"ok": "en service", "brancher": "à brancher", "ecrire": "à écrire", "dur": "garde dure"}
-_AUT_DEFAUT = {"lv": None, "ombre": False, "decl": "Sur alerte", "per": "Hérite du domaine", "excl": "",
+_AUT_DEFAUT = {"lv": None, "ombre": False, "decl": "Sur alerte", "per": "Hérite du domaine", "persel": "", "excl": "",
                "fen": "Toujours", "fd": "02:00", "ff": "06:00", "ech": 2, "boucle": 3, "boucleh": "1 h",
                "avis": None, "aviq": "Hérite de la gouvernance", "snap": None,
                "ou": "Hérite (selon le geste)", "nuit": "Hérite de la gouvernance"}
@@ -74214,7 +74214,7 @@ def aut_regler(cle: str, reglages: dict, acteur: str = "") -> dict:
     for k, v in (reglages or {}).items():
         if k not in _AUT_DEFAUT:
             return {"ok": False, "error": "réglage inconnu : %s" % str(k)[:40]}
-        if not est_geste and k not in ("lv", "per"):
+        if not est_geste and k not in ("lv", "per", "persel"):
             return {"ok": False, "error": "un domaine ne porte que le palier et le périmètre"}
         if k == "lv":
             if v in (None, ""):
@@ -74241,7 +74241,7 @@ def aut_regler(cle: str, reglages: dict, acteur: str = "") -> dict:
             if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(v or "")):
                 return {"ok": False, "error": "%s : une heure HH:MM est attendue" % k}
             propres[k] = str(v)
-        elif k == "excl":
+        elif k in ("excl", "persel"):
             propres[k] = str(v or "")[:300]
         elif k == "aviq":
             propres[k] = str(v or _AUT_DEFAUT["aviq"])[:120]
@@ -74508,6 +74508,105 @@ def _aut_exclusions(eff: dict) -> list:
     return [x.strip() for x in str(eff.get("excl") or "").split(",") if x.strip()]
 
 
+_AUT_DOMAINE_RE = re.compile(r"(?<![a-z0-9.-])((?:[a-z0-9][a-z0-9-]*\.)+[a-z]{2,})(?![a-z0-9-])")
+
+
+def _aut_machines_flotte() -> list:
+    """Les machines du parc enregistrées dans la Flotte : tout ce qui n'est pas Orion."""
+    try:
+        return [str(x.get("name")) for x in (_ms_load() or []) if x.get("name")]
+    except Exception:
+        return []
+
+
+def _aut_sites_maison():
+    """Les sites de la maison : ceux du panneau qui n'appartiennent à AUCUN compte. None si on ne peut pas l'établir."""
+    try:
+        doms = {_norm_domain(str(d.get("domain") or "")) for d in (get_fp_domains() or []) if isinstance(d, dict) and d.get("domain")}
+        comptes = set(_all_user_domains())
+        return {d for d in doms if d and d not in comptes}
+    except Exception:
+        return None
+
+
+def aut_perimetre_motif(eff: dict, sujet: str, titre: str = "", cmd: str = "") -> str:
+    """Le périmètre du geste (« Orion seulement », « les sites de la maison », une sélection). Vide si la cible est dans la borne.
+    « Hérite du domaine » ne borne rien. Une borne qu'on ne peut pas établir retient : dans le doute, elle ne touche pas."""
+    per = str((eff or {}).get("per") or "")
+    if per in ("", _AUT_DEFAUT["per"]):
+        return ""
+    texte = " ".join(str(t or "") for t in (sujet, titre, cmd))
+    if per == "Orion seulement":
+        hit = aut_correspond(_aut_machines_flotte(), texte)
+        return "« %s » n'est pas Orion : ce geste est limité à Orion" % hit if hit else ""
+    if per == "Les sites de la maison seulement":
+        cibles = sorted(set(_AUT_DOMAINE_RE.findall(texte.lower())))
+        if not cibles:
+            return ""                                      # le geste ne vise pas un site : la borne ne le concerne pas
+        maison = _aut_sites_maison()
+        if maison is None:
+            return "impossible d'établir quels sont les sites de la maison : elle ne touche à rien"
+        hors = [d for d in cibles if d not in maison]
+        return "« %s » n'est pas un site de la maison (ce geste y est limité)" % hors[0] if hors else ""
+    if per == "Une sélection à choisir":
+        sel = [x.strip() for x in str((eff or {}).get("persel") or "").replace(";", ",").split(",") if x.strip()]
+        if not sel:
+            return "périmètre « sélection » sans aucun nom choisi : elle ne touche à rien"
+        return "" if aut_correspond(sel, texte) else "la cible n'est pas dans la sélection de ce geste"
+    return ""
+
+
+# Ce que chaque geste sauvegarde avant d'agir, EN PLUS des fichiers que sa commande réécrit.
+_AUT_SNAP_FICHIERS = {"rotation-des-secrets/faire-tourner-une-cle-ssh": lambda: [MULTISERVER_CONFIG_FILE]}
+
+
+def aut_snap_actif(eff: dict) -> bool:
+    """Le point de restauration est-il demandé ? Le réglage du geste, sinon « partiellement réversible » ; coupé net si le réglage général
+    « Instantané avant chaque action autonome » est décoché (sauf demande explicite du geste)."""
+    snap = (eff or {}).get("snap")
+    if snap is not None:
+        return bool(snap)
+    if not _mem_cfg("pf_instantane", True):
+        return False
+    return (eff or {}).get("rev") == "part"
+
+
+def aut_point_restauration(g: dict, cmd: str = "") -> str:
+    """Copie, avant le geste, les fichiers qu'il va modifier. Rend une phrase pour le journal (vide : rien à sauvegarder).
+    Une copie qui échoue n'arrête pas le geste : elle est dite."""
+    eff = (g or {}).get("eff") or {}
+    cle = (g or {}).get("cle")
+    if not cle or not aut_snap_actif(eff):
+        return ""
+    fichiers = []
+    try:
+        fichiers += _files_to_snapshot(cmd) if cmd else []
+        if cle in _AUT_SNAP_FICHIERS:
+            fichiers += _AUT_SNAP_FICHIERS[cle]()
+    except Exception as e:
+        logging.info("[AUTONOMIE] point de restauration : %s", e)
+    ids, manque = [], []
+    for fp in list(dict.fromkeys(fichiers))[:6]:
+        try:
+            if os.path.isfile(fp) and os.path.getsize(fp) < 300_000:
+                with open(fp, "r", errors="replace") as fh:
+                    contenu = fh.read()
+                conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+                try:
+                    cur = conn.execute("INSERT INTO file_snapshots (ts,session_id,trigger_command,file_path,content_before,action_id) "
+                                       "VALUES (datetime('now'),?,?,?,?,0)", ("autonomie", ("%s %s" % (cle, g.get("sujet") or ""))[:500], fp, contenu))
+                    conn.commit(); ids.append(cur.lastrowid)
+                finally:
+                    conn.close()
+            else:
+                manque.append(os.path.basename(fp))
+        except Exception as e:
+            manque.append("%s (%s)" % (os.path.basename(fp), str(e)[:40]))
+    if not ids and not manque:
+        return ""
+    return "point de restauration n° %s%s" % (", ".join(str(i) for i in ids) or "—", (" · non sauvegardé : " + ", ".join(manque)) if manque else "")
+
+
 def aut_retenue(eff: dict, sujet: str, titre: str = "", cmd: str = "", chemin: str = "alerte") -> str:
     """Un motif de refus tiré des règles de PORTÉE : intouchables, exclusions du geste, déclencheur. Vide si rien ne retient."""
     gov = aut_gouvernance()
@@ -74520,7 +74619,7 @@ def aut_retenue(eff: dict, sujet: str, titre: str = "", cmd: str = "", chemin: s
     decl = eff.get("decl")
     if decl == "Sur demande seulement":
         return "déclencheur « sur demande seulement » : elle n'agit pas seule"
-    return ""
+    return aut_perimetre_motif(eff, sujet, titre, cmd)
 
 
 def _aut_modele_creds(label: str):
@@ -75797,11 +75896,12 @@ def proactive_scan(auto_act: bool = None) -> dict:
                                      t["suggested_action"], t["title"],
                                      "hors de la fenêtre de maintenance")
                     continue
+                _pt = aut_point_restauration(g, t["suggested_action"])
                 r = proactive_act(t["id"], auto=True)
                 acted.append({"id": t["id"], "ok": r.get("ok"), "gate": r.get("gate")})
                 if g.get("cle") and not r.get("differe"):
                     aut_disj_resultat(g["cle"], g.get("sujet") or "", bool(r.get("ok")), g.get("eff") or {})
-                    aut_journaliser(g["cle"], g.get("sujet") or "", bool(r.get("ok")), t["title"],
+                    aut_journaliser(g["cle"], g.get("sujet") or "", bool(r.get("ok")), t["title"] + ((" — " + _pt) if _pt else ""),
                                     str(r.get("error") or r.get("gate") or "")[:300], g.get("eff") or {}, r.get("inverse"))
                     aut_raconter(g["cle"], g.get("sujet") or "", bool(r.get("ok")), t["title"],
                                  str(r.get("error") or r.get("gate") or "")[:300], g.get("eff") or {})
@@ -115257,9 +115357,8 @@ function autRendre(){
                  +autChamp('Déclencheur', autSel(k,'decl',ch.decl||[],v('decl')), 'Seul « Sur demande seulement » est appliqué : il interdit tout geste seul.')
                  +autChamp('Gravité du récit', autSel(k,'ou',ch.ou||[],v('ou')), 'Au palier « Agir + raconter ». Les canaux viennent du Centre de notifications.')
                  +autChamp('Réveil nocturne', autSel(k,'nuit',ch.nuit||[],v('nuit')), 'Un échec avec « Oui » est critique ; « Non » plafonne à « à voir ».')
-                 +'</div><div class="aut-grp">Enregistrés, appliqués au fil du câblage</div><div class="aut-grid">'
-                 +autChamp('Périmètre', autSel(k,'per',ch.per||[],v('per')))
-                 +autChamp('Point de restauration', autTog(k,'snap',v('snap')===null?g.rev==='part':v('snap')))
+                 +autChamp('Périmètre', autSel(k,'per',ch.per||[],v('per'))+(v('per')==='Une sélection à choisir'?'<input class="bu-inp mono" type="text" value="'+escapeAttr(v('persel')||'')+'" placeholder="ex. athena, boheme-shop" aria-label="persel" onchange="autSet(\''+k+'\',\'persel\',this)">':''), 'Borne les cibles du geste. « Orion seulement » écarte les machines de la Flotte ; « sites de la maison » écarte les sites des comptes (et ne concerne que les gestes qui visent un site).')
+                 +autChamp('Point de restauration', autTog(k,'snap',v('snap')===null?g.rev==='part':v('snap')), 'Copie les fichiers que le geste va modifier avant d\u2019agir (consultable avec le numéro écrit au journal). Sans effet pour un geste qui n\u2019écrit aucun fichier.')
                  +'</div><div style="padding-top:8px"><button class="btn-x mini" onclick="autRemettre(\''+k+'\')">Rétablir les valeurs du domaine</button></div></div>';
             }
             return '<div class="aut-g"><div class="co"><b>'+escapeHtml(g.nom)+'</b><div class="aut-tags">'
