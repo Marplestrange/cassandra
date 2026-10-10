@@ -72825,7 +72825,7 @@ def secure_execute(cmd: str) -> str:
 #   disque / SSL / sécurité = détection + investigation + action sur clic.
 # ============================================================
 _PROACTIVE_LAST = [0.0]
-_SAFE_ACTION_KINDS = ("service.restart",)   # seules actions auto-remédiables (réversibles)
+_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir")   # seules actions auto-remédiables (réversibles)
 
 
 def _detect_disk() -> list:
@@ -72965,6 +72965,46 @@ def _detect_security() -> list:
                         "suggested_action": "", "action_kind": "diagnostic"})
     except Exception:
         pass
+    out += _detect_attaquants()
+    return out
+
+
+def _detect_attaquants() -> list:
+    """Adresses insistantes : beaucoup d'attaques repoussées sur les sites ces deux derniers jours, et pas encore bannies.
+
+    Chacune devient un constat qui porte son bannissement (CrowdSec, sept jours, réversible). La règle « Réseau et accès ›
+    Bannir ou débannir » décide si Cassandra le pose seule. Une adresse de confiance (la maison, le tailnet, l'adresse
+    publique) n'est JAMAIS proposée : sinon son refus compterait comme un échec et ferait sauter le disjoncteur."""
+    import shutil                                       # pas d'import global de shutil dans ce module
+    out = []
+    try:
+        if not shutil.which("cscli"):
+            return out                                  # sans CrowdSec, le bannissement est impossible : pas de constat
+        seuil = int(_mem_cfg("proactive_ban_min", 40))
+        rows = query_db("SELECT ip, SUM(n) n FROM secu_ip WHERE jour >= date('now','localtime','-1 days') "
+                        "GROUP BY ip HAVING SUM(n) >= ? ORDER BY n DESC LIMIT 10", (seuil,)) or []
+        if not rows:
+            return out
+        ok, brut = _sec_cscli(["decisions", "list", "-o", "json"])
+        bannies = set()
+        if ok:
+            try:
+                for a in (json.loads(brut or "null") or []):
+                    for d in (a.get("decisions") or []):
+                        bannies.add(str(d.get("value") or ""))
+            except Exception:
+                pass
+        for r in rows:
+            ip = str(r["ip"] or "").strip()
+            if not ip or ip in bannies or _sec_de_confiance(ip):
+                continue
+            out.append({"fkey": "attaquant_%s" % ip, "category": "security", "severity": "warning",
+                        "title": "Adresse insistante : %s (%d attaques repoussées)" % (ip, int(r["n"])),
+                        "detail": "%s a tenté %d fois en deux jours : sondes d'effraction, mots de passe refusés. "
+                                  "Pas encore bannie." % (ip, int(r["n"])),
+                        "suggested_action": "bannir %s" % ip, "action_kind": "securite.bannir"})
+    except Exception as e:
+        logging.info("[PROACTIF] adresses insistantes : %s", e)
     return out
 
 
@@ -73499,7 +73539,7 @@ _AUT_CATALOGUE = [
    ('verrouiller-ssh-arreter-les-services-inutiles', 'Verrouiller SSH, arrêter les services inutiles', 'brancher', 'part', 'clé SSH présente, unités listées'),
  ]),
  ('reseau-et-acces', 'Réseau et accès', 'Adresses, robots, chemins, pare-feu, interfaces.', [
-   ('bannir-ou-debannir-une-adresse-ou-un-pays', 'Bannir ou débannir une adresse ou un pays', 'brancher', 'oui', 'exclut maison, tailnet, confiance'),
+   ('bannir-ou-debannir-une-adresse-ou-un-pays', 'Bannir ou débannir une adresse ou un pays', 'ok', 'oui', 'exclut maison, tailnet, confiance'),
    ('freiner-bloquer-ou-liberer-un-robot', 'Freiner, bloquer ou libérer un robot', 'brancher', 'oui', "fichier d'ajouts du site"),
    ('fermer-ou-rouvrir-un-chemin', 'Fermer ou rouvrir un chemin', 'brancher', 'oui', 'refus sur « / » ou si des humains y passent'),
    ('poser-ou-retirer-une-regle-de-pare-feu', 'Poser ou retirer une règle de pare-feu', 'brancher', 'oui', "à l'essai, retour automatique"),
@@ -73613,7 +73653,8 @@ _AUT_CATALOGUE = [
 
 # Le geste du catalogue que sait déclencher chaque action_kind du moteur proactif. Les autres restent au
 # palier global, sans disjoncteur : l'ancien comportement.
-_AUT_GESTE_DE_KIND = {"service.restart": "machine/relancer-un-service"}
+_AUT_GESTE_DE_KIND = {"service.restart": "machine/relancer-un-service",
+                      "securite.bannir": "reseau-et-acces/bannir-ou-debannir-une-adresse-ou-un-pays"}
 # Un constat précis qui relève d'un geste plus fin que son action_kind (testé en premier).
 _AUT_GESTE_DE_FKEY = {"collector_stale": "machine/relancer-le-collecteur"}
 _AUT_STATUTS = {"ok": "en service", "brancher": "à brancher", "ecrire": "à écrire", "dur": "garde dure"}
@@ -73889,7 +73930,7 @@ def aut_debloquer(cle: str, acteur: str = "") -> dict:
     return {"ok": True}
 
 
-def aut_journaliser(cle: str, sujet: str, ok: bool, detail: str, resultat: str, eff: dict) -> None:
+def aut_journaliser(cle: str, sujet: str, ok: bool, detail: str, resultat: str, eff: dict, defaire=None) -> None:
     """Une action autonome entre au journal « Qui a fait quoi », avec la règle qui l'a permise."""
     try:
         conn = _sec_gestes_conn()
@@ -73898,12 +73939,250 @@ def aut_journaliser(cle: str, sujet: str, ok: bool, detail: str, resultat: str, 
                          ("cassandra", "aut:" + cle, (sujet or "")[:120],
                           ("règle %s · palier %s%s" % (eff.get("libelle", cle), eff.get("palier", "?"),
                                                        (" · " + detail) if detail else ""))[:400],
-                          1 if ok else 0, (resultat or "")[:400], ""))
+                          1 if ok else 0, (resultat or "")[:400], json.dumps(defaire, ensure_ascii=False) if (defaire and ok) else ""))
             conn.commit()
         finally:
             conn.close()
     except Exception as e:
         logging.info("[AUTONOMIE] journal : %s", e)
+
+
+# ── LA GOUVERNANCE TRANSVERSE (10-10) : ce qui vaut pour tous les gestes ──────────────────────────────
+# Les intouchables, le second avis par défaut et son repli, le point de restauration. Une seule ligne dans
+# `autonomie_reglages` (clé « gov »). Le récit passe, lui, par la politique du Centre de notifications.
+_AUT_AVIS_SECOURS = ("Elle propose seulement", "Elle agit quand même si le geste est réversible", "Elle attend, sans rien faire")
+_AUT_SNAP_MODES = ("Fichiers et base, avant chaque geste en plusieurs étapes", "Fichiers seulement")
+# Par défaut : les appareils de Sandrine. « On n'écrit jamais chez l'autre » : Drisse le retire ou l'étend à sa guise.
+_AUT_GOV_DEFAUT = {"avis_defaut": "", "avis_secours": _AUT_AVIS_SECOURS[0], "snap_mode": _AUT_SNAP_MODES[0],
+                   "intouchables": ["ragnar", "iphone-sandrine"]}
+_AUT_AVIS_CACHE = {}               # (cle, sujet, commande) -> (epoch, verdict) ; une demande d'avis se paie en secondes
+_AUT_AVIS_TTL_S = 1800
+
+
+def aut_gouvernance() -> dict:
+    g = dict(_AUT_GOV_DEFAUT)
+    g["intouchables"] = list(_AUT_GOV_DEFAUT["intouchables"])
+    g.update({k: v for k, v in (aut_reglages_lire().get("gov") or {}).items() if k in _AUT_GOV_DEFAUT})
+    return g
+
+
+def aut_gouverner(champs: dict, acteur: str = "") -> dict:
+    propres = {}
+    for k, v in (champs or {}).items():
+        if k not in _AUT_GOV_DEFAUT:
+            return {"ok": False, "error": "réglage inconnu : %s" % str(k)[:40]}
+        if k == "avis_secours":
+            if v not in _AUT_AVIS_SECOURS:
+                return {"ok": False, "error": "repli inconnu"}
+            propres[k] = v
+        elif k == "snap_mode":
+            if v not in _AUT_SNAP_MODES:
+                return {"ok": False, "error": "mode de restauration inconnu"}
+            propres[k] = v
+        elif k == "avis_defaut":
+            propres[k] = str(v or "")[:160]
+        elif k == "intouchables":
+            if not isinstance(v, list):
+                return {"ok": False, "error": "une liste est attendue"}
+            propres[k] = [str(x).strip()[:120] for x in v if str(x).strip()][:200]
+    try:
+        conn = _aut_conn()
+        try:
+            row = conn.execute("SELECT reglages FROM autonomie_reglages WHERE cle = 'gov'").fetchone()
+            actuel = json.loads(row["reglages"]) if row else {}
+            actuel.update(propres)
+            conn.execute("INSERT INTO autonomie_reglages (cle, reglages, par) VALUES ('gov', ?, ?) "
+                         "ON CONFLICT(cle) DO UPDATE SET reglages = excluded.reglages, par = excluded.par, "
+                         "ts = datetime('now','localtime')", (json.dumps(actuel, ensure_ascii=False), acteur or ""))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"ok": False, "error": "enregistrement impossible : %s" % str(e)[:120]}
+    try:
+        log_user_activity(acteur, acteur, "autonomie_gouverner", json.dumps(propres, ensure_ascii=False)[:200])
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+def aut_correspond(liste, *textes) -> str:
+    """La première entrée de la liste que ces textes nomment : un nom (mot entier), une adresse, un réseau CIDR.
+    « ragnar (le PC de Sandrine) » vaut « ragnar »."""
+    import ipaddress
+    brut = " ".join(str(t or "") for t in textes).lower()
+    if not brut.strip():
+        return ""
+    ips = []
+    for m in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", brut):
+        try:
+            ips.append(ipaddress.ip_address(m))
+        except Exception:
+            pass
+    for entree in (liste or []):
+        nom = str(entree).split("(")[0].strip().lower()
+        if not nom:
+            continue
+        try:
+            reseau = ipaddress.ip_network(nom, strict=False)
+            if any(ip in reseau for ip in ips):
+                return str(entree)
+            continue
+        except Exception:
+            pass
+        if re.search(r"(?<![a-z0-9])" + re.escape(nom) + r"(?![a-z0-9])", brut):
+            return str(entree)
+    return ""
+
+
+def _aut_exclusions(eff: dict) -> list:
+    return [x.strip() for x in str(eff.get("excl") or "").split(",") if x.strip()]
+
+
+def aut_retenue(eff: dict, sujet: str, titre: str = "", cmd: str = "", chemin: str = "alerte") -> str:
+    """Un motif de refus tiré des règles de PORTÉE : intouchables, exclusions du geste, déclencheur. Vide si rien ne retient."""
+    gov = aut_gouvernance()
+    hit = aut_correspond(gov["intouchables"], sujet, titre, cmd)
+    if hit:
+        return "« %s » est dans les intouchables : aucune règle n'agit dessus" % hit
+    hit = aut_correspond(_aut_exclusions(eff), sujet, titre, cmd)
+    if hit:
+        return "« %s » est exclu de « %s »" % (hit, eff.get("libelle", eff.get("cle", "?")))
+    decl = eff.get("decl")
+    if decl == "Sur demande seulement":
+        return "déclencheur « sur demande seulement » : elle n'agit pas seule"
+    return ""
+
+
+def _aut_modele_creds(label: str):
+    """(clé, modèle, base, fournisseur) du modèle nommé par un libellé du menu « nom · fournisseur » / « nom · local »."""
+    label = str(label or "").strip()
+    if not label or label == _AUT_DEFAUT["aviq"]:
+        label = aut_gouvernance().get("avis_defaut") or ""
+    if not label:
+        return None
+    if label.endswith(" · local"):
+        nom = label[:-len(" · local")]
+        try:
+            if ollama_available() and any(m["name"] == nom for m in (ollama_list() or [])):
+                return ("ollama", nom, _ollama_base() + "/v1", "ollama")
+        except Exception:
+            pass
+        return None
+    if " · " in label:
+        nom, fourn = label.rsplit(" · ", 1)
+        try:
+            conn = _modeles_conn()
+            try:
+                r = conn.execute("SELECT id FROM modeles_registre WHERE nom = ? AND fournisseur = ?", (nom, fourn)).fetchone()
+            finally:
+                conn.close()
+            return modele_creds(r["id"]) if r else None
+        except Exception:
+            return None
+    return None
+
+
+def _aut_lire_avis(texte: str):
+    """('oui'|'non', raison) tiré de la réponse du relecteur, ou None si elle ne se lit pas."""
+    t = str(texte or "")
+    m = re.search(r"\{.*\}", t, re.S)
+    if m:
+        try:
+            j = json.loads(m.group(0))
+            a = str(j.get("avis") or j.get("verdict") or "").strip().lower()
+            if a in ("oui", "non"):
+                return a, str(j.get("raison") or j.get("reason") or "")[:240]
+        except Exception:
+            pass
+    mots = re.findall(r"\b(oui|non)\b", t.lower())
+    if len(set(mots)) == 1:
+        return mots[0], t.strip()[:240]
+    return None
+
+
+def aut_second_avis(eff: dict, sujet: str, titre: str, cmd: str) -> dict:
+    """Un modèle relit le geste AVANT qu'il parte. Rend {ok, raison, modele, dispo}. `dispo` est faux quand aucun
+    avis n'a pu être obtenu : c'est le repli de la gouvernance qui tranche alors, pas un silence."""
+    cle = eff.get("cle", "")
+    k = (cle, str(sujet or ""), str(cmd or ""))
+    c = _AUT_AVIS_CACHE.get(k)
+    if c and time.time() - c[0] < _AUT_AVIS_TTL_S:
+        return c[1]
+    creds = _aut_modele_creds(eff.get("aviq"))
+    if not creds:
+        v = {"ok": False, "dispo": False, "raison": "aucun modèle de second avis n'est choisi ou joignable", "modele": ""}
+        _AUT_AVIS_CACHE[k] = (time.time() - _AUT_AVIS_TTL_S + 120, v)     # on retente dans deux minutes
+        return v
+    consigne = ("Tu es le second avis d'un agent qui administre un serveur Linux. L'agent s'apprête à exécuter un geste. "
+                "Dis s'il est raisonnable de le laisser partir SEUL, sans demander à l'humain. Sois prudent : au moindre "
+                "doute sur la commande, sa cible, sa réversibilité ou sa cause, réponds non.\n"
+                "Réponds par UN SEUL objet JSON, rien d'autre : {\"avis\": \"oui\" ou \"non\", \"raison\": \"une phrase\"}.")
+    contexte = ("Règle : %s\nGeste réversible : %s\nSujet : %s\nCause constatée : %s\nCommande : %s"
+                % (eff.get("libelle", cle), {"oui": "oui", "part": "en partie", "non": "non"}.get(eff.get("rev"), "?"),
+                   str(sujet or "")[:160], str(titre or "")[:200], str(cmd or "")[:300]))
+    txt = ""
+    try:
+        txt = _itare_agent_text([{"role": "user", "content": contexte}], system=consigne, max_tokens=500, temperature=0.0,
+                                timeout=60.0, reflexion=False, creds=creds)
+    except Exception as e:
+        logging.info("[AUTONOMIE] second avis : %s", e)
+    lu = _aut_lire_avis(txt)
+    modele = "%s (%s)" % (creds[1], creds[3])
+    if not lu:
+        v = {"ok": False, "dispo": False, "raison": "le second avis n'a pas répondu de façon lisible", "modele": modele}
+        _AUT_AVIS_CACHE[k] = (time.time() - _AUT_AVIS_TTL_S + 120, v)
+        return v
+    v = {"ok": lu[0] == "oui", "dispo": True, "raison": lu[1], "modele": modele}
+    _AUT_AVIS_CACHE[k] = (time.time(), v)
+    return v
+
+
+def aut_avis_requis(eff: dict) -> bool:
+    if eff.get("avis") is not None:
+        return bool(eff["avis"])
+    return eff.get("rev") != "oui"          # par défaut : tout ce qui n'est pas pleinement réversible
+
+
+def aut_avis_porte(eff: dict, sujet: str, titre: str, cmd: str) -> str:
+    """Un motif de refus issu du second avis (ou de son repli), vide si le geste peut partir."""
+    if not aut_avis_requis(eff):
+        return ""
+    v = aut_second_avis(eff, sujet, titre, cmd)
+    eff["avis_rendu"] = v
+    if v.get("dispo"):
+        return "" if v["ok"] else "second avis négatif (%s) : %s" % (v.get("modele", "?"), v.get("raison", ""))
+    repli = aut_gouvernance().get("avis_secours")
+    if repli == _AUT_AVIS_SECOURS[1] and eff.get("rev") == "oui":
+        return ""
+    return "pas de second avis (%s) : %s" % (v.get("raison", "indisponible"),
+                                             "elle attend" if repli == _AUT_AVIS_SECOURS[2] else "elle propose seulement")
+
+
+_AUT_NIVEAU_DE_OU = {"Info : la cloche": "info", "À voir : cloche et e-mail à l'administrateur": "avoir",
+                     "Critique : cloche, e-mail et Telegram": "critique"}
+
+
+def aut_raconter(cle: str, sujet: str, ok: bool, detail: str, resultat: str, eff: dict) -> None:
+    """« Agir puis raconter » : la notification passe par le Centre (la cloche reçoit toujours ; l'e-mail et Telegram
+    suivent la politique de la gravité). Au palier « Agir », le journal seul garde la trace."""
+    if (eff or {}).get("palier") != "raconter":
+        return
+    niveau = _AUT_NIVEAU_DE_OU.get(eff.get("ou")) or ("info" if ok else "avoir")
+    if not ok and niveau == "info":
+        niveau = "avoir"
+    if eff.get("nuit") == "Non, jamais pour ce geste" and niveau == "critique":
+        niveau = "avoir"
+    if eff.get("nuit") == "Oui, pour ce geste" and not ok:
+        niveau = "critique"
+    lib = eff.get("libelle") or aut_libelle(cle)
+    try:
+        notif(("Fait seule : %s" if ok else "Échec seule : %s") % lib,
+              ("%s · %s%s" % ((sujet or "?")[:100], detail or "", (" · " + resultat) if (resultat and not ok) else ""))[:400],
+              source="veille", niveau=niveau, sujet=(sujet or "")[:100], cle="aut:fait:%s:%s" % (cle, (sujet or "")[:60]),
+              nature="evenement")
+    except Exception as e:
+        logging.info("[AUTONOMIE] récit : %s", e)
 
 
 def aut_porte(cle: str, sujet: str = "", titre: str = "") -> dict:
@@ -73926,7 +74205,13 @@ def aut_porte(cle: str, sujet: str = "", titre: str = "") -> dict:
         return _non("mode ombre sur « %s » : elle dit ce qu'elle aurait fait" % eff.get("libelle", cle))
     if not _aut_fenetre_ok(eff):
         return _non("hors de la fenêtre réglée pour « %s » (%s)" % (eff.get("libelle", cle), eff.get("fen")))
+    motif = aut_retenue(eff, sujet, titre, "", "planifie")
+    if motif:
+        return _non(motif)
     motif = aut_disj_verifier(cle, sujet, eff)
+    if motif:
+        return _non(motif)
+    motif = aut_avis_porte(eff, sujet, titre, "")
     if motif:
         return _non(motif)
     return {"ok": True, "eff": eff, "cle": cle, "sujet": sujet}
@@ -73938,6 +74223,7 @@ def aut_fin(porte: dict, ok: bool, detail: str = "", resultat: str = "") -> None
         return
     aut_disj_resultat(porte["cle"], porte.get("sujet") or "", bool(ok), porte.get("eff") or {})
     aut_journaliser(porte["cle"], porte.get("sujet") or "", bool(ok), detail, resultat, porte.get("eff") or {})
+    aut_raconter(porte["cle"], porte.get("sujet") or "", bool(ok), detail, resultat, porte.get("eff") or {})
 
 
 def autonomie_etat() -> dict:
@@ -73982,7 +74268,27 @@ def autonomie_etat() -> dict:
             a["libelle"] = aut_libelle(a["geste"][4:]) if a["geste"] != "aut:debloquer" else "Disjoncteur débloqué"
     except Exception:
         pass
+    recit, canaux = {}, {}
+    try:
+        recit = notif_politique(_NT_MACHINE)
+        canaux = notif_canaux_etat()
+        canaux = {"mail": bool((canaux.get("mail") or {}).get("declare")), "telegram": bool((canaux.get("telegram") or {}).get("declare")),
+                  "webhook": bool((canaux.get("webhook") or {}).get("declare"))}
+    except Exception as e:
+        logging.info("[AUTONOMIE] politique de récit : %s", e)
+    machines, sites = [], []
+    try:
+        machines = sorted({str(m.get("name") or m.get("nom") or "") for m in (flotte_parc().get("machines") or []) if (m.get("name") or m.get("nom"))})
+    except Exception:
+        pass
+    try:
+        sites = _sec_sites_geres()
+    except Exception:
+        pass
     return {"ok": True, "global": glob, "paliers": list(_PF_PALIERS), "domaines": domaines, "actions": actions,
+            "gouvernance": aut_gouvernance(), "recit": recit, "canaux": canaux,
+            "choix_gouvernance": {"avis_secours": list(_AUT_AVIS_SECOURS), "snap_mode": list(_AUT_SNAP_MODES)},
+            "intouchables_choix": {"machines": machines, "sites": sites},
             "choix": {k: list(v) for k, v in _AUT_CHOIX.items()}, "defaut": _AUT_DEFAUT,
             "declenches": [aut_libelle(k) for k, v in disj.items() if v.get("etat") == "declenche"]}
 
@@ -74022,11 +74328,18 @@ def pf_autorise(signature: str, action_kind: str, cmd: str, fkey: str = "",
                         % (signature, (sav or {}).get("successes", 0), _PF_SEUIL_PROMO))
     if eff and not _aut_fenetre_ok(eff):
         return _non("hors de la fenêtre réglée pour « %s » (%s)" % (eff.get("libelle", cle), eff.get("fen")))
+    if eff:
+        motif = aut_retenue(eff, fkey, titre, cmd, "alerte")
+        if motif:
+            return _non(motif)
     if _pf_en_pause():
         return _non("heures où vous êtes là (%s–%s) : elle propose au lieu d'agir"
                     % (a["pause_debut"], a["pause_fin"]))
     if eff:
         motif = aut_disj_verifier(cle, fkey or titre, eff)
+        if motif:
+            return _non(motif)
+        motif = aut_avis_porte(eff, fkey or titre, titre, cmd)
         if motif:
             return _non(motif)
     # Plus de plafond par jour (décision du 10-10) : le disjoncteur, qui mesure des erreurs et des boucles,
@@ -75020,7 +75333,9 @@ def proactive_scan(auto_act: bool = None) -> dict:
                 if g.get("cle"):
                     aut_disj_resultat(g["cle"], g.get("sujet") or "", bool(r.get("ok")), g.get("eff") or {})
                     aut_journaliser(g["cle"], g.get("sujet") or "", bool(r.get("ok")), t["title"],
-                                    str(r.get("error") or r.get("gate") or "")[:300], g.get("eff") or {})
+                                    str(r.get("error") or r.get("gate") or "")[:300], g.get("eff") or {}, r.get("inverse"))
+                    aut_raconter(g["cle"], g.get("sujet") or "", bool(r.get("ok")), t["title"],
+                                 str(r.get("error") or r.get("gate") or "")[:300], g.get("eff") or {})
         except Exception as e:
             logging.warning("[PROACTIVE] auto-act: %s", e)
         return acted
@@ -75418,6 +75733,26 @@ def proactive_act(fid, auto: bool = False, acteur: str = "") -> dict:
             logging.info("[PROACTIF] observation : %s", e)
     if auto and kind not in _SAFE_ACTION_KINDS:
         return {"ok": False, "error": "action non éligible à l'auto-remédiation"}
+    # UN BANNISSEMENT passe par le geste de Sécurité (CrowdSec, vérifié après coup, avec son inverse), pas par la cage :
+    # c'est le même geste que celui de l'humain, avec les mêmes refus (la maison, le tailnet, les adresses de confiance).
+    if kind == "securite.bannir":
+        _m = re.match(r"^\s*bannir\s+([0-9a-fA-F:.]+(?:/\d{1,3})?)\s*$", cmd)
+        if not _m:
+            return {"ok": False, "error": "commande de bannissement illisible"}
+        _res, _inv = _sec_geste_executer("bannir", {"ip": _m.group(1), "jours": int(_mem_cfg("proactive_ban_jours", 7))}, "cassandra")
+        out = ("bannie : " + str(_res.get("detail") or "")) if _res.get("ok") else ("⛔ " + str(_res.get("error") or "refusé"))
+        try:
+            log_action("proactive", cmd, out, 0, True, False)
+        except Exception:
+            pass
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            conn.execute("UPDATE proactive_findings SET status='acted', acted_at=datetime('now'), action_result=? WHERE id=?",
+                         (("auto • " if auto else "") + str(out)[:1500], int(fid)))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+        return {"ok": bool(_res.get("ok")), "output": str(out)[:2000], "gate": "", "inverse": _inv if _res.get("ok") else None}
     # Plus de juge : la commande tourne en cage comme toute autre. Seul le veto
     # parle avant, pour NOMMER le geste au lieu de rendre un « permission denied ».
     _v = veto_root(cmd)
@@ -96809,6 +97144,14 @@ class CassandraHandler(BaseHTTPRequestHandler):
             elif _sub == "regler":
                 _r = aut_regler(str(data.get("cle") or ""), data.get("reglages") if isinstance(data.get("reglages"), dict) else {}, _qui)
                 log_admin_action(_sid, "autonomie_regler", "OK" if _r.get("ok") else "FAIL", ("%s %s" % (data.get("cle"), json.dumps(data.get("reglages"), ensure_ascii=False)))[:200])
+            elif _sub == "gouverner":
+                _r = aut_gouverner(data.get("champs") if isinstance(data.get("champs"), dict) else {}, _qui)
+                log_admin_action(_sid, "autonomie_gouverner", "OK" if _r.get("ok") else "FAIL", json.dumps(data.get("champs"), ensure_ascii=False)[:200])
+            elif _sub == "recit":
+                _niv = str(data.get("niveau") or "")
+                _can = [c for c in (data.get("canaux") or []) if c in ("mail", "telegram", "webhook")] if isinstance(data.get("canaux"), list) else []
+                _r = notif_politique_set(_NT_MACHINE, _niv, _can)
+                log_admin_action(_sid, "autonomie_recit", "OK" if _r.get("ok") else "FAIL", "%s -> %s" % (_niv, ",".join(_can)))
             elif _sub == "remettre":
                 _r = aut_remettre(str(data.get("cle") or ""), _qui)
                 log_admin_action(_sid, "autonomie_remettre", "OK" if _r.get("ok") else "FAIL", str(data.get("cle") or "")[:120])
@@ -104249,6 +104592,7 @@ select.bu-inp:focus{color:var(--txt)}
 .aut-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px 16px;margin-bottom:10px}
 .aut-f{display:flex;flex-direction:column;gap:4px;min-width:0}.aut-f.w{grid-column:1/-1}.aut-f label{font-size:12px;font-weight:600}
 .aut-tog{width:18px;height:18px;accent-color:var(--accent);align-self:flex-start}
+.aut-x{border:0;background:transparent;color:inherit;font-size:14px;line-height:1;padding:0 0 0 2px;cursor:pointer}
 .aut-r{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.aut-r .bu-inp{width:auto;min-width:0;max-width:100%}.aut-r .t{font-size:12px;color:var(--txt-faint)}
 @media(max-width:820px){.aut-g{grid-template-columns:1fr}.aut-dr{justify-content:flex-start}}
 .pf-om:last-child{border-bottom:0}
@@ -108709,6 +109053,20 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
         <div id="pf-paliers" style="padding:14px 16px;display:grid;gap:9px"></div>
       </div>
       <div id="aut-alerte"></div>
+      <div class="card bu-flush" style="margin-bottom:15px">
+        <div class="bu-ct">Récit et réveil<div class="bu-sp"></div><span class="gd-tag" style="--c:var(--ok)">Centre de notifications</span></div>
+        <p class="bu-note">Chaque geste raconte ce qu'il a fait avec une gravité. Les canaux de chaque gravité sont ceux du Centre de notifications : la cloche reçoit toujours. Le critique réveille la nuit ; « à voir » attend la fin des heures calmes, dans le mail du matin ; « info » reste dans la cloche. Au palier « Agir », seul le journal garde la trace.</p>
+        <div id="aut-recit"></div>
+      </div>
+      <div class="card bu-flush" style="margin-bottom:15px">
+        <div class="bu-ct">Second avis et restauration</div>
+        <div id="aut-avis" class="aut-grid" style="padding:12px 16px"></div>
+      </div>
+      <div class="card bu-flush" style="margin-bottom:15px">
+        <div class="bu-ct">Intouchables<div class="bu-sp"></div><span class="gd-tag" style="--c:var(--danger)">aucune règle n'agit dessus</span></div>
+        <p class="bu-note">Ce sur quoi elle ne fait rien, jamais, quel que soit le geste : un nom de machine ou de site, une adresse, un réseau (192.168.1.0/24). Un constat qui nomme un intouchable est retenu et reste visible.</p>
+        <div id="aut-intch" style="padding:0 16px 14px"></div>
+      </div>
       <div class="card bu-flush" style="margin-bottom:15px">
         <div class="bu-ct">Règles par domaine<div class="bu-sp"></div><span class="gd-tag" style="--c:var(--violet)" id="aut-cnt"></span></div>
         <p class="bu-note">Le palier ci-dessus vaut partout où rien n'est réglé. Ici, chaque domaine et chaque geste peut avoir le sien. Un geste « à brancher » existe dans l'application sans être câblé à la proactivité ; un geste « à écrire » n'existe que pour un humain : ni l'un ni l'autre ne peut agir seul pour l'instant. <b>Pas de plafond par jour</b> : un disjoncteur arrête un geste qui échoue ou qui boucle, et toi seul le débloques.</p>
@@ -114354,14 +114712,14 @@ function autRendre(){
                  +autChamp('Mode ombre', autTog(k,'ombre',v('ombre')), 'Elle dit ce qu\u2019elle aurait fait, sans le faire.')
                  +autChamp('Fenêtre horaire', '<div class="aut-r">'+autSel(k,'fen',ch.fen||[],v('fen'))+autTps(k,'fd',v('fd'))+'<span class="t">à</span>'+autTps(k,'ff',v('ff'))+'</div>', 'La plage ne compte que si « Plage horaire » est choisie.', true)
                  +autChamp('Disjoncteur', '<div class="aut-r">'+autNum(k,'ech',v('ech'),1,5)+'<span class="t"> échecs d\u2019affilée, ou</span>'+autNum(k,'boucle',v('boucle'),1,10)+'<span class="t"> actions sur le même sujet en</span>'+autSel(k,'boucleh',ch.boucleh||[],v('boucleh'))+'</div>', 'Il arrête le geste seul. Toi seul le débloques.', true)
+                 +autChamp('Exclusions', '<input class="bu-inp mono" type="text" value="'+escapeAttr(v('excl')||'')+'" placeholder="ex. boheme-shop, 10.0.0.0/24" aria-label="excl" onchange="autSet(\''+k+'\',\'excl\',this)">','Ce qu\u2019elle ne touche jamais avec ce geste, en plus des intouchables. Séparés par des virgules.', true)
+                 +autChamp('Second avis', '<div class="aut-r">'+autTog(k,'avis',v('avis')===null?g.rev!=='oui':v('avis'))+autSel(k,'aviq',[def.aviq].concat(ETAT.proactivite._autModeles||[]),v('aviq'))+'</div>', 'Un modèle relit le geste avant l\u2019action. Par défaut : tout ce qui n\u2019est pas pleinement réversible.', true)
+                 +autChamp('Déclencheur', autSel(k,'decl',ch.decl||[],v('decl')), 'Seul « Sur demande seulement » est appliqué : il interdit tout geste seul.')
+                 +autChamp('Gravité du récit', autSel(k,'ou',ch.ou||[],v('ou')), 'Au palier « Agir + raconter ». Les canaux viennent du Centre de notifications.')
+                 +autChamp('Réveil nocturne', autSel(k,'nuit',ch.nuit||[],v('nuit')), 'Un échec avec « Oui » est critique ; « Non » plafonne à « à voir ».')
                  +'</div><div class="aut-grp">Enregistrés, appliqués au fil du câblage</div><div class="aut-grid">'
-                 +autChamp('Déclencheur', autSel(k,'decl',ch.decl||[],v('decl')))
                  +autChamp('Périmètre', autSel(k,'per',ch.per||[],v('per')))
-                 +autChamp('Exclusions', '<input class="bu-inp mono" type="text" value="'+escapeAttr(v('excl')||'')+'" placeholder="ex. boheme-shop, 10.0.0.0/24" aria-label="excl" onchange="autSet(\''+k+'\',\'excl\',this)">','Ce qu\u2019elle ne touche jamais avec ce geste.')
-                 +autChamp('Second avis', '<div class="aut-r">'+autTog(k,'avis',v('avis')===null?g.rev!=='oui':v('avis'))+autSel(k,'aviq',[def.aviq].concat(ETAT.proactivite._autModeles||[]),v('aviq'))+'</div>', 'Un modèle du registre relit le geste avant l\u2019action.', true)
                  +autChamp('Point de restauration', autTog(k,'snap',v('snap')===null?g.rev==='part':v('snap')))
-                 +autChamp('Gravité du récit', autSel(k,'ou',ch.ou||[],v('ou')), 'Les canaux viennent du Centre de notifications.')
-                 +autChamp('Réveil nocturne', autSel(k,'nuit',ch.nuit||[],v('nuit')))
                  +'</div><div style="padding-top:8px"><button class="btn-x mini" onclick="autRemettre(\''+k+'\')">Rétablir les valeurs du domaine</button></div></div>';
             }
             return '<div class="aut-g"><div class="co"><b>'+escapeHtml(g.nom)+'</b><div class="aut-tags">'
@@ -114377,6 +114735,7 @@ function autRendre(){
             +' '+autTag(dm.gestes.length+' gestes')+'<div class="aut-h">'+escapeHtml(dm.desc)+'</div></div>'
             +'<div class="aut-seg" title="Palier du domaine : vaut pour ses gestes sans palier propre">'+seg+'</div></summary>'+lignes+'</details>';
     }).join('');
+    try{ autRecit(d); autAvisCarte(d); autIntch(d); }catch(e){}
     const cnt=document.getElementById('aut-cnt'); if(cnt) cnt.textContent=nOk+' en service · '+nBr+' à brancher · '+nEc+' à écrire · '+nDur+' garde dure';
     const nd=document.getElementById('aut-nd'); if(nd) nd.textContent=decl.length;
     const al=document.getElementById('aut-alerte');
@@ -114388,6 +114747,75 @@ function autRendre(){
         return '<div class="pf-om"><span class="q">'+escapeHtml(String(a.ts||'').slice(5,16))+'</span><div class="co"><b>'+escapeHtml(a.libelle||a.geste)+(a.cible?' · '+escapeHtml(a.cible):'')+'</b>'
             +'<span>'+escapeHtml(a.detail||'')+(a.ok?'':' · échec : '+escapeHtml(a.resultat||''))+'</span></div>'+autTag(a.ok?'fait':'échec',a.ok?'var(--ok)':'var(--danger)')+'</div>'; }).join('')
         :'<div class="empty-state" style="padding:22px">Rien encore : aucune action autonome n\u2019est passée par une règle depuis la mise en service.</div>';
+}
+
+// ── GOUVERNANCE TRANSVERSE (10-10) : récit et réveil, second avis, intouchables ───────────────────────────
+function autChips(items){ return items.map(function(x){
+    return '<button class="aut-b'+(x.on?' on':'')+'" '+(x.dis?'disabled ':'')+'onclick="'+x.clic+'" aria-pressed="'+(!!x.on)+'" title="'+escapeAttr(x.tip||'')+'">'+escapeHtml(x.t)+'</button>'; }).join(' '); }
+function autRecit(d){
+    const z=document.getElementById('aut-recit'); if(!z) return;
+    const R=d.recit||{}, C=d.canaux||{};
+    const lib={critique:['Critique','réveille la nuit'],avoir:['À voir','attend la fin des heures calmes, dans le mail du matin'],info:['Info','reste dans la cloche']};
+    z.innerHTML='<div class="mx-tbl"><table><thead><tr><th>Gravité</th><th>Canaux</th><th>Comportement</th></tr></thead><tbody>'+
+      ['critique','avoir','info'].map(function(n){
+        const cur=R[n]||[]; const mk=function(c,t){ return {t:t+(C[c]?'':' (non déclaré)'), on:cur.indexOf(c)>=0, clic:'autRecitBasc(\''+n+'\',\''+c+'\')', tip:C[c]?'':'Ce canal n\u2019est pas déclaré : rien n\u2019y part tant qu\u2019il ne l\u2019est pas (Réglages › Canaux).'}; };
+        return '<tr><td><b>'+lib[n][0]+'</b></td><td><span class="gd-tag" style="--c:var(--ok)">cloche · toujours</span> '+
+          autChips([mk('mail','e-mail à l\u2019administrateur'),mk('telegram','Telegram'),mk('webhook','webhook')])+'</td><td><span class="aut-h">'+lib[n][1]+'</span></td></tr>'; }).join('')+
+      '</tbody></table></div>';
+}
+async function autRecitBasc(niveau, canal){
+    const d=ETAT.proactivite._aut; const cur=((d&&d.recit)||{})[niveau]||[]; const n=cur.filter(function(c){ return c!=='cloche'; });
+    const i=n.indexOf(canal); if(i>=0) n.splice(i,1); else n.push(canal);
+    try{
+        const r=await apiPost('/api/autonomie/recit',{niveau:niveau, canaux:n});
+        if(typeof showToast==='function') showToast(r&&r.ok?'Enregistré':((r&&(r.error||r.reason))||'refusé'), r&&r.ok?'success':'error', r&&r.ok?1500:6000);
+    }catch(e){ if(typeof showToast==='function') showToast('Erreur réseau','error',5000); }
+    await autCharger();
+}
+function autAvisCarte(d){
+    const z=document.getElementById('aut-avis'); if(!z) return;
+    const G=d.gouvernance||{}, CG=d.choix_gouvernance||{}; const modeles=ETAT.proactivite._autModeles||[];
+    const sel=function(champ, opts, val, vide){
+        return '<select class="bu-inp" aria-label="'+escapeAttr(champ)+'" onchange="autGouverner(\''+champ+'\',this.value)">'+(vide?'<option value="">'+vide+'</option>':'')+
+          opts.map(function(o){ return '<option'+(o===val?' selected':'')+'>'+escapeHtml(o)+'</option>'; }).join('')+'</select>'; };
+    z.innerHTML=autChamp('Second avis par défaut', sel('avis_defaut', modeles, G.avis_defaut||'', '(aucun modèle choisi)'),
+        modeles.length?'Un modèle du registre relit les gestes marqués « second avis ». Il se déclare dans Réglages › Agents IA.':'Aucun modèle déclaré : ajoute-en un dans Réglages › Agents IA.',true)
+      +autChamp('Si aucun avis n\u2019est disponible', sel('avis_secours', CG.avis_secours||[], G.avis_secours), 'Un modèle éteint ou un fournisseur en panne ne doit pas la bloquer en silence.')
+      +autChamp('Point de restauration', sel('snap_mode', CG.snap_mode||[], G.snap_mode), 'Enregistré : appliqué au fil du câblage de chaque geste.');
+}
+async function autGouverner(champ, valeur){
+    const o={}; o[champ]=valeur;
+    try{
+        const r=await apiPost('/api/autonomie/gouverner',{champs:o});
+        if(typeof showToast==='function') showToast(r&&r.ok?'Enregistré':((r&&r.error)||'refusé'), r&&r.ok?'success':'error', r&&r.ok?1500:6000);
+    }catch(e){ if(typeof showToast==='function') showToast('Erreur réseau','error',5000); }
+    await autCharger();
+}
+function autIntch(d){
+    const z=document.getElementById('aut-intch'); if(!z) return;
+    const L=(d.gouvernance||{}).intouchables||[]; const CH=d.intouchables_choix||{};
+    const groupe=function(nom, liste){ const o=(liste||[]).filter(function(x){ return L.indexOf(x)<0; });
+        return o.length?'<optgroup label="'+nom+'">'+o.map(function(x){ return '<option>'+escapeHtml(x)+'</option>'; }).join('')+'</optgroup>':''; };
+    z.innerHTML='<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">'+(L.length?L.map(function(x,i){
+        return '<span class="gd-tag" style="--c:var(--danger)">'+escapeHtml(x)+' <button class="aut-x" aria-label="Retirer '+escapeAttr(x)+'" onclick="autIntchRetirer('+i+')">\u00d7</button></span>'; }).join(''):'<span class="aut-h">Aucun intouchable.</span>')+'</div>'+
+      '<div class="aut-r"><select class="bu-inp" id="aut-ic-sel" aria-label="Choisir un intouchable"><option value="">Choisir dans la liste…</option>'+groupe('Machines de la flotte',CH.machines)+groupe('Sites',CH.sites)+'</select>'+
+      '<button class="btn-x mini" onclick="autIntchAjouter(\'aut-ic-sel\')">Ajouter</button>'+
+      '<input class="bu-inp mono" id="aut-ic-txt" type="text" placeholder="ou une adresse, un réseau, un site" aria-label="Saisir un intouchable" style="min-width:220px">'+
+      '<button class="btn-x mini" onclick="autIntchAjouter(\'aut-ic-txt\')">Ajouter</button></div>';
+}
+async function autIntchEnvoyer(liste){
+    try{
+        const r=await apiPost('/api/autonomie/gouverner',{champs:{intouchables:liste}});
+        if(typeof showToast==='function') showToast(r&&r.ok?'Enregistré':((r&&r.error)||'refusé'), r&&r.ok?'success':'error', r&&r.ok?1500:6000);
+    }catch(e){ if(typeof showToast==='function') showToast('Erreur réseau','error',5000); }
+    await autCharger();
+}
+function autIntchAjouter(id){
+    const e=document.getElementById(id); const v=e?String(e.value||'').trim():''; if(!v) return;
+    const L=(((ETAT.proactivite._aut||{}).gouvernance||{}).intouchables||[]).slice(); if(L.indexOf(v)<0) L.push(v); autIntchEnvoyer(L);
+}
+function autIntchRetirer(i){
+    const L=(((ETAT.proactivite._aut||{}).gouvernance||{}).intouchables||[]).slice(); L.splice(i,1); autIntchEnvoyer(L);
 }
 function autOuv(id, o){ (ETAT.proactivite._autOuv||(ETAT.proactivite._autOuv={}))[id]=!!o; }
 function autBasc(cle){ const g=ETAT.proactivite._autGeste||(ETAT.proactivite._autGeste={}); g[cle]=!g[cle]; autRendre(); }
