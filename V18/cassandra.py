@@ -88354,6 +88354,27 @@ def _secu_outils_resume(k: str, o: dict) -> tuple:
     return ("", "")
 
 
+def _secu_outils_acquit(k: str, o: dict, acquits: dict) -> None:
+    """UNE ACCEPTATION VAUT PARTOUT (10-10) : acceptée dans le Sensorium (outil_secu.<k>), l'alerte d'un outil ne
+    reste pas « à regarder » ici. Même règle que le Sensorium : elle tient tant que le chiffre surveillé (critiques
+    pour Trivy, avertissements pour Lynis) ne dépasse pas celui du moment de l'acceptation. Un virus ou un
+    videur arrêté (panne) ne s'accepte pas."""
+    a = (acquits or {}).get("outil_secu." + k)
+    if not a or o.get("niveau") != "regarder":
+        return
+    r = o.get("resultat") or {}
+    if k == "trivy":
+        n = sum(i.get("critiques", 0) for i in (r.get("images") or []) if not i.get("erreur"))
+    elif k == "lynis":
+        n = len(r.get("avertissements") or [])
+    else:
+        return
+    avant = _sensorium_nombre(a.get("valeur"))
+    if avant is not None and n <= avant:
+        o["niveau"] = "accepte"
+        o["acquit"] = {"raison": a.get("raison") or "", "jusqua": a.get("jusqua") or "", "par": a.get("par") or ""}
+
+
 def _sec_verdict(d: dict) -> dict:
     """Le verdict se CALCULE sur les mesures ; le modèle n'y touche pas."""
     expo = d["exposition"]
@@ -88475,8 +88496,13 @@ def securite_etat(compte: str = "", force: bool = False, ip: str = "") -> dict:
              "cles": cles, "fail2ban": _sec_fail2ban(), "maj": _sec_maj(), "cage": _sec_cage(),
              "confinement": conf, "mesure": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
              "hote": socket.gethostname()}
+        try:
+            _acq = sensorium_acquits()
+        except Exception:
+            _acq = {}
         for _k, _o in d["outils"].items():
             _o["niveau"], _o["dit"] = _secu_outils_resume(_k, _o)
+            _secu_outils_acquit(_k, _o, _acq)
         d["verdict"] = _sec_verdict(d)
         _SEC_CACHE.update({"t": maintenant, "d": d})
         d = dict(d)
@@ -115635,7 +115661,7 @@ function cronPollBadge(){
 const SC = {d: null, page: 'verdict', filtre: 'tout', flux: null, audits: null, veille: null};
 const SC_PAGES = ['verdict','exposition','parefeu','acces','defenses','outils','maj','journal','audit','ailleurs'];
 const SC_NIV = {ok: 'ok', regarder: 'warn', panne: 'danger', stable: 'ok'};
-function scP(niv, txt){ return '<span class="mx-pill ' + ({ok:'ok', stable:'ok', regarder:'regarder', panne:'panne', info:'pas_encore'}[niv] || '') + '">' + mxE(txt) + '</span>'; }
+function scP(niv, txt){ return '<span class="mx-pill ' + ({ok:'ok', stable:'ok', accepte:'ok', regarder:'regarder', panne:'panne', info:'pas_encore'}[niv] || '') + '">' + mxE(txt) + '</span>'; }
 function scL(pill, titre, sous, gest){ return '<div class="mx-row">' + pill + '<div class="mx-rt"><b>' + titre + '</b><span>' + (sous || '') + '</span></div><div class="mx-gest">' + (gest || '') + '</div></div>'; }
 function scB(txt, action, cls){ return '<button class="mx-btn' + (cls ? ' ' + cls : '') + '" type="button" onclick="' + action + '">' + mxE(txt) + '</button>'; }
 function scTexte(id, t){ const e = document.getElementById(id); if (e) e.textContent = t; }
@@ -115946,7 +115972,7 @@ const SC_OUTILS_X = {
 });
 function scOutils(){
     const O = SC.d.outils || {}, K = ['lynis', 'trivy', 'clamav', 'crowdsec'];
-    const lib = {ok: 'BON', regarder: 'À REGARDER', panne: 'ALERTE', pas_encore: 'INSTALLÉ'};
+    const lib = {ok: 'BON', regarder: 'À REGARDER', panne: 'ALERTE', pas_encore: 'INSTALLÉ', accepte: 'ACCEPTÉ'};
     const inst = K.filter(function(k){ return (O[k] || {}).installe; });
     scTexte('sc-outils-meta', inst.length + ' sur ' + K.length + ' installé' + (inst.length > 1 ? 's' : '') + ' · open source');
     scHtml('sc-outils', K.map(function(k){
@@ -115960,6 +115986,7 @@ function scOutils(){
         return scL(scP(o.installe ? (o.niveau || 'pas_encore') : '', o.installe ? (lib[o.niveau] || 'INSTALLÉ') : 'ABSENT'),
                    mxE(o.nom) + (o.version ? ' <span class="sc-mono">' + mxE(o.version) + '</span>' : ''),
                    mxE(o.role || '') + '<br>' + mxE(o.dit || '') + (r.quand ? ' · <i>dernier passage ' + mxE(String(r.quand).slice(0, 16)) + '</i>' : '')
+                   + (o.acquit ? '<br><i>Acceptée dans le Sensorium' + (o.acquit.raison ? ' : ' + mxE(o.acquit.raison) : '') + ' — revient si le chiffre monte.</i>' : '')
                    + (o.present ? '' : '<br><i>Programme des outils absent : relancez install.sh.</i>'), g);
     }).join(''));
     let h = '';
