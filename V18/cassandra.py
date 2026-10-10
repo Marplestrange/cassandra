@@ -9323,6 +9323,21 @@ def _fp_act_impl(args: dict) -> tuple:
     r = fp_action_run(str(args.get("action", "")), str(args.get("arg", "")),
                       str(args.get("arg2", "")), bool(args.get("confirm")),
                       "agent")
+    _cle = _AUT_ACTION_FP.get(str(args.get("action", "")))
+    if r.get("needs_confirm") and _cle:
+        _teinte = False
+        try:
+            _teinte = bool(origine_courante().get("teintes") or [])
+        except Exception:
+            pass
+        _porte = {"ok": False, "motif": "ce tour a lu du contenu venu du dehors"} if _teinte else \
+            aut_porte(_cle, str(args.get("arg2") or args.get("arg") or ""), "panel_act %s %s" % (args.get("action"), args.get("arg", "")))
+        if _porte.get("ok"):
+            r = fp_action_run(str(args.get("action", "")), str(args.get("arg", "")), str(args.get("arg2", "")), True, "agent")
+            aut_fin(_porte, bool(r.get("ok")), "accord donné par la règle · %s %s" % (args.get("action"), args.get("arg", "")),
+                    str(r.get("reason") or "")[:200])
+        else:
+            r = dict(r, reason=str(r.get("reason") or "") + " (la règle ne l'autorise pas seule : %s)" % _porte.get("motif", "?"))
     if r.get("needs_confirm"):
         return (r, "Accord requis : %s\nCommande : %s\nRelance avec confirm=true "
                    "si l'utilisateur approuve." % (r["reason"], r.get("command", "")),
@@ -11445,6 +11460,74 @@ def fp_backup_pass() -> dict:
             "stale": len(a.get("stale", []))}
 
 
+_SAUV_CLE_EMPREINTE = "sauvegardes-preuve-et-hors-site/verifier-les-empreintes-des-sauvegardes"
+_SAUV_CLE_BAC = "sauvegardes-preuve-et-hors-site/tester-une-restauration-en-bac-a-sable"
+
+
+def aut_sauvegardes_preuve() -> dict:
+    """Règles « Sauvegardes : preuve et hors site ». Une sauvegarde que personne ne relit n'est qu'une intention : toutes les
+    `sauv_preuve_jours` (7) jours, pour chaque plan actif de Cassandra, elle (1) compare l'empreinte d'un fichier tiré au hasard de la
+    DERNIÈRE copie à son original, (2) fait un essai de restauration à blanc dans un dossier à côté. Chaque preuve passe par sa règle."""
+    jours = float(_mem_cfg("sauv_preuve_jours", 7) or 7)
+    try:
+        plans = [x for x in (sauv_plans(inclure_fp=False).get("plans") or []) if x.get("actif") and x.get("moteur") == "rclone"]
+    except Exception as e:
+        return {"ok": False, "reason": str(e)[:100]}
+    faits = []
+    for pl in plans:
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10); conn.row_factory = sqlite3.Row
+            conn.execute("CREATE TABLE IF NOT EXISTS autonomie_preuves (cle TEXT PRIMARY KEY, ts REAL)")
+            copie = conn.execute("SELECT id FROM sauv_copies WHERE plan_id=? AND blanc=0 AND resultat NOT LIKE 'échec%' ORDER BY id DESC LIMIT 1",
+                                 (pl["id"],)).fetchone()
+            vus = {r["cle"]: r["ts"] for r in conn.execute("SELECT cle, ts FROM autonomie_preuves WHERE cle LIKE ?", ("%%:%d" % pl["id"],))}
+            conn.close()
+        except Exception as e:
+            logging.info("[SAUVEGARDE] preuves : %s", e)
+            continue
+        if not copie:
+            continue
+        for cle, tag in ((_SAUV_CLE_EMPREINTE, "verif"), (_SAUV_CLE_BAC, "bac")):
+            if time.time() - vus.get("%s:%d" % (tag, pl["id"]), 0) < jours * 86400:
+                continue
+            sujet = "plan:%d" % pl["id"]
+            porte = aut_porte(cle, sujet, "%s du plan « %s »" % ("Empreinte" if tag == "verif" else "Essai de restauration", pl.get("nom", "?")))
+            if not porte.get("ok"):
+                continue
+            if tag == "verif":
+                r = sauv_verifier(copie["id"]); ok, det = bool(r.get("ok")), str(r.get("detail") or r.get("reason") or "")
+            else:
+                r = sauv_restaurer(copie["id"], blanc=True, a_cote=True, acteur="cassandra")
+                ok = bool(r.get("ok")) and int(r.get("fichiers") or 0) > 0
+                det = str(r.get("detail") or r.get("reason") or "") + ("" if ok or not r.get("ok") else " — aucun fichier à restaurer")
+            aut_fin(porte, ok, det[:200], "" if ok else det[:200])
+            if not ok and tag == "bac":
+                try:
+                    _itare_proactive_add("Essai de restauration en échec : %s" % pl.get("nom", "?"), det[:300], source="sauvegarde", nature="etat",
+                                         niveau="critique", sujet=sujet, cle="sauvegarde:bac:%d" % pl["id"])
+                except Exception:
+                    pass
+            try:
+                conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+                conn.execute("INSERT OR REPLACE INTO autonomie_preuves (cle, ts) VALUES (?,?)", ("%s:%d" % (tag, pl["id"]), time.time()))
+                conn.commit(); conn.close()
+            except Exception:
+                pass
+            faits.append({"plan": pl["id"], "preuve": tag, "ok": ok})
+    return {"ok": True, "faits": faits}
+
+
+# ── L'accord d'une opération FastPanel peut venir des RÈGLES (10-10) ─────────────────────────────────────────────────
+# Jusqu'ici une opération qui modifie l'hébergement répondait toujours « accord requis » à l'agent, qui devait la présenter à
+# l'humain. Quand la règle du geste l'autorise (palier, fenêtre, disjoncteur, intouchables, périmètre, second avis), l'accord est
+# donné par la règle, et le geste passe par la même porte et le même journal que les autres. Un tour qui a lu du contenu venu
+# du dehors n'obtient JAMAIS cet accord : c'est la protection contre une injection.
+_AUT_ACTION_FP = {"site_creer": "hebergement/ajouter-un-site-ou-un-domaine",
+                  "ssl_reemettre": "hebergement/renouveler-un-certificat",
+                  "sauvegarde": "hebergement/relancer-une-sauvegarde-en-echec",
+                  "analyse_site": "defense-vue-de-l-exterieur/lancer-clamav-lynis-trivy"}
+
+
 def fp_ssl_autorenew_etat() -> dict:
     """Ce que la passe de renouvellement FERAIT, sans rien faire.
 
@@ -11937,7 +12020,7 @@ def fp_infra_pass() -> dict:
                     ("databases", fp_db_autolink), ("websocket", ws_proxy_watch),
                     ("fleet", fleet_pass), ("sites", site_pass),
                     ("scans", fp_scan_watch), ("liens", fp_liens_watch),
-                    ("rotation", aut_rotation_pass)):
+                    ("rotation", aut_rotation_pass), ("preuves", aut_sauvegardes_preuve)):
         try:
             res[nom] = fn()
         except Exception as e:
@@ -74449,7 +74532,7 @@ _AUT_CATALOGUE = [
    ('renouveler-un-certificat', 'Renouveler un certificat', 'ok', 'oui', 'seuil de 30 jours'),
    ('creer-une-base-de-donnees', 'Créer une base de données', 'ecrire', 'oui', 'cloisonnement par compte'),
    ('creer-ou-modifier-un-plan-de-sauvegarde', 'Créer ou modifier un plan de sauvegarde', 'ecrire', 'oui', 'cloisonnement par compte'),
-   ('ajouter-un-site-ou-un-domaine', 'Ajouter un site ou un domaine', 'ecrire', 'oui', 'cloisonnement par compte'),
+   ('ajouter-un-site-ou-un-domaine', 'Ajouter un site ou un domaine', 'ok', 'oui', 'cloisonnement par compte'),
    ('supprimer-une-base-ou-un-site', 'Supprimer une base ou un site', 'dur', 'non', 'confirmation humaine'),
  ]),
  ('conteneurs', 'Conteneurs', 'Docker et Compose.', [
@@ -74506,8 +74589,8 @@ _AUT_CATALOGUE = [
    ('rediger-le-rapport-d-incident', "Rédiger le rapport d'incident", 'brancher', 'oui', 'écrit au journal'),
  ]),
  ('sauvegardes-preuve-et-hors-site', 'Sauvegardes : preuve et hors site', 'Restaurer pour de vrai, envoyer ailleurs, purger.', [
-   ('tester-une-restauration-en-bac-a-sable', 'Tester une restauration en bac à sable', 'ecrire', 'oui', 'bac isolé, rien en production'),
-   ('verifier-les-empreintes-des-sauvegardes', 'Vérifier les empreintes des sauvegardes', 'ecrire', 'oui', 'lecture seule'),
+   ('tester-une-restauration-en-bac-a-sable', 'Tester une restauration en bac à sable', 'ok', 'oui', 'bac isolé, rien en production'),
+   ('verifier-les-empreintes-des-sauvegardes', 'Vérifier les empreintes des sauvegardes', 'ok', 'oui', 'lecture seule'),
    ('envoyer-une-sauvegarde-hors-site', 'Envoyer une sauvegarde hors site', 'ecrire', 'oui', 'destination à décider'),
    ('purger-les-sauvegardes-hors-retention', 'Purger les sauvegardes hors rétention', 'dur', 'non', 'suppression irréversible'),
  ]),
