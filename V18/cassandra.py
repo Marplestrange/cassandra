@@ -73699,6 +73699,66 @@ def _detect_wordpress() -> list:
     return out
 
 
+def _surface_ecoute() -> dict:
+    """Ce qui écoute sur TOUTES les interfaces (ou une adresse publique) : {"tcp/22": "sshd", …}. Les adresses locales, celles du
+    réseau privé et celles du tailnet n'exposent rien au-delà de la maison, et ne comptent pas."""
+    import ipaddress
+    sortie = {}
+    for proto, opt in (("tcp", "-tlnpH"), ("udp", "-ulnpH")):
+        try:
+            p = subprocess.run(["ss", opt], capture_output=True, text=True, timeout=15)
+        except Exception:
+            continue
+        for ligne in (p.stdout or "").splitlines():
+            col = ligne.split()
+            if len(col) < 5:
+                continue
+            local = col[3] if col[0] in ("LISTEN", "UNCONN") else col[4]
+            m = re.match(r"^(?:\[(.+)\]|(.+?))(?:%[\w.-]+)?:(\d+)$", local)
+            if not m:
+                continue
+            adr, port = (m.group(1) or m.group(2) or ""), m.group(3)
+            if adr not in ("*", "0.0.0.0", "::"):
+                try:
+                    ip = ipaddress.ip_address(adr)
+                except ValueError:
+                    continue
+                if ip.is_loopback or ip.is_private or ip.is_link_local or ip in ipaddress.ip_network("100.64.0.0/10") \
+                        or ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"):
+                    continue
+            proc = re.search(r'\(\("([^"]+)"', ligne)
+            sortie.setdefault("%s/%s" % (proto, port), proc.group(1) if proc else "?")
+    return sortie
+
+
+def _detect_surface() -> list:
+    """Règles « Défense vue de l'extérieur › Scanner sa surface » et « Comparer à la surface attendue ». La PREMIÈRE fois, l'état
+    d'aujourd'hui devient la référence (et la cloche le dit, port par port) ; ensuite, tout port NOUVEAU à l'écoute sur toutes les
+    interfaces est un constat. Réglage : surface_attendue (liste de « tcp/22 »)."""
+    actuel = _surface_ecoute()
+    if not actuel:
+        return []
+    cfg = get_cassandra_config() or {}
+    attendu = cfg.get("surface_attendue")
+    if attendu is None:
+        try:
+            cfg["surface_attendue"] = sorted(actuel)
+            save_cassandra_config(cfg)
+            notif("Surface exposée : l'état d'aujourd'hui sert de référence",
+                  "À l'écoute sur toutes les interfaces : %s. À partir de maintenant, tout NOUVEAU port est signalé. Si l'un de ceux-ci ne devrait pas "
+                  "être là, dis-le-moi." % ", ".join("%s (%s)" % (k, v) for k, v in sorted(actuel.items())),
+                  source="securite", niveau="avoir", cle="surface:reference")
+        except Exception as e:
+            logging.warning("[SURFACE] référence : %s", e)
+        return []
+    attendu = set(str(x) for x in attendu)
+    return [{"fkey": "surface_%s" % k.replace("/", "_"), "category": "security", "severity": "warning",
+             "title": "Nouveau port à l'écoute sur toutes les interfaces : %s (%s)" % (k, v),
+             "detail": "%s écoute sur %s, qui n'était pas dans la surface attendue. Si c'est voulu, ajoute « %s » à surface_attendue ; sinon, il faut le refermer." % (v, k, k),
+             "suggested_action": "", "action_kind": "diagnostic"}
+            for k, v in sorted(actuel.items()) if k not in attendu]
+
+
 def _detect_pieces() -> list:
     """Le dossier des pièces jointes de session : ce qu'il pèse, ce qui traîne.
 
@@ -74359,6 +74419,7 @@ _PF_DETECTEURS = (
     ("conteneurs", "Conteneurs", "proactive_watch_containers", "_detect_conteneurs"),
     ("domaines", "Domaines", "proactive_watch_domaines", "_detect_domaines_expiration"),
     ("wordpress", "Sites WordPress", "proactive_watch_wp", "_detect_wordpress"),
+    ("surface", "Surface exposée", "proactive_watch_surface", "_detect_surface"),
 )
 
 
@@ -74640,8 +74701,8 @@ _AUT_CATALOGUE = [
    ('remplacer-un-mot-de-passe-de-service', 'Remplacer un mot de passe de service', 'ecrire', 'part', 'écrit dans le coffre avant usage'),
  ]),
  ('defense-vue-de-l-exterieur', "Défense vue de l'extérieur", "Ce qui est vraiment exposé, comparé à ce qui devrait l'être.", [
-   ('scanner-sa-surface-depuis-l-exterieur', "Scanner sa surface depuis l'extérieur", 'ecrire', 'oui', 'ses propres adresses seulement'),
-   ('comparer-a-la-surface-attendue', 'Comparer à la surface attendue', 'ecrire', 'oui', 'lecture seule'),
+   ('scanner-sa-surface-depuis-l-exterieur', "Scanner sa surface depuis l'extérieur", 'ok', 'oui', 'ses propres adresses seulement'),
+   ('comparer-a-la-surface-attendue', 'Comparer à la surface attendue', 'ok', 'oui', 'lecture seule'),
    ('refermer-ce-qui-n-aurait-pas-du-etre-ouvert', "Refermer ce qui n'aurait pas dû être ouvert", 'brancher', 'oui', "pare-feu à l'essai"),
    ('lancer-clamav-lynis-trivy', 'Lancer ClamAV, Lynis, Trivy', 'brancher', 'oui', 'outils en liste blanche'),
  ]),
