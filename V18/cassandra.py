@@ -71033,6 +71033,12 @@ def _catalogue_etendre(p: dict) -> tuple:
                       ", ".join(_conf_approuves()) or "aucune"))
 
     if op in ("service_ajouter", "service_retirer"):
+        # 10-10 : Cassandra a voulu « redémarrer » session-c63.scope (une session sudo finie, marquée en échec) et
+        # s'est vu conseiller de l'ajouter ici. Une session ou un scope n'est pas un service : l'ajouter ouvrirait
+        # le catalogue aux connexions en cours. Elle s'efface, elle ne se redémarre pas.
+        if val.startswith("session-") or val.endswith(".scope"):
+            return 1, ("« %s » est une session de connexion, pas un service : elle ne se redémarre pas. Finie en échec, "
+                       "elle s'efface par catalogue(nom='ssh_sessions', params={op:'nettoyer'})." % val[:64])
         if not _ETENDRE_UNITE.match(val) or val.startswith(_ETENDRE_REFUS):
             return 1, "unité refusée : %r" % val[:64]
         cfg = get_cassandra_config()
@@ -71321,7 +71327,9 @@ _CATALOGUE = {
         "params": {"op": {"restart": ["restart"], "reload": ["reload"], "status": ["status", "--no-pager"],
                           "start": ["start"], "stop": ["stop"]},
                    "unite": _catalogue_services},
-        "aide": ("Cette unité n'est pas dans la table du catalogue. Ajoute-la toi-même : "
+        "aide": ("Cette unité n'est pas dans la table du catalogue. Une session-cNNN.scope « en échec » n'est PAS un "
+                 "service : c'est une connexion finie ; elle s'efface par catalogue(nom='ssh_sessions', params={op:'nettoyer'}). "
+                 "Pour un vrai service absent de la table, ajoute-le : "
                  "catalogue(nom='catalogue_etendre', params={op:'service_ajouter', valeur:'<unité>'})."),
         "reseau": False,
     },
