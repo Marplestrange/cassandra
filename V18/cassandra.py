@@ -23750,14 +23750,21 @@ def _sonde_mandat(arg, row):
 
 
 def _sonde_seuil(arg, row):
-    """RAM et charge : rentrées quand la mesure repasse sous le seuil d'avertissement."""
+    """RAM et charge : rentrées quand la mesure repasse sous le seuil d'avertissement.
+
+    LES VRAIS NOMS (10-10) : get_metrics() rend « ram », « disk », « load_1m » ; la sonde lisait « ram_pct »,
+    « disk_pct », « load1 » (les noms de proactive_metrics), ne trouvait rien, se disait muette — et une alerte de
+    charge, de mémoire ou de disque ne se refermait JAMAIS seule (« Load Average 9,19 » restait sous une charge à 1,7)."""
     m = get_metrics() or {}
     th = (load_alert_config() or {}).get("thresholds", {}) or {}
+
+    def lire(*noms):
+        return next((m[n] for n in noms if m.get(n) is not None), None)
     if arg == "ram":
-        v = m.get("ram_pct")
+        v = lire("ram", "ram_pct")
         return None if v is None else float(v) < float(th.get("ram_warning", 85))
     if arg == "load":
-        v = m.get("load1")
+        v = lire("load_1m", "load1")
         if v is None:
             return None
         try:
@@ -23766,7 +23773,7 @@ def _sonde_seuil(arg, row):
             coeurs = 1
         return float(v) < float(th.get("load_warning", coeurs * 1.5))
     if arg.startswith("disk"):
-        v = m.get("disk_pct")
+        v = lire("disk", "disk_pct")
         return None if v is None else float(v) < float(th.get("disk_warning", 80))
     return None
 
@@ -72420,7 +72427,8 @@ def _detect_disk() -> list:
     def _f(x):
         try: return float(x or 0)
         except Exception: return 0.0
-    disk = _f(m.get("disk_pct")); swap = _f(m.get("swap_pct"))
+    # get_metrics() rend « disk » et « swap » (10-10 : lus sous « disk_pct », ils valaient toujours 0)
+    disk = _f(m.get("disk", m.get("disk_pct"))); swap = _f(m.get("swap", m.get("swap_pct")))
     warn = _mem_cfg("proactive_disk_warn", 80.0); crit = _mem_cfg("proactive_disk_crit", 90.0)
     if disk >= warn:
         sev = "critical" if disk >= crit else "warning"
@@ -78934,6 +78942,12 @@ def _sensorium_alertes_passe() -> dict:
     now = _utcnow()
     fmt = "%Y-%m-%d %H:%M:%S"
     ouvertes, fermees = 0, 0
+    # UNE TRANSACTION OUVERTE BLOQUE LA CLOCHE (10-10) : notif() et notif_resoudre_cle() écrivent dans la même base
+    # par leur propre connexion. Appelés pendant que celle-ci tenait ses écritures, ils attendaient le verrou,
+    # abandonnaient (« database is locked »), et la ligne d'état était effacée quand même : « Santé 65/100 » restait
+    # ouverte pour toujours. On décide d'abord, on écrit et on FERME, puis on parle à la cloche ; une alerte dont la
+    # fermeture échoue garde sa ligne et sera refermée au passage suivant.
+    a_envoyer, a_fermer = [], []
     conn = _sensorium_conn()
     try:
         etat = {r["wkey"]: dict(r) for r in conn.execute("SELECT * FROM sensorium_alertes")}
@@ -78951,17 +78965,12 @@ def _sensorium_alertes_passe() -> dict:
             age = (now - datetime.strptime(e["depuis"], fmt)).total_seconds()
             delai = 0 if wk.startswith(_SENSORIUM_IMMEDIAT) else SENSORIUM_NOTIF_APRES_S
             if age >= delai and (not e.get("nid") or e.get("valeur") != val):
-                niveau = "critique" if wk.startswith(_SENSORIUM_CRITIQUES) else "avoir"
                 causes = []
                 try:
                     causes = (json.loads(r.get("detail") or "{}") or {}).get("causes_probables") or []
                 except Exception:
                     causes = []
-                n = notif("%s : %s" % (_sensorium_libelle(wk), val[:140]),
-                          corps=("En alerte depuis %d min." % (age // 60)) + (("\nCause probable : %s" % causes[0]) if causes else ""),
-                          source="sensorium", niveau=niveau, sujet=wk[:120], cle="sensorium:" + wk, nature="etat")
-                conn.execute("UPDATE sensorium_alertes SET nid = ?, valeur = ? WHERE wkey = ?", (int(n.get("id") or 0), val, wk))
-                ouvertes += 0 if e.get("nid") else 1
+                a_envoyer.append((wk, val, age, causes, bool(e.get("nid"))))
         for wk, e in etat.items():
             if wk in actives:
                 continue
@@ -78969,16 +78978,68 @@ def _sensorium_alertes_passe() -> dict:
                 conn.execute("UPDATE sensorium_alertes SET ok_depuis = ? WHERE wkey = ?", (now.strftime(fmt), wk))
                 continue
             if (now - datetime.strptime(e["ok_depuis"], fmt)).total_seconds() >= SENSORIUM_FERMER_APRES_S or wk in acquits:
-                if e.get("nid"):
-                    actuelle = next((str(r.get("value") or "") for r in rows if str(r.get("wkey")) == wk), "")
-                    notif_resoudre_cle("sensorium:" + wk, par="sensorium",
-                                       detail=("Acceptée." if wk in acquits else ("Revenu à la normale%s." % ((" : " + actuelle[:140]) if actuelle else ""))))
-                    fermees += 1
-                conn.execute("DELETE FROM sensorium_alertes WHERE wkey = ?", (wk,))
+                a_fermer.append((wk, bool(e.get("nid"))))
         conn.commit()
     finally:
         conn.close()
+    faits, effaces = [], []
+    for wk, val, age, causes, deja in a_envoyer:
+        niveau = "critique" if wk.startswith(_SENSORIUM_CRITIQUES) else "avoir"
+        n = notif("%s : %s" % (_sensorium_libelle(wk), val[:140]),
+                  corps=("En alerte depuis %d min." % (age // 60)) + (("\nCause probable : %s" % causes[0]) if causes else ""),
+                  source="sensorium", niveau=niveau, sujet=wk[:120], cle="sensorium:" + wk, nature="etat")
+        if n.get("id"):
+            faits.append((int(n["id"]), val, wk))
+            ouvertes += 0 if deja else 1
+    for wk, avait in a_fermer:
+        if avait:
+            actuelle = next((str(r.get("value") or "") for r in rows if str(r.get("wkey")) == wk), "")
+            if notif_resoudre_cle("sensorium:" + wk, par="sensorium",
+                                  detail=("Acceptée." if wk in acquits else ("Revenu à la normale%s." % ((" : " + actuelle[:140]) if actuelle else "")))) <= 0:
+                # Plus rien d'ouvert sous cette clé (déjà fermée à la main) : la ligne part ; un verrou : elle reste.
+                ouverte = _nt_ouverte_cle("sensorium:" + wk)
+                if ouverte:
+                    continue
+            fermees += 1
+        effaces.append(wk)
+    if faits or effaces:
+        conn = _sensorium_conn()
+        try:
+            for nid, val, wk in faits:
+                conn.execute("UPDATE sensorium_alertes SET nid = ?, valeur = ? WHERE wkey = ?", (nid, val, wk))
+            for wk in effaces:
+                conn.execute("DELETE FROM sensorium_alertes WHERE wkey = ?", (wk,))
+            conn.commit()
+        finally:
+            conn.close()
+    # Les orphelines : ouvertes dans la cloche, oubliées ici (effacées malgré un verrou, avant le 10-10). Plus
+    # suivies et plus en alerte : la mesure est revenue, on les referme.
+    try:
+        c2 = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+        try:
+            cles = [x[0] for x in c2.execute("SELECT DISTINCT cle FROM notifs WHERE cle LIKE 'sensorium:%' AND resolue = 0")]
+        finally:
+            c2.close()
+    except Exception:
+        cles = []
+    suivies = set(etat) | set(actives)
+    for cle in cles:
+        wk = cle.split(":", 1)[1]
+        if wk not in suivies and notif_resoudre_cle(cle, par="sensorium", detail="Revenu à la normale.") > 0:
+            fermees += 1
     return {"ok": True, "alertes": len(actives), "ouvertes": ouvertes, "fermees": fermees}
+
+
+def _nt_ouverte_cle(cle: str) -> bool:
+    """Une notification est-elle encore ouverte sous cette clé ? (En cas de doute — base verrouillée — oui.)"""
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+        try:
+            return bool(conn.execute("SELECT 1 FROM notifs WHERE cle = ? AND resolue = 0 LIMIT 1", (cle,)).fetchone())
+        finally:
+            conn.close()
+    except Exception:
+        return True
 
 
 def _sensorium_alertes_boucle() -> None:

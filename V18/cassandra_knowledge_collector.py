@@ -4531,7 +4531,9 @@ def collect_outils_securite() -> list:
         sev, val = "info", ""
         if o == "lynis":
             av = r.get("avertissements") or []
-            val = "score %s/100 · %d avertissement%s · %d conseil%s" % (r.get("score"), len(av), "s" if len(av) > 1 else "",
+            # LE CHIFFRE QUI COMPTE EN TÊTE : une alerte acceptée revient si le PREMIER nombre du texte monte
+            # (_sensorium_nombre). En tête, le score (plus haut = mieux) ferait l'inverse ; les avertissements, non.
+            val = "%d avertissement%s · score %s/100 · %d conseil%s" % (len(av), "s" if len(av) > 1 else "", r.get("score"),
                                                                        r.get("suggestions_n", 0), "s" if r.get("suggestions_n", 0) > 1 else "")
             if av:
                 sev, val = "warning", val + " : " + " ; ".join(a.get("texte", "")[:80] for a in av[:3])
@@ -4540,8 +4542,9 @@ def collect_outils_securite() -> list:
             crit = sum(i.get("critiques", 0) for i in I)
             corr = sum(i.get("corrigeables", 0) for i in I)
             pires = sorted(I, key=lambda i: -i.get("critiques", 0))[:3]
-            val = "%d image%s · %d faille%s critique%s · %d corrigée%s en amont, en attente d'une nouvelle image" % (len(I), "s" if len(I) > 1 else "", crit, "s" if crit > 1 else "",
-                                                                          "s" if crit > 1 else "", corr, "s" if corr > 1 else "")
+            # Les critiques en tête (et non le nombre d'images) : acceptée, l'alerte revient si elles augmentent.
+            val = "%d faille%s critique%s · %d image%s · %d corrigée%s en amont, en attente d'une nouvelle image" % (
+                crit, "s" if crit > 1 else "", "s" if crit > 1 else "", len(I), "s" if len(I) > 1 else "", corr, "s" if corr > 1 else "")
             if crit:
                 sev, val = "warning", val + " : " + ", ".join("%s (%d)" % (i["image"], i["critiques"]) for i in pires if i.get("critiques"))
         elif o == "clamav":
