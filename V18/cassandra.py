@@ -104191,6 +104191,20 @@ select.bu-inp:focus{color:var(--txt)}
 .pf-b .l{font-size:10.5px;color:var(--txt-faint);line-height:1.45}
 .pf-om{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:11px;align-items:center;
   padding:10px 14px;border-bottom:1px solid var(--line)}
+.aut-d{border-top:1px solid var(--line)}.aut-d>summary{list-style:none;cursor:pointer;display:flex;gap:10px 16px;align-items:center;justify-content:space-between;flex-wrap:wrap;padding:12px 16px}
+.aut-d>summary::-webkit-details-marker{display:none}.aut-d[open]>summary{border-bottom:1px solid var(--line)}
+.aut-d .co b{font-size:13px}.aut-h{font-size:11.5px;color:var(--txt-faint);margin-top:2px}
+.aut-seg{display:flex;gap:3px;flex-wrap:wrap}.aut-b{font-family:'JetBrains Mono',monospace;font-size:10.5px;padding:5px 8px;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--txt-soft);cursor:pointer}
+.aut-b.on{background:var(--accent);color:#fff;border-color:transparent;font-weight:700}
+.aut-g{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:8px 16px;align-items:center;padding:11px 16px;border-top:1px solid var(--line)}
+.aut-g:first-of-type{border-top:0}.aut-dr{display:flex;gap:6px;flex-wrap:wrap;align-items:center;justify-content:flex-end}
+.aut-tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:4px}
+.aut-pan{grid-column:1/-1;background:var(--bg-soft,rgba(127,127,127,.06));border-radius:10px;padding:12px 14px}
+.aut-grp{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--txt-ghost);margin:2px 0 8px}
+.aut-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px 16px;margin-bottom:10px}
+.aut-f{display:flex;flex-direction:column;gap:4px;min-width:0}.aut-f.w{grid-column:1/-1}.aut-f label{font-size:12px;font-weight:600}
+.aut-tog{width:18px;height:18px;accent-color:var(--accent)}
+@media(max-width:820px){.aut-g{grid-template-columns:1fr}.aut-dr{justify-content:flex-start}}
 .pf-om:last-child{border-bottom:0}
 .pf-om .q{font-family:'JetBrains Mono',monospace;font-size:9.5px;color:var(--txt-faint);
   white-space:nowrap}
@@ -108543,7 +108557,7 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
           <button class="bu-seg" style="padding:6px 14px" aria-selected="false"
                   onclick="pfVue('scans')">Scans</button>
           <button class="bu-seg" style="padding:6px 14px" aria-selected="false"
-                  onclick="pfVue('auto')">Autonomie</button>
+                  onclick="pfVue('auto')">Règles</button>
         </div>
         <span id="pf-counts" style="display:flex;gap:6px"></span>
         <button class="btn-x" onclick="pfScan()">Scanner</button>
@@ -108647,6 +108661,16 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
       <div class="card bu-flush" style="margin-bottom:15px">
         <div class="bu-ct">Jusqu'où elle peut aller seule</div>
         <div id="pf-paliers" style="padding:14px 16px;display:grid;gap:9px"></div>
+      </div>
+      <div id="aut-alerte"></div>
+      <div class="card bu-flush" style="margin-bottom:15px">
+        <div class="bu-ct">Règles par domaine<div class="bu-sp"></div><span class="gd-tag" style="--c:var(--violet)" id="aut-cnt"></span></div>
+        <p class="bu-note">Le palier ci-dessus vaut partout où rien n'est réglé. Ici, chaque domaine et chaque geste peut avoir le sien. Un geste « à brancher » existe dans l'application sans être câblé à la proactivité ; un geste « à écrire » n'existe que pour un humain : ni l'un ni l'autre ne peut agir seul pour l'instant. <b>Pas de plafond par jour</b> : un disjoncteur arrête un geste qui échoue ou qui boucle, et toi seul le débloques.</p>
+        <div id="aut-domaines"></div>
+      </div>
+      <div class="card bu-flush" style="margin-bottom:15px">
+        <div class="bu-ct">Ce qu'elle a fait seule, et au nom de quelle règle</div>
+        <div id="aut-actions"></div>
       </div>
       <div class="pf-duo">
         <div class="card bu-flush">
@@ -114169,14 +114193,10 @@ async function pfAutonomie(){
 
     const r=document.getElementById('pf-reglages');
     if(r) r.innerHTML='<div class="pf-bx">'+
-      '<div class="pf-b" style="--c:var(--accent)"><div class="n">'+
-      '<input class="bu-inp mono" id="pf-bj" value="'+(a.budget_jour||0)+
-      '" style="width:52px;padding:1px 5px;font-size:17px" onchange="pfRegler()"></div>'+
-      '<div class="l">actions autonomes par jour</div></div>'+
-      '<div class="pf-b" style="--c:var(--accent)"><div class="n">'+
-      '<input class="bu-inp mono" id="pf-bs" value="'+(a.budget_sujet||0)+
-      '" style="width:52px;padding:1px 5px;font-size:17px" onchange="pfRegler()"></div>'+
-      '<div class="l">sur un même sujet</div></div></div>'+
+      '<div class="pf-b" style="--c:var(--ok)"><div class="n">\u221e</div>'+
+      '<div class="l">actions par jour : aucun plafond</div></div>'+
+      '<div class="pf-b" style="--c:var(--warn)"><div class="n" id="aut-nd">0</div>'+
+      '<div class="l">disjoncteur(s) déclenché(s)</div></div></div>'+
       '<label class="bu-sw"><input type="checkbox" id="pf-pause"'+
       (a.pause?' checked':'')+' onchange="pfRegler()"><span>Ne rien faire seule entre '+
       '<input class="bu-inp mono" id="pf-pd" type="time" value="'+escapeAttr(a.pause_debut||'09:00')+
@@ -114195,8 +114215,9 @@ async function pfAutonomie(){
       'd\u2019affilée</b> sur un savoir-faire, il repasse en proposition et vous êtes '+
       'prévenu.</span></label>'+
       '<p style="margin:0;font-size:11.5px;color:var(--txt-soft);line-height:1.6">'+
-      'Un budget épuisé n\u2019est pas une panne : Cassandra continue de proposer. '+
-      'C\u2019est la <b>différence entre borner et bâillonner</b>.</p>';
+      'Un disjoncteur déclenché n\u2019est pas une panne : le geste fautif se tait, '+
+      'le reste continue. C\u2019est la <b>différence entre borner et bâillonner</b>.</p>';
+    autCharger();
 
     let o; try{ o=await apiPost('/api/pf/ombre',{}); }catch(e){ o=null; }
     const l=(o&&o.ombre)||[];
@@ -114221,6 +114242,134 @@ async function pfAutonomie(){
       : '<div class="empty-state" style="padding:26px">Rien dans l\u2019ombre — '+
         'au palier actuel, elle agit ou elle ne propose rien.</div>';
 }
+
+// ── LES RÈGLES PAR DOMAINE ET PAR GESTE (10-10) ─────────────────────────────────
+// Un réglage « actif » est lu par la porte (`pf_autorise`) : le palier, le mode ombre, la fenêtre, le disjoncteur.
+// Les autres s'enregistrent déjà et s'appliqueront au fil du câblage de chaque geste : l'écran le dit.
+const AUT_LV=[['observer','Observer'],['proposer','Proposer'],['maitrise','Agir'],['raconter','Agir + raconter']];
+const AUT_ST={ok:'var(--ok)',brancher:'var(--violet)',ecrire:'var(--txt-ghost)',dur:'var(--danger)'};
+const AUT_REV={oui:['réversible','var(--ok)'],part:['en partie réversible','var(--warn)'],non:['irréversible','var(--danger)']};
+function autTag(t,c){ return '<span class="gd-tag"'+(c?' style="--c:'+c+'"':'')+'>'+escapeHtml(t)+'</span>'; }
+function autChamp(lab, ctl, aide, large){
+    return '<div class="aut-f'+(large?' w':'')+'"><label>'+lab+'</label>'+ctl+(aide?'<span class="aut-h">'+aide+'</span>':'')+'</div>';
+}
+function autSel(cle, champ, opts, val, dis){
+    return '<select class="bu-inp" aria-label="'+escapeAttr(champ)+'" onchange="autSet(\''+cle+'\',\''+champ+'\',this)"'+(dis?' disabled':'')+'>'
+        +opts.map(function(o){ return '<option'+(o===val?' selected':'')+'>'+escapeHtml(o)+'</option>'; }).join('')+'</select>';
+}
+function autNum(cle, champ, val, mn, mx){
+    return '<input class="bu-inp mono" type="number" min="'+mn+'" max="'+mx+'" value="'+val+'" style="width:70px" aria-label="'+escapeAttr(champ)+'" onchange="autSet(\''+cle+'\',\''+champ+'\',this)">';
+}
+function autTps(cle, champ, val){
+    return '<input class="bu-inp mono" type="time" value="'+escapeAttr(val)+'" style="width:auto" aria-label="'+escapeAttr(champ)+'" onchange="autSet(\''+cle+'\',\''+champ+'\',this)">';
+}
+function autTog(cle, champ, val){
+    return '<input type="checkbox" class="aut-tog" aria-label="'+escapeAttr(champ)+'"'+(val?' checked':'')+' onchange="autSet(\''+cle+'\',\''+champ+'\',this)">';
+}
+async function autCharger(){
+    let d=null; try{ d=await apiPost('/api/autonomie',{}); }catch(e){}
+    ETAT.proactivite._aut=(d&&d.ok)?d:null;
+    if(!ETAT.proactivite._autModeles){
+        try{
+            const m=await apiPost('/api/modeles',{});
+            ETAT.proactivite._autModeles=((m&&m.modeles)||[]).map(function(x){ return x.nom+' · '+x.fournisseur; })
+                .concat(((m&&m.locaux)||[]).map(function(x){ return x.name+' · local'; }));
+        }catch(e){ ETAT.proactivite._autModeles=[]; }
+    }
+    autRendre();
+}
+function autRendre(){
+    const d=ETAT.proactivite._aut; const dom=document.getElementById('aut-domaines'); if(!dom) return;
+    if(!d){ dom.innerHTML='<div class="empty-state" style="padding:22px">Les règles ne répondent pas.</div>'; return; }
+    const ouv=ETAT.proactivite._autOuv||(ETAT.proactivite._autOuv={}); const gouv=ETAT.proactivite._autGeste||(ETAT.proactivite._autGeste={});
+    const def=d.defaut||{}, ch=d.choix||{};
+    let nOk=0, nBr=0, nEc=0, nDur=0; const decl=[];
+    dom.innerHTML=d.domaines.map(function(dm){
+        const dl=dm.reglages||{};
+        const seg=AUT_LV.map(function(l){
+            return '<button class="aut-b'+(dl.lv===l[0]?' on':'')+'" onclick="event.stopPropagation();autSetDom(\''+dm.id+'\',\''+(dl.lv===l[0]?'':l[0])+'\')" aria-pressed="'+(dl.lv===l[0])+'">'+l[1]+'</button>';
+        }).join('');
+        const lignes=dm.gestes.map(function(g){
+            if(g.st==='ok') nOk++; else if(g.st==='brancher') nBr++; else if(g.st==='ecrire') nEc++; else nDur++;
+            const R=g.reglages||{}; const v=function(k){ return R[k]!==undefined?R[k]:def[k]; };
+            const dj=g.disjoncteur||{}; const ouvert=dj.etat==='declenche'; if(ouvert) decl.push(g);
+            const verrou=(g.st==='dur'||g.st==='ecrire');
+            const opts=[['','Hérite']].concat(AUT_LV).map(function(l){
+                const dis=verrou&&(l[0]==='maitrise'||l[0]==='raconter');
+                return '<option value="'+l[0]+'"'+((R.lv||'')===l[0]?' selected':'')+(dis?' disabled':'')+'>'+l[1]+'</option>'; }).join('');
+            const nReg=Object.keys(R).length;
+            const lib=(AUT_LV.filter(function(l){ return l[0]===g.palier; })[0]||['',''])[1];
+            const effet=g.st==='dur'?'jamais seule':(g.st==='ecrire'?'propose seulement : geste à écrire':
+                (g.st==='brancher'?'à brancher : '+lib:(g.palier==='maitrise'||g.palier==='raconter'?'agit seule':lib.toLowerCase())));
+            let pan='';
+            if(gouv[g.cle]){
+                const k='g:'+g.cle;
+                pan='<div class="aut-pan"><div class="aut-grp">Appliqués par la porte</div><div class="aut-grid">'
+                 +autChamp('Mode ombre', autTog(k,'ombre',v('ombre')), 'Elle dit ce qu\u2019elle aurait fait, sans le faire.')
+                 +autChamp('Fenêtre horaire', autSel(k,'fen',ch.fen||[],v('fen'))+' '+autTps(k,'fd',v('fd'))+' à '+autTps(k,'ff',v('ff')), 'La plage ne compte que si « Plage horaire » est choisie.', true)
+                 +autChamp('Disjoncteur', autNum(k,'ech',v('ech'),1,5)+' échecs d\u2019affilée, ou '+autNum(k,'boucle',v('boucle'),1,10)+' actions sur le même sujet en '+autSel(k,'boucleh',ch.boucleh||[],v('boucleh')), 'Il arrête le geste seul. Toi seul le débloques.', true)
+                 +'</div><div class="aut-grp">Enregistrés, appliqués au fil du câblage</div><div class="aut-grid">'
+                 +autChamp('Déclencheur', autSel(k,'decl',ch.decl||[],v('decl')))
+                 +autChamp('Périmètre', autSel(k,'per',ch.per||[],v('per')))
+                 +autChamp('Exclusions', '<input class="bu-inp mono" type="text" value="'+escapeAttr(v('excl')||'')+'" placeholder="ex. boheme-shop, 10.0.0.0/24" aria-label="excl" onchange="autSet(\''+k+'\',\'excl\',this)">','Ce qu\u2019elle ne touche jamais avec ce geste.')
+                 +autChamp('Second avis', autTog(k,'avis',v('avis')===null?g.rev!=='oui':v('avis'))+' '+autSel(k,'aviq',[def.aviq].concat(ETAT.proactivite._autModeles||[]),v('aviq')), 'Un modèle du registre relit le geste avant l\u2019action.', true)
+                 +autChamp('Point de restauration', autTog(k,'snap',v('snap')===null?g.rev==='part':v('snap')))
+                 +autChamp('Gravité du récit', autSel(k,'ou',ch.ou||[],v('ou')), 'Les canaux viennent du Centre de notifications.')
+                 +autChamp('Réveil nocturne', autSel(k,'nuit',ch.nuit||[],v('nuit')))
+                 +'</div><div style="padding-top:8px"><button class="btn-x mini" onclick="autRemettre(\''+k+'\')">Rétablir les valeurs du domaine</button></div></div>';
+            }
+            return '<div class="aut-g"><div class="co"><b>'+escapeHtml(g.nom)+'</b><div class="aut-tags">'
+                +autTag(g.statut,AUT_ST[g.st])+autTag(AUT_REV[g.rev][0],AUT_REV[g.rev][1])+autTag('garde : '+g.garde)
+                +(ouvert?autTag('disjoncteur déclenché','var(--warn)'):'')+'</div>'
+                +(ouvert?'<div class="aut-h" style="color:var(--warn)">'+escapeHtml(dj.raison||'')+'</div>':'')+'</div>'
+                +'<div class="aut-dr"><select class="bu-inp" aria-label="Palier : '+escapeAttr(g.nom)+'" onchange="autSet(\'g:'+g.cle+'\',\'lv\',this)">'+opts+'</select>'
+                +autTag(effet,(g.palier==='maitrise'||g.palier==='raconter')&&g.st==='ok'?'var(--ok)':'')
+                +(ouvert?'<button class="btn-x mini" style="border-color:var(--warn);color:var(--warn)" onclick="autDebloquer(\''+g.cle+'\')">Débloquer</button>':'')
+                +'<button class="btn-x mini" onclick="autBasc(\''+g.cle+'\')">Réglages '+(gouv[g.cle]?'\u25b4':'\u25be')+(nReg?' · '+nReg:'')+'</button></div>'+pan+'</div>';
+        }).join('');
+        return '<details class="aut-d"'+(ouv[dm.id]?' open':'')+' ontoggle="autOuv(\''+dm.id+'\',this.open)"><summary><div class="co"><b>'+escapeHtml(dm.nom)+'</b>'
+            +' '+autTag(dm.gestes.length+' gestes')+'<div class="aut-h">'+escapeHtml(dm.desc)+'</div></div>'
+            +'<div class="aut-seg" title="Palier du domaine : vaut pour ses gestes sans palier propre">'+seg+'</div></summary>'+lignes+'</details>';
+    }).join('');
+    const cnt=document.getElementById('aut-cnt'); if(cnt) cnt.textContent=nOk+' en service · '+nBr+' à brancher · '+nEc+' à écrire · '+nDur+' garde dure';
+    const nd=document.getElementById('aut-nd'); if(nd) nd.textContent=decl.length;
+    const al=document.getElementById('aut-alerte');
+    if(al) al.innerHTML=decl.length?'<div class="card bu-flush aut-al" style="margin-bottom:15px"><div style="padding:12px 16px;display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center">'
+        +'<b style="color:var(--warn)">'+decl.length+' disjoncteur'+(decl.length>1?'s déclenchés':' déclenché')+'</b><span style="color:var(--txt-soft);font-size:12px">'
+        +decl.map(function(g){ return escapeHtml(g.nom)+' — '+escapeHtml(g.disjoncteur.raison||''); }).join(' · ')+'</span></div></div>':'';
+    const ac=document.getElementById('aut-actions');
+    if(ac) ac.innerHTML=(d.actions||[]).length?d.actions.map(function(a){
+        return '<div class="pf-om"><span class="q">'+escapeHtml(String(a.ts||'').slice(5,16))+'</span><div class="co"><b>'+escapeHtml(a.libelle||a.geste)+(a.cible?' · '+escapeHtml(a.cible):'')+'</b>'
+            +'<span>'+escapeHtml(a.detail||'')+(a.ok?'':' · échec : '+escapeHtml(a.resultat||''))+'</span></div>'+autTag(a.ok?'fait':'échec',a.ok?'var(--ok)':'var(--danger)')+'</div>'; }).join('')
+        :'<div class="empty-state" style="padding:22px">Rien encore : aucune action autonome n\u2019est passée par une règle depuis la mise en service.</div>';
+}
+function autOuv(id, o){ (ETAT.proactivite._autOuv||(ETAT.proactivite._autOuv={}))[id]=!!o; }
+function autBasc(cle){ const g=ETAT.proactivite._autGeste||(ETAT.proactivite._autGeste={}); g[cle]=!g[cle]; autRendre(); }
+async function autEnvoyer(cle, reglages){
+    try{
+        const d=await apiPost('/api/autonomie/regler',{cle:cle, reglages:reglages});
+        if(typeof showToast==='function') showToast(d&&d.ok?'Enregistré':((d&&d.error)||'refusé'), d&&d.ok?'success':'error', d&&d.ok?1500:6000);
+    }catch(e){ if(typeof showToast==='function') showToast('Erreur réseau','error',5000); }
+    await autCharger();
+}
+function autSet(cle, champ, el){
+    let v; if(el.type==='checkbox') v=el.checked; else if(el.type==='number') v=parseInt(el.value,10); else v=el.value;
+    if(champ==='lv'&&v==='') v=null;
+    const o={}; o[champ]=v; autEnvoyer(cle,o);
+}
+function autSetDom(id, lv){ autEnvoyer('d:'+id,{lv:lv||null}); }
+async function autRemettre(cle){
+    try{ await apiPost('/api/autonomie/remettre',{cle:cle}); }catch(e){}
+    await autCharger();
+}
+async function autDebloquer(cle){
+    if(!await fp2Confirm('Ce geste a été arrêté par son disjoncteur. Le débloquer le remet en route : à faire une fois la cause réglée.\n\nLe débloquer ?', 'Débloquer le disjoncteur')) return;
+    try{
+        const d=await apiPost('/api/autonomie/debloquer',{cle:cle});
+        if(typeof showToast==='function') showToast(d&&d.ok?'Disjoncteur débloqué':((d&&d.error)||'refusé'), d&&d.ok?'success':'error', 4000);
+    }catch(e){}
+    await autCharger();
+}
 async function pfPalier(p){
     document.querySelectorAll('.pf-niv').forEach(function(n){
         const i=n.querySelector('input'); n.classList.toggle('on', i && i.value===p); });
@@ -114236,8 +114385,6 @@ async function pfRegler(){
     const c=function(i){ const e=document.getElementById(i); return e?e.checked:false; };
     try{
         await apiPost('/api/pf/autonomie',{set:1,
-            pf_budget_jour:parseInt(g('pf-bj'),10)||0,
-            pf_budget_sujet:parseInt(g('pf-bs'),10)||0,
             pf_pause:c('pf-pause'), pf_pause_debut:g('pf-pd'), pf_pause_fin:g('pf-pf'),
             pf_reversible:c('pf-rev'), pf_instantane:c('pf-inst'),
             pf_retrograde:c('pf-retro')});
