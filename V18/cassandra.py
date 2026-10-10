@@ -73235,6 +73235,61 @@ def _aut_purger_caches() -> tuple:
     return True, det
 
 
+_DOM_EXPIRE_CACHE = {}          # domaine enregistré -> (relevé à, date d'expiration ou None)
+
+
+def _dom_enregistre(domaine: str) -> str:
+    """Le domaine qu'on RENOUVELLE : « app.cassandra.center » -> « cassandra.center » ; « x.co.uk » -> « x.co.uk »."""
+    p = [x for x in str(domaine or "").lower().strip(".").split(".") if x]
+    if len(p) < 2:
+        return ""
+    if len(p) >= 3 and len(p[-1]) == 2 and p[-2] in ("co", "com", "org", "net", "gov", "ac"):
+        return ".".join(p[-3:])
+    return ".".join(p[-2:])
+
+
+def _dom_expiration(domaine: str):
+    """La date d'expiration (datetime UTC) lue par RDAP, ou None. Un relevé par domaine et par 24 h : on ne harcèle pas un registre."""
+    t, v = _DOM_EXPIRE_CACHE.get(domaine, (0, None))
+    if time.time() - t < 86400:
+        return v
+    exp = None
+    try:
+        req = urllib.request.Request("https://rdap.org/domain/%s" % domaine, headers={"User-Agent": "Cassandra-Veille/1.0", "Accept": "application/rdap+json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.loads(r.read(400000).decode("utf-8", "replace"))
+        for ev in (d.get("events") or []):
+            if str(ev.get("eventAction")).lower() == "expiration":
+                exp = datetime.strptime(str(ev.get("eventDate"))[:19], "%Y-%m-%dT%H:%M:%S")
+                break
+    except Exception as e:
+        logging.info("[DOMAINES] expiration de %s : %s", domaine, str(e)[:100])
+    _DOM_EXPIRE_CACHE[domaine] = (time.time(), exp)
+    return exp
+
+
+def _detect_domaines_expiration() -> list:
+    """Règle « Domaines et DNS › Surveiller les expirations de domaines » : lecture seule. Un domaine qui expire éteint tous ses sites
+    d'un coup, sans aucune erreur avant le jour J. Seuil réglable : domaine_expire_jours (45) ; critique sous 14 jours."""
+    seuil = int(_mem_cfg("domaine_expire_jours", 45) or 45)
+    out = []
+    try:
+        doms = {_dom_enregistre(str(d.get("domain") or "")) for d in (get_fp_domains() or []) if isinstance(d, dict)}
+    except Exception:
+        doms = set()
+    for dom in sorted(x for x in doms if x):
+        exp = _dom_expiration(dom)
+        if not exp:
+            continue
+        jours = (exp - datetime.utcnow()).days
+        if jours <= seuil:
+            out.append({"fkey": "domaine_expire_%s" % dom, "category": "domaine", "severity": "critical" if jours <= 14 else "warning",
+                        "title": "Le domaine %s expire dans %d jours" % (dom, max(jours, 0)),
+                        "detail": "%s expire le %s (registre, par RDAP). À renouveler chez le registraire : tous ses sites s'éteignent le jour dit." % (dom, exp.strftime("%d/%m/%Y")),
+                        "suggested_action": "", "action_kind": "diagnostic"})
+    return out
+
+
 def _detect_pieces() -> list:
     """Le dossier des pièces jointes de session : ce qu'il pèse, ce qui traîne.
 
@@ -73893,6 +73948,7 @@ _PF_DETECTEURS = (
     ("collector", "Collecteur", "proactive_watch_collector", "_detect_collector"),
     ("ssh", "Clés SSH", "proactive_watch_ssh", "_detect_cles_ssh_anciennes"),
     ("conteneurs", "Conteneurs", "proactive_watch_containers", "_detect_conteneurs"),
+    ("domaines", "Domaines", "proactive_watch_domaines", "_detect_domaines_expiration"),
 )
 
 
@@ -74148,7 +74204,7 @@ _AUT_CATALOGUE = [
  ('domaines-et-dns', 'Domaines et DNS', 'Enregistrements, SPF, DKIM, DMARC, tunnels, expirations.', [
    ('corriger-un-enregistrement-derive-de-la-referenc', 'Corriger un enregistrement dérivé de la référence (A, MX)', 'ecrire', 'oui', 'référence versionnée'),
    ('publier-ou-reparer-spf-dkim-dmarc', 'Publier ou réparer SPF, DKIM, DMARC', 'ecrire', 'oui', 'valeurs validées avant publication'),
-   ('surveiller-les-expirations-de-domaines', 'Surveiller les expirations de domaines', 'ecrire', 'oui', 'lecture seule'),
+   ('surveiller-les-expirations-de-domaines', 'Surveiller les expirations de domaines', 'ok', 'oui', 'lecture seule'),
    ('gerer-les-tunnels-cloudflare', 'Gérer les tunnels Cloudflare', 'ecrire', 'oui', 'tailnet toujours joignable'),
    ('modifier-les-serveurs-de-noms', 'Modifier les serveurs de noms', 'dur', 'non', 'peut couper un site entier'),
    ('renouveler-ou-acheter-un-domaine', 'Renouveler ou acheter un domaine', 'dur', 'non', 'dépense : accord humain'),
@@ -115478,7 +115534,7 @@ function autRendre(){
             const nReg=Object.keys(R).length;
             const lib=(AUT_LV.filter(function(l){ return l[0]===g.palier; })[0]||['',''])[1];
             const effet=g.st==='dur'?'jamais seule':(g.st==='ecrire'?'propose seulement : geste à écrire':
-                (g.st==='brancher'?'à brancher : '+lib:(g.palier==='maitrise'||g.palier==='raconter'?'agit seule':lib.toLowerCase())));
+                (g.st==='brancher'?'à brancher : '+lib:(g.palier==='maitrise'?'agit seule après 10 réussites':(g.palier==='raconter'?'agit seule':lib.toLowerCase()))));
             let pan='';
             if(gouv[g.cle]){
                 const k='g:'+g.cle;
