@@ -419,8 +419,10 @@ def lancer_clamav():
     analyses = re.search(r"Scanned files:\s*(\d+)", o)
     sig = max((os.path.getmtime(p) for p in glob.glob("/var/lib/clamav/*.c[lv]d")), default=0)
     # Le code 2 vient aussi d'un simple fichier illisible (une socket, un tube) : seules les vraies erreurs comptent.
+    # Un fichier qui disparaît ou qu'on ne peut pas ouvrir (les /tmp/systemd-private-* des services) non plus.
+    benins = ("Not supported file type", "Access denied", "Can't access file", "No such file", "Permission denied")
     erreurs = [l for l in o.splitlines() if ("ERROR" in l or "Can't" in l or "Could not" in l)
-               and "Not supported file type" not in l and "Access denied" not in l]
+               and not any(b in l for b in benins)]
     return ecrire("clamav", {"cibles": cibles, "analyses": int(analyses.group(1)) if analyses else None,
                              "duree_min": round((time.time() - debut) / 60),
                              "infectes": infectes[:200], "erreur": "" if rc in (0, 1) or not erreurs else " ; ".join(erreurs[:3])[-300:],

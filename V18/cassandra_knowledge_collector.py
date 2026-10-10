@@ -4540,7 +4540,7 @@ def collect_outils_securite() -> list:
             crit = sum(i.get("critiques", 0) for i in I)
             corr = sum(i.get("corrigeables", 0) for i in I)
             pires = sorted(I, key=lambda i: -i.get("critiques", 0))[:3]
-            val = "%d image%s · %d faille%s critique%s · %d corrigeable%s" % (len(I), "s" if len(I) > 1 else "", crit, "s" if crit > 1 else "",
+            val = "%d image%s · %d faille%s critique%s · %d corrigée%s en amont, en attente d'une nouvelle image" % (len(I), "s" if len(I) > 1 else "", crit, "s" if crit > 1 else "",
                                                                           "s" if crit > 1 else "", corr, "s" if corr > 1 else "")
             if crit:
                 sev, val = "warning", val + " : " + ", ".join("%s (%d)" % (i["image"], i["critiques"]) for i in pires if i.get("critiques"))

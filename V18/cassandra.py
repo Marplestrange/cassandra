@@ -88260,7 +88260,7 @@ def _secu_outils_resume(k: str, o: dict) -> tuple:
         I = r.get("images") or []
         crit = sum(i.get("critiques", 0) for i in I)
         corr = sum(i.get("corrigeables", 0) for i in I)
-        return ("regarder" if crit else "ok", "%d image%s · %d faille%s critique%s · %d corrigeable%s par une mise à jour" % (
+        return ("regarder" if crit else "ok", "%d image%s · %d faille%s critique%s · %d déjà corrigée%s par leur auteur, en attente d'une nouvelle image" % (
             len(I), "s" if len(I) > 1 else "", crit, "s" if crit > 1 else "", "s" if crit > 1 else "", corr, "s" if corr > 1 else ""))
     if k == "clamav":
         n = len(r.get("infectes") or [])
@@ -115893,7 +115893,7 @@ function scOutils(){
     if (tv && (tv.images || []).length)
         h += '<details class="sc-details"><summary>Trivy — failles par image</summary><div class="mx-rows">' + tv.images.map(function(i){
             return i.erreur ? scL(scP('regarder', 'ILLISIBLE'), mxE(i.image), mxE(i.erreur), '')
-                 : scL(scP(i.critiques ? 'regarder' : 'ok', i.critiques + ' CRIT.'), mxE(i.image), i.hautes + ' haute(s) · ' + i.corrigeables + ' corrigeable(s)'
+                 : scL(scP(i.critiques ? 'regarder' : 'ok', i.critiques + ' CRIT.'), mxE(i.image), i.hautes + ' haute(s) · ' + i.corrigeables + ' déjà corrigée(s) par leur auteur (arrivent avec une nouvelle image)'
                        + ((i.exemples || []).length ? '<br><span class="sc-mono">' + mxE(i.exemples.slice(0, 4).map(function(e){ return e.id + ' ' + e.paquet + (e.corrigee_en ? ' → ' + e.corrigee_en : ''); }).join(' · ')) + '</span>' : ''), ''); }).join('') + '</div></details>';
     const cl = (O.clamav || {}).resultat;
     if (cl && (cl.infectes || []).length)
