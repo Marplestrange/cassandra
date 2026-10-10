@@ -73426,7 +73426,7 @@ def secure_execute(cmd: str) -> str:
 #   disque / SSL / sécurité = détection + investigation + action sur clic.
 # ============================================================
 _PROACTIVE_LAST = [0.0]
-_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer", "disque.purger", "wp.maj", "wp.plugin", "wp.restaurer", "secret.rotation")   # seules actions auto-remédiables (réversibles)
+_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer", "disque.purger", "wp.maj", "wp.plugin", "wp.restaurer", "secret.rotation", "sauvegarde.plan")   # seules actions auto-remédiables (réversibles)
 
 
 def _detect_disk() -> list:
@@ -73875,6 +73875,78 @@ def _detect_surface() -> list:
              "detail": "%s écoute sur %s, qui n'était pas dans la surface attendue. Si c'est voulu, ajoute « %s » à surface_attendue ; sinon, il faut le refermer." % (v, k, k),
              "suggested_action": "", "action_kind": "diagnostic"}
             for k, v in sorted(actuel.items()) if k not in attendu]
+
+
+_PLAN_NOM = "Cassandra — sauvegarde quotidienne"
+_PLAN_STOCKAGE = ("cassandra-local", "/var/backups/fastpanel")
+_PLAN_CLE = "hebergement/creer-ou-modifier-un-plan-de-sauvegarde"
+
+
+def _detect_sauvegardes_absentes() -> list:
+    """Règle « Hébergement › Créer ou modifier un plan de sauvegarde » : des sites n'ont AUCUNE copie, et le panneau n'a AUCUN plan
+    pour en produire. Un plan existant qui n'a pas encore tourné n'est pas un manque : on n'en crée pas un second."""
+    out = []
+    try:
+        a = fp_backup_audit()
+        manquants = a.get("missing") or [] if a.get("ok") else []
+        if not manquants:
+            return out
+        pl = fp_backup_plans()
+        if not pl.get("ok") or (pl.get("plans") or []):
+            return out
+    except Exception as e:
+        logging.info("[PROACTIF] sauvegardes absentes : %s", e)
+        return out
+    out.append({"fkey": "sauv_absente_plan", "category": "backup", "severity": "warning",
+                "title": "%d site%s sans aucune sauvegarde, et aucun plan pour en produire" % (len(manquants), "s" if len(manquants) > 1 else ""),
+                "detail": "Sans copie : %s. Le panneau n'a aucun plan de sauvegarde : Cassandra peut créer un plan quotidien (4 h, 7 copies gardées) vers un dossier du "
+                          "serveur — un filet sur le même disque, pas une copie hors machine." % ", ".join(manquants[:8]),
+                "suggested_action": "creer-plan-sauvegarde", "action_kind": "sauvegarde.plan"})
+    return out
+
+
+def _aut_creer_plan_sauvegarde() -> tuple:
+    """(ok, détail). Déclare le stockage local s'il n'y en a pas, crée le plan quotidien s'il n'y en a pas, PROUVE qu'il existe, puis le lance
+    une première fois en arrière-plan pour fermer le manque tout de suite. Rien n'est supprimé ni modifié : on ne fait qu'ajouter."""
+    import shutil
+    pl = fp_backup_plans()
+    if not pl.get("ok"):
+        return False, "plans du panneau illisibles : %s" % str(pl.get("reason"))[:100]
+    if pl.get("plans"):
+        return True, "un plan existe déjà dans le panneau : rien n'est créé"
+    st = fp_backup_stockages()
+    if not st.get("ok"):
+        return False, "stockages du panneau illisibles : %s" % str(st.get("reason"))[:100]
+    notes = []
+    if not st.get("stockages"):
+        nom, chemin = _PLAN_STOCKAGE
+        if shutil.disk_usage("/").free < 10 * 2 ** 30:
+            return False, "moins de 10 Go libres : pas de sauvegarde locale sur un disque presque plein"
+        try:
+            os.makedirs(chemin, mode=0o700, exist_ok=True)
+        except Exception as e:
+            return False, "dossier %s impossible : %s" % (chemin, str(e)[:80])
+        r = fp_backup_stockage_local_creer(nom, chemin, confirm=True, acteur="cassandra")
+        if not r.get("ok"):
+            return False, "stockage refusé par le panneau : %s" % str(r.get("reason"))[:120]
+        notes.append(r.get("output", ""))
+    r = fp_backup_plan_creer(_PLAN_NOM, "", "*", "4", confirm=True, acteur="cassandra", garder=7)
+    if not r.get("ok"):
+        return False, "plan refusé par le panneau : %s %s" % (str(r.get("reason"))[:100], str(r.get("detail") or "")[:120])
+    apres = fp_backup_plans()
+    plan = next((x for x in (apres.get("plans") or []) if str(x.get("name")) == _PLAN_NOM), None)
+    if not plan:
+        return False, "le panneau a répondu « créé » mais le plan n'apparaît pas dans sa liste"
+    notes.append(r.get("output", ""))
+    if plan.get("id") is not None:
+        def _premier():
+            try:
+                fp_action_run("sauvegarde", str(plan["id"]), "", True, "cassandra")
+            except Exception as e:
+                logging.info("[SAUVEGARDE] première exécution : %s", e)
+        threading.Thread(target=_premier, daemon=True, name="premiere-sauvegarde").start()
+        notes.append("première exécution lancée en arrière-plan")
+    return True, " · ".join(x for x in notes if x)
 
 
 def _detect_pieces() -> list:
@@ -74611,6 +74683,7 @@ _PF_DETECTEURS = (
     ("domaines", "Domaines", "proactive_watch_domaines", "_detect_domaines_expiration"),
     ("wordpress", "Sites WordPress", "proactive_watch_wp", "_detect_wordpress"),
     ("surface", "Surface exposée", "proactive_watch_surface", "_detect_surface"),
+    ("plan_sauvegarde", "Plan de sauvegarde", "proactive_watch_plan", "_detect_sauvegardes_absentes"),
 )
 
 
@@ -74822,7 +74895,7 @@ _AUT_CATALOGUE = [
    ('relancer-une-sauvegarde-en-echec', 'Relancer une sauvegarde en échec', 'ok', 'oui', 'une relance par échec, en arrière-plan'),
    ('renouveler-un-certificat', 'Renouveler un certificat', 'ok', 'oui', 'seuil de 30 jours'),
    ('creer-une-base-de-donnees', 'Créer une base de données', 'ok', 'oui', 'cloisonnement par compte'),
-   ('creer-ou-modifier-un-plan-de-sauvegarde', 'Créer ou modifier un plan de sauvegarde', 'ecrire', 'oui', 'cloisonnement par compte'),
+   ('creer-ou-modifier-un-plan-de-sauvegarde', 'Créer ou modifier un plan de sauvegarde', 'ok', 'oui', 'cloisonnement par compte'),
    ('ajouter-un-site-ou-un-domaine', 'Ajouter un site ou un domaine', 'ok', 'oui', 'cloisonnement par compte'),
    ('supprimer-une-base-ou-un-site', 'Supprimer une base ou un site', 'dur', 'non', 'confirmation humaine'),
  ]),
@@ -74925,6 +74998,7 @@ _AUT_CATALOGUE = [
 # Le geste du catalogue que sait déclencher chaque action_kind du moteur proactif. Les autres restent au
 # palier global, sans disjoncteur : l'ancien comportement.
 _AUT_GESTE_DE_KIND = {
+    "sauvegarde.plan": "hebergement/creer-ou-modifier-un-plan-de-sauvegarde",
     "secret.rotation": "rotation-des-secrets/remplacer-un-mot-de-passe-de-service",
     "wp.maj": "sites-wordpress/mettre-a-jour-le-cur-et-les-plugins",
     "wp.plugin": "sites-wordpress/desactiver-un-plugin-fautif",
@@ -77203,6 +77277,22 @@ def proactive_act(fid, auto: bool = False, acteur: str = "") -> dict:
         if _ok and kind == "wp.maj" and aut_porte(_WP_CLE_CACHE, _m.group(1), "Vider le cache de %s" % _m.group(1)).get("ok"):
             _ok2, det2 = _aut_wp_cache(_m.group(1))
             out += " · cache : " + det2
+        try:
+            log_action("proactive", cmd, out, 0, True, False)
+        except Exception:
+            pass
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            conn.execute("UPDATE proactive_findings SET status='acted', acted_at=datetime('now'), action_result=? WHERE id=?",
+                         (("auto • " if auto else "") + str(out)[:1500], int(fid)))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+        return {"ok": bool(_ok), "output": str(out)[:2000], "gate": ""}
+    if kind == "sauvegarde.plan":
+        if cmd.strip() != "creer-plan-sauvegarde":
+            return {"ok": False, "error": "commande de plan illisible"}
+        _ok, out = _aut_creer_plan_sauvegarde()
         try:
             log_action("proactive", cmd, out, 0, True, False)
         except Exception:
