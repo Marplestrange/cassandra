@@ -4296,15 +4296,29 @@ def _mx_verdict_pannes() -> list:
     toutes les quelques heures : le détail le dit, pour que l'heure ne passe pas pour une alerte à
     la minute."""
     out = []
+    # PLUS SUIVI ≠ EN PANNE (10-10) : le dernier relevé de CHAQUE domaine jamais vérifié passait pour l'état du
+    # moment — trois sites de l'ère Amizo, plus relevés depuis le 29-09, s'affichaient « en panne » en tête. Un
+    # site dont le dernier relevé a plus de deux jours n'est plus suivi : il ne dit rien du présent.
+    limite = (_utcnow() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        acquits = sensorium_acquits()
+    except Exception:
+        acquits = {}
+
+    def quand(t):
+        n = _ts_norm(t)
+        return (n[11:16] or "?") if n[:10] == _utcnow().strftime("%Y-%m-%d") else "le %s à %s" % (_mx_date_fr(n), n[11:16] or "?")
     conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
     try:
         for dom, ts, code in conn.execute(
                 "SELECT domain, ts, http_code FROM site_status WHERE id IN "
                 "(SELECT MAX(id) FROM site_status GROUP BY domain) AND up = 0 ORDER BY domain"):
+            if _ts_norm(ts) < limite:
+                continue
             depuis = conn.execute(
                 "SELECT MIN(ts) FROM site_status WHERE domain=? AND id > COALESCE("
                 "(SELECT MAX(id) FROM site_status WHERE domain=? AND up=1), 0)", (dom, dom)).fetchone()[0] or ts
-            out.append(_mx_ligne("panne", "%s ne répond plus depuis %s" % (dom, _ts_norm(depuis)[11:16] or "?"),
+            out.append(_mx_ligne("panne", "%s ne répond plus depuis %s" % (dom, quand(depuis)),
                                  "Dernier relevé %s%s. Les sites sont vérifiés toutes les quelques heures : "
                                  "l'heure est celle du relevé, pas de la panne."
                                  % (_ts_norm(ts)[:16], (" (code %s)" % code) if code else ""),
@@ -4313,10 +4327,13 @@ def _mx_verdict_pannes() -> list:
         for nom, ts in conn.execute(
                 "SELECT name, ts FROM fleet_status WHERE id IN "
                 "(SELECT MAX(id) FROM fleet_status GROUP BY name) AND online = 0 ORDER BY name"):
+            # Acceptée dans le Sensorium (« il est parti ») : une acceptation vaut partout.
+            if "fleet." + str(nom) in acquits or _ts_norm(ts) < limite:
+                continue
             depuis = conn.execute(
                 "SELECT MIN(ts) FROM fleet_status WHERE name=? AND id > COALESCE("
                 "(SELECT MAX(id) FROM fleet_status WHERE name=? AND online=1), 0)", (nom, nom)).fetchone()[0] or ts
-            out.append(_mx_ligne("panne", "La machine %s ne répond plus depuis %s" % (nom, _ts_norm(depuis)[11:16] or "?"),
+            out.append(_mx_ligne("panne", "La machine %s ne répond plus depuis %s" % (nom, quand(depuis)),
                                  "Dernier relevé %s ; les machines sont vérifiées toutes les cinq minutes." % _ts_norm(ts)[:16],
                                  [{"lib": "Voir la flotte", "f": "flotte", "a": nom},
                                   {"lib": "Voir le journal", "f": "journal", "a": _ts_norm(ts)}]))
@@ -77146,7 +77163,7 @@ def site_availability(days: int = 30) -> dict:
         conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
         rows = conn.execute(
             "SELECT domain, COUNT(*), SUM(up), AVG(CASE WHEN up=1 THEN response_ms END), "
-            "MAX(CASE WHEN up=1 THEN response_ms END) FROM site_status WHERE ts >= ? "
+            "MAX(CASE WHEN up=1 THEN response_ms END), MAX(ts) FROM site_status WHERE ts >= ? "
             "GROUP BY domain ORDER BY domain", (depuis,)).fetchall()
         pannes = {r[0]: (r[1], r[2]) for r in conn.execute(
             "SELECT domain, COUNT(*), COALESCE(SUM(duration_min),0) FROM site_events "
@@ -77154,15 +77171,20 @@ def site_availability(days: int = 30) -> dict:
         conn.close()
     except Exception as e:
         return {"ok": False, "reason": str(e)}
-    out = []
-    for dom, total, up, moy, mx in rows:
+    out, plus_suivis = [], []
+    # Un site plus relevé depuis deux jours n'est plus suivi (supprimé, déménagé) : son 0 % ne le met pas en tête.
+    suivi_depuis = (_utcnow() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+    for dom, total, up, moy, mx, dernier in rows:
+        if _ts_norm(dernier) < suivi_depuis:
+            plus_suivis.append(dom)
+            continue
         n, minutes = pannes.get(dom, (0, 0))
         out.append({"domain": dom, "samples": total,
                     "availability": round(100.0 * (up or 0) / total, 2) if total else None,
                     "response_avg_ms": int(moy) if moy is not None else None,
                     "response_max_ms": int(mx) if mx is not None else None,
                     "outages": n, "downtime_min": minutes, "downtime": _fleet_duree(minutes)})
-    return {"ok": True, "days": d, "sites": out,
+    return {"ok": True, "days": d, "sites": out, "plus_suivis": plus_suivis,
             "reason": "" if out else "Aucune mesure enregistrée — la passe n'a pas encore tourné."}
 
 
