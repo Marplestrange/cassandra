@@ -73186,7 +73186,7 @@ def secure_execute(cmd: str) -> str:
 #   disque / SSL / sécurité = détection + investigation + action sur clic.
 # ============================================================
 _PROACTIVE_LAST = [0.0]
-_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation")   # seules actions auto-remédiables (réversibles)
+_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer")   # seules actions auto-remédiables (réversibles)
 
 
 def _detect_disk() -> list:
@@ -73603,6 +73603,82 @@ def _detect_sauvegardes_echec() -> list:
     return out
 
 
+_CONT_NOM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def _docker_inspecter() -> list:
+    """Tous les conteneurs (arrêtés compris), tels que `docker inspect` les décrit. [] si Docker est absent ou muet."""
+    import shutil
+    if not shutil.which("docker"):
+        return []
+    p = subprocess.run(["docker", "ps", "-aq"], capture_output=True, text=True, timeout=20)
+    ids = (p.stdout or "").split()
+    if p.returncode != 0 or not ids:
+        return []
+    q = subprocess.run(["docker", "inspect"] + ids[:60], capture_output=True, text=True, timeout=40)
+    try:
+        return json.loads(q.stdout or "[]") or []
+    except Exception:
+        return []
+
+
+def _detect_conteneurs() -> list:
+    """Règle « Conteneurs › Relancer un conteneur » : un conteneur en mauvaise santé, ou tombé en ERREUR depuis moins de 24 h.
+    Un conteneur arrêté proprement (code 0) ou à la main n'est JAMAIS relancé : on ne contredit pas une décision."""
+    out = []
+    try:
+        maintenant = datetime.utcnow()
+        for c in _docker_inspecter():
+            nom = str(c.get("Name") or "").lstrip("/")
+            st = c.get("State") or {}
+            if not _CONT_NOM_RE.match(nom):
+                continue
+            sante = str((st.get("Health") or {}).get("Status") or "")
+            raison = ""
+            if sante == "unhealthy":
+                raison = "en mauvaise santé (« unhealthy »)"
+            elif str(st.get("Status")) in ("exited", "dead") and int(st.get("ExitCode") or 0) != 0:
+                try:
+                    fin = datetime.strptime(str(st.get("FinishedAt") or "")[:19], "%Y-%m-%dT%H:%M:%S")
+                    recent = (maintenant - fin).total_seconds() < 86400
+                except Exception:
+                    recent = False
+                if recent:
+                    raison = "tombé en erreur (code %s)" % st.get("ExitCode")
+            if raison:
+                out.append({"fkey": "conteneur_%s" % nom, "category": "service", "severity": "warning",
+                            "title": "Conteneur %s %s" % (nom, raison),
+                            "detail": "Le conteneur %s est %s. Une relance suffit souvent ; elle est vérifiée après coup." % (nom, raison),
+                            "suggested_action": "relancer-conteneur %s" % nom, "action_kind": "conteneur.relancer"})
+    except Exception as e:
+        logging.info("[PROACTIF] conteneurs : %s", e)
+    return out
+
+
+def _aut_relancer_conteneur(nom: str) -> tuple:
+    """(ok, détail). Relance un conteneur CONNU, puis prouve qu'il tourne et qu'il n'est pas « unhealthy »."""
+    if not _CONT_NOM_RE.match(nom or ""):
+        return False, "nom de conteneur illisible"
+    connus = {str(c.get("Name") or "").lstrip("/") for c in _docker_inspecter()}
+    if nom not in connus:
+        return False, "conteneur inconnu de Docker : %s" % nom
+    p = subprocess.run(["docker", "restart", "-t", "20", nom], capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        return False, "relance impossible : %s" % " ".join(((p.stderr or "") + (p.stdout or "")).split())[:160]
+    etat = ""
+    for _ in range(12):
+        time.sleep(5)
+        cur = next((c for c in _docker_inspecter() if str(c.get("Name") or "").lstrip("/") == nom), None)
+        st = (cur or {}).get("State") or {}
+        sante = str((st.get("Health") or {}).get("Status") or "")
+        etat = "%s%s" % (st.get("Status", "?"), (" / " + sante) if sante else "")
+        if st.get("Status") == "running" and sante in ("", "healthy"):
+            return True, "%s relancé, il tourne (%s)" % (nom, etat)
+        if st.get("Status") in ("exited", "dead"):
+            break
+    return False, "%s relancé mais ne va pas mieux (%s)" % (nom, etat)
+
+
 def _aut_relancer_site(domaine: str) -> tuple:
     """Relance ce qui sert les sites, puis VÉRIFIE que le site répond de nouveau. (ok, détail).
     nginx arrêté : on le relance ; sinon php-fpm. Une relance qui ne rend pas le site est un échec : le disjoncteur compte."""
@@ -73793,6 +73869,7 @@ _PF_DETECTEURS = (
     ("db", "Bases de données", "proactive_watch_db", "_detect_db"),
     ("collector", "Collecteur", "proactive_watch_collector", "_detect_collector"),
     ("ssh", "Clés SSH", "proactive_watch_ssh", "_detect_cles_ssh_anciennes"),
+    ("conteneurs", "Conteneurs", "proactive_watch_containers", "_detect_conteneurs"),
 )
 
 
@@ -74009,7 +74086,7 @@ _AUT_CATALOGUE = [
    ('supprimer-une-base-ou-un-site', 'Supprimer une base ou un site', 'dur', 'non', 'confirmation humaine'),
  ]),
  ('conteneurs', 'Conteneurs', 'Docker et Compose.', [
-   ('relancer-un-conteneur', 'Relancer un conteneur', 'brancher', 'oui', 'dossiers connus'),
+   ('relancer-un-conteneur', 'Relancer un conteneur', 'ok', 'oui', 'dossiers connus'),
    ('mettre-une-image-a-jour', 'Mettre une image à jour', 'brancher', 'part', 'retour automatique si « unhealthy »'),
  ]),
  ('comptes', 'Comptes', 'Utilisateurs, droits, clés de sécurité.', [
@@ -74107,6 +74184,7 @@ _AUT_CATALOGUE = [
 # Le geste du catalogue que sait déclencher chaque action_kind du moteur proactif. Les autres restent au
 # palier global, sans disjoncteur : l'ancien comportement.
 _AUT_GESTE_DE_KIND = {
+    "conteneur.relancer": "conteneurs/relancer-un-conteneur",
     "ssh.rotation": "rotation-des-secrets/faire-tourner-une-cle-ssh","service.restart": "machine/relancer-un-service",
                       "securite.bannir": "reseau-et-acces/bannir-ou-debannir-une-adresse-ou-un-pays",
                       "site.relancer": "hebergement/relancer-un-site",
@@ -76328,6 +76406,23 @@ def proactive_act(fid, auto: bool = False, acteur: str = "") -> dict:
         if not _m:
             return {"ok": False, "error": "commande de relance de site illisible"}
         _ok, out = _aut_relancer_site(_m.group(1))
+        try:
+            log_action("proactive", cmd, out, 0, True, False)
+        except Exception:
+            pass
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            conn.execute("UPDATE proactive_findings SET status='acted', acted_at=datetime('now'), action_result=? WHERE id=?",
+                         (("auto • " if auto else "") + str(out)[:1500], int(fid)))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+        return {"ok": bool(_ok), "output": str(out)[:2000], "gate": ""}
+    if kind == "conteneur.relancer":
+        _m = re.match(r"^\s*relancer-conteneur\s+([A-Za-z0-9][A-Za-z0-9_.-]{0,63})\s*$", cmd)
+        if not _m:
+            return {"ok": False, "error": "commande de relance de conteneur illisible"}
+        _ok, out = _aut_relancer_conteneur(_m.group(1))
         try:
             log_action("proactive", cmd, out, 0, True, False)
         except Exception:
