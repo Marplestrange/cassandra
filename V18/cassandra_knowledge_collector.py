@@ -4550,7 +4550,9 @@ def collect_outils_securite() -> list:
                 sev, val = "critical", "%d FICHIER%s INFECTÉ%s : %s" % (len(inf), "S" if len(inf) > 1 else "", "S" if len(inf) > 1 else "",
                                                                      " ; ".join("%s (%s)" % (x["fichier"], x["menace"]) for x in inf[:3]))
             else:
-                val = "%s fichiers analysés · aucune menace · signatures du %s" % (r.get("analyses") or "?", r.get("signatures") or "?")
+                val = "%s · aucune menace · signatures du %s" % (
+                    ("%d fichiers analysés" % r["analyses"]) if r.get("analyses") is not None else "balayage complet",
+                    r.get("signatures") or "?")
                 try:
                     if (datetime.now() - datetime.strptime(r.get("signatures") or "", "%Y-%m-%d %H:%M")).days > 3:
                         sev, val = "warning", val + " (PÉRIMÉES : freshclam ne les met plus à jour)"

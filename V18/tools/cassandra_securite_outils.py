@@ -404,8 +404,11 @@ def lancer_clamav():
     r = reglages()
     cibles = r.get("CLAMAV_CIBLES", "").split() or ["/home", "/var/www", "/srv", "/root", "/tmp", "/var/tmp", DATA_DIR]
     cibles = [c for c in cibles if os.path.isdir(c)]
+    # Un seul fil (pas de balayage multiple) : le démon prendrait tous les cœurs, et la machine alerterait sur sa
+    # propre charge pendant le balayage. Plus lent, mais la nuit, ça ne gêne personne.
+    debut = time.time()
     if actif("clamav-daemon"):
-        rc, o = sh(["clamdscan", "--multiscan", "--fdpass", "--infected", *cibles], timeout=6 * 3600)
+        rc, o = sh(["clamdscan", "--fdpass", "--infected", *cibles], timeout=12 * 3600)
     else:
         rc, o = sh(["clamscan", "-r", "-i", "--max-filesize=50M", *cibles], timeout=12 * 3600)
     infectes = []
@@ -415,8 +418,12 @@ def lancer_clamav():
             infectes.append({"fichier": m.group(1), "menace": m.group(2)})
     analyses = re.search(r"Scanned files:\s*(\d+)", o)
     sig = max((os.path.getmtime(p) for p in glob.glob("/var/lib/clamav/*.c[lv]d")), default=0)
+    # Le code 2 vient aussi d'un simple fichier illisible (une socket, un tube) : seules les vraies erreurs comptent.
+    erreurs = [l for l in o.splitlines() if ("ERROR" in l or "Can't" in l or "Could not" in l)
+               and "Not supported file type" not in l and "Access denied" not in l]
     return ecrire("clamav", {"cibles": cibles, "analyses": int(analyses.group(1)) if analyses else None,
-                             "infectes": infectes[:200], "erreur": "" if rc in (0, 1) else o.strip()[-300:],
+                             "duree_min": round((time.time() - debut) / 60),
+                             "infectes": infectes[:200], "erreur": "" if rc in (0, 1) or not erreurs else " ; ".join(erreurs[:3])[-300:],
                              "signatures": time.strftime("%Y-%m-%d %H:%M", time.localtime(sig)) if sig else ""})
 
 

@@ -88266,8 +88266,9 @@ def _secu_outils_resume(k: str, o: dict) -> tuple:
         n = len(r.get("infectes") or [])
         if n:
             return ("panne", "%d FICHIER%s INFECTÉ%s" % (n, "S" if n > 1 else "", "S" if n > 1 else ""))
-        return ("regarder" if r.get("erreur") else "ok", "%s fichiers analysés · aucune menace · signatures du %s" % (
-            r.get("analyses") if r.get("analyses") is not None else "?", r.get("signatures") or "?"))
+        fait = ("%d fichiers analysés" % r["analyses"]) if r.get("analyses") is not None else \
+               ("balayage complet en %d min" % r["duree_min"] if r.get("duree_min") is not None else "balayage complet")
+        return ("regarder" if r.get("erreur") else "ok", "%s · aucune menace · signatures du %s" % (fait, r.get("signatures") or "?"))
     if k == "crowdsec":
         if not (r.get("moteur") and r.get("videur")):
             return ("panne", "moteur %s · videur %s" % ("actif" if r.get("moteur") else "ARRÊTÉ", "actif" if r.get("videur") else "ARRÊTÉ"))
