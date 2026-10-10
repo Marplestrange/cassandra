@@ -73761,6 +73761,34 @@ def _aut_conn():
     return conn
 
 
+def _aut_ecrire(fn, essais: int = 4):
+    """Exécute `fn(conn)` dans UNE transaction d'écriture prise d'entrée (BEGIN IMMEDIATE), et la rejoue si la base est
+    occupée. En mode WAL, lire PUIS écrire sur la même connexion échoue sur-le-champ (« database is locked », sans
+    attendre le délai) dès qu'un autre écrivain a commité entre les deux : prendre le verrou avant de lire l'évite.
+    Une occupation est inscrite au journal : c'est la seule façon de savoir qui gêne."""
+    derniere = None
+    for i in range(essais):
+        conn = _aut_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            r = fn(conn)
+            conn.commit()
+            return r
+        except sqlite3.OperationalError as e:
+            derniere = e
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if "lock" not in str(e).lower() and "busy" not in str(e).lower():
+                raise
+            logging.warning("[AUTONOMIE] base occupée (essai %d/%d) : %s", i + 1, essais, e)
+            time.sleep(0.4 * (i + 1))
+        finally:
+            conn.close()
+    raise derniere
+
+
 def aut_reglages_lire() -> dict:
     try:
         conn = _aut_conn()
@@ -73823,22 +73851,19 @@ def aut_regler(cle: str, reglages: dict, acteur: str = "") -> dict:
             if str(v) not in _AUT_CHOIX[k]:
                 return {"ok": False, "error": "%s : valeur inconnue" % k}
             propres[k] = str(v)
+    def _ecrire(conn):
+        row = conn.execute("SELECT reglages FROM autonomie_reglages WHERE cle = ?", (cle,)).fetchall()
+        actuel = json.loads(row[0]["reglages"]) if row else {}
+        actuel.update(propres)
+        actuel = {k: v for k, v in actuel.items() if v != _AUT_DEFAUT.get(k)}
+        if actuel:
+            conn.execute("INSERT INTO autonomie_reglages (cle, reglages, par) VALUES (?,?,?) "
+                         "ON CONFLICT(cle) DO UPDATE SET reglages = excluded.reglages, par = excluded.par, "
+                         "ts = datetime('now','localtime')", (cle, json.dumps(actuel, ensure_ascii=False), acteur or ""))
+        else:
+            conn.execute("DELETE FROM autonomie_reglages WHERE cle = ?", (cle,))
     try:
-        conn = _aut_conn()
-        try:
-            row = conn.execute("SELECT reglages FROM autonomie_reglages WHERE cle = ?", (cle,)).fetchone()
-            actuel = json.loads(row["reglages"]) if row else {}
-            actuel.update(propres)
-            actuel = {k: v for k, v in actuel.items() if v != _AUT_DEFAUT.get(k)}
-            if actuel:
-                conn.execute("INSERT INTO autonomie_reglages (cle, reglages, par) VALUES (?,?,?) "
-                             "ON CONFLICT(cle) DO UPDATE SET reglages = excluded.reglages, par = excluded.par, "
-                             "ts = datetime('now','localtime')", (cle, json.dumps(actuel, ensure_ascii=False), acteur or ""))
-            else:
-                conn.execute("DELETE FROM autonomie_reglages WHERE cle = ?", (cle,))
-            conn.commit()
-        finally:
-            conn.close()
+        _aut_ecrire(_ecrire)
     except Exception as e:
         return {"ok": False, "error": "enregistrement impossible : %s" % str(e)[:120]}
     try:
@@ -73852,12 +73877,7 @@ def aut_remettre(cle: str, acteur: str = "") -> dict:
     if str(cle or "") not in _aut_index():
         return {"ok": False, "error": "domaine ou geste inconnu"}
     try:
-        conn = _aut_conn()
-        try:
-            conn.execute("DELETE FROM autonomie_reglages WHERE cle = ?", (cle,))
-            conn.commit()
-        finally:
-            conn.close()
+        _aut_ecrire(lambda conn: conn.execute("DELETE FROM autonomie_reglages WHERE cle = ?", (cle,)))
     except Exception as e:
         return {"ok": False, "error": str(e)[:120]}
     return {"ok": True}
@@ -73903,11 +73923,12 @@ def _aut_fenetre_ok(eff: dict) -> bool:
     return True
 
 
-def _aut_declenche(conn, cle: str, raison: str) -> None:
-    conn.execute("INSERT INTO autonomie_disj (cle, etat, raison, depuis, echecs_suite) VALUES (?, 'declenche', ?, "
-                 "datetime('now','localtime'), 0) ON CONFLICT(cle) DO UPDATE SET etat = 'declenche', raison = excluded.raison, "
-                 "depuis = excluded.depuis", (cle, raison[:240]))
-    conn.commit()
+def _aut_declenche(cle: str, raison: str) -> None:
+    def _ecrire(conn):
+        conn.execute("INSERT INTO autonomie_disj (cle, etat, raison, depuis, echecs_suite) VALUES (?, 'declenche', ?, "
+                     "datetime('now','localtime'), 0) ON CONFLICT(cle) DO UPDATE SET etat = 'declenche', raison = excluded.raison, "
+                     "depuis = excluded.depuis", (cle, raison[:240]))
+    _aut_ecrire(_ecrire)
     try:
         notif("Disjoncteur déclenché : %s" % aut_libelle(cle),
               "%s. Cette règle ne fait plus rien seule ; tu la débloques dans Proactivité › Règles quand la cause est réglée." % raison,
@@ -73921,39 +73942,37 @@ def aut_disj_verifier(cle: str, sujet: str, eff: dict):
     try:
         conn = _aut_conn()
         try:
-            r = conn.execute("SELECT etat, raison FROM autonomie_disj WHERE cle = ?", (cle,)).fetchone()
-            if r and r["etat"] == "declenche":
-                return "disjoncteur déclenché : %s" % (r["raison"] or "?")
+            r = conn.execute("SELECT etat, raison FROM autonomie_disj WHERE cle = ?", (cle,)).fetchall()
+            if r and r[0]["etat"] == "declenche":
+                return "disjoncteur déclenché : %s" % (r[0]["raison"] or "?")
             heures = {"1 h": 1, "6 h": 6, "24 h": 24}.get(eff.get("boucleh"), 1)
             n = conn.execute("SELECT COUNT(*) FROM autonomie_actions WHERE cle = ? AND sujet = ? AND ts > ?",
-                             (cle, sujet or "", time.time() - heures * 3600)).fetchone()[0]
-            if n >= int(eff.get("boucle") or 3):
-                raison = "boucle : %d actions sur « %s » en %s" % (n, (sujet or "?")[:60], eff.get("boucleh"))
-                _aut_declenche(conn, cle, raison)
-                return "disjoncteur déclenché : %s" % raison
+                             (cle, sujet or "", time.time() - heures * 3600)).fetchall()[0][0]
         finally:
             conn.close()
+        if n >= int(eff.get("boucle") or 3):
+            raison = "boucle : %d actions sur « %s » en %s" % (n, (sujet or "?")[:60], eff.get("boucleh"))
+            _aut_declenche(cle, raison)
+            return "disjoncteur déclenché : %s" % raison
     except Exception as e:
         logging.info("[AUTONOMIE] vérification du disjoncteur : %s", e)
     return None
 
 
 def aut_disj_resultat(cle: str, sujet: str, ok: bool, eff: dict) -> None:
+    def _ecrire(conn):
+        conn.execute("INSERT INTO autonomie_actions (ts, cle, sujet, ok) VALUES (?,?,?,?)",
+                     (time.time(), cle, sujet or "", 1 if ok else 0))
+        conn.execute("DELETE FROM autonomie_actions WHERE ts < ?", (time.time() - 3 * 86400,))
+        r = conn.execute("SELECT echecs_suite FROM autonomie_disj WHERE cle = ?", (cle,)).fetchall()
+        suite = 0 if ok else ((r[0]["echecs_suite"] if r else 0) or 0) + 1
+        conn.execute("INSERT INTO autonomie_disj (cle, etat, echecs_suite) VALUES (?, 'arme', ?) "
+                     "ON CONFLICT(cle) DO UPDATE SET echecs_suite = excluded.echecs_suite", (cle, suite))
+        return suite
     try:
-        conn = _aut_conn()
-        try:
-            conn.execute("INSERT INTO autonomie_actions (ts, cle, sujet, ok) VALUES (?,?,?,?)",
-                         (time.time(), cle, sujet or "", 1 if ok else 0))
-            conn.execute("DELETE FROM autonomie_actions WHERE ts < ?", (time.time() - 3 * 86400,))
-            r = conn.execute("SELECT echecs_suite FROM autonomie_disj WHERE cle = ?", (cle,)).fetchone()
-            suite = 0 if ok else ((r["echecs_suite"] if r else 0) or 0) + 1
-            conn.execute("INSERT INTO autonomie_disj (cle, etat, echecs_suite) VALUES (?, 'arme', ?) "
-                         "ON CONFLICT(cle) DO UPDATE SET echecs_suite = excluded.echecs_suite", (cle, suite))
-            conn.commit()
-            if not ok and suite >= int(eff.get("ech") or 2):
-                _aut_declenche(conn, cle, "%d échecs d'affilée (dernier sujet : %s)" % (suite, (sujet or "?")[:60]))
-        finally:
-            conn.close()
+        suite = _aut_ecrire(_ecrire)
+        if not ok and suite >= int(eff.get("ech") or 2):
+            _aut_declenche(cle, "%d échecs d'affilée (dernier sujet : %s)" % (suite, (sujet or "?")[:60]))
     except Exception as e:
         logging.info("[AUTONOMIE] résultat : %s", e)
 
@@ -73961,14 +73980,11 @@ def aut_disj_resultat(cle: str, sujet: str, ok: bool, eff: dict) -> None:
 def aut_debloquer(cle: str, acteur: str = "") -> dict:
     if "g:" + str(cle or "") not in _aut_index():
         return {"ok": False, "error": "geste inconnu"}
+    def _ecrire(conn):
+        conn.execute("UPDATE autonomie_disj SET etat = 'arme', raison = '', echecs_suite = 0 WHERE cle = ?", (cle,))
+        conn.execute("DELETE FROM autonomie_actions WHERE cle = ?", (cle,))
     try:
-        conn = _aut_conn()
-        try:
-            conn.execute("UPDATE autonomie_disj SET etat = 'arme', raison = '', echecs_suite = 0 WHERE cle = ?", (cle,))
-            conn.execute("DELETE FROM autonomie_actions WHERE cle = ?", (cle,))
-            conn.commit()
-        finally:
-            conn.close()
+        _aut_ecrire(_ecrire)
     except Exception as e:
         return {"ok": False, "error": str(e)[:120]}
     try:
@@ -74043,18 +74059,15 @@ def aut_gouverner(champs: dict, acteur: str = "") -> dict:
             if not isinstance(v, list):
                 return {"ok": False, "error": "une liste est attendue"}
             propres[k] = [str(x).strip()[:120] for x in v if str(x).strip()][:200]
+    def _ecrire(conn):
+        row = conn.execute("SELECT reglages FROM autonomie_reglages WHERE cle = 'gov'").fetchall()
+        actuel = json.loads(row[0]["reglages"]) if row else {}
+        actuel.update(propres)
+        conn.execute("INSERT INTO autonomie_reglages (cle, reglages, par) VALUES ('gov', ?, ?) "
+                     "ON CONFLICT(cle) DO UPDATE SET reglages = excluded.reglages, par = excluded.par, "
+                     "ts = datetime('now','localtime')", (json.dumps(actuel, ensure_ascii=False), acteur or ""))
     try:
-        conn = _aut_conn()
-        try:
-            row = conn.execute("SELECT reglages FROM autonomie_reglages WHERE cle = 'gov'").fetchone()
-            actuel = json.loads(row["reglages"]) if row else {}
-            actuel.update(propres)
-            conn.execute("INSERT INTO autonomie_reglages (cle, reglages, par) VALUES ('gov', ?, ?) "
-                         "ON CONFLICT(cle) DO UPDATE SET reglages = excluded.reglages, par = excluded.par, "
-                         "ts = datetime('now','localtime')", (json.dumps(actuel, ensure_ascii=False), acteur or ""))
-            conn.commit()
-        finally:
-            conn.close()
+        _aut_ecrire(_ecrire)
     except Exception as e:
         return {"ok": False, "error": "enregistrement impossible : %s" % str(e)[:120]}
     try:
