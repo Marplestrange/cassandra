@@ -10822,6 +10822,35 @@ def fp_ssl_overview(filtre_domaines=None) -> dict:
             "inconnu": [d.get("domain") for d in inconnus]}
 
 
+def _fp_ssl_renouveler_panneau(dom: str, staging: bool = False) -> dict:
+    """Renouvelle un certificat Let's Encrypt par l'API du panneau (PUT /certificates/{id}/renew/external), puis PROUVE
+    le renouvellement : la date d'émission du certificat doit avoir changé. Sans cette preuve, le geste n'est pas réussi."""
+    if staging:
+        return {"ok": False, "reason": "le mode essai n'existe pas via le panneau"}
+    def _liste():
+        r = fp_api_call("GET", "/api/certificates")
+        d = r.get("data") if r.get("ok") else None
+        d = d.get("data") if isinstance(d, dict) else d
+        return d if isinstance(d, list) else None
+    items = _liste()
+    if items is None:
+        return {"ok": False, "reason": "certbot absent et la liste des certificats du panneau est illisible"}
+    cert = next((x for x in items if str(x.get("common_name") or "").lower() == dom
+                 or dom in str(x.get("alternative_name") or "").lower().replace(",", " ").split()), None)
+    if not cert:
+        return {"ok": False, "reason": "aucun certificat du panneau pour %s" % dom}
+    avant = str(cert.get("issued_at") or "")
+    r = fp_api_call("PUT", "/api/certificates/%s/renew/external" % int(cert["id"]), {}, timeout=90)
+    if not r.get("ok"):
+        return {"ok": False, "reason": "le panneau a refusé le renouvellement : %s" % str(r.get("reason") or r.get("status"))[:160]}
+    for _ in range(12):
+        time.sleep(5)
+        nouv = next((x for x in (_liste() or []) if x.get("id") == cert.get("id")), None) or {}
+        if str(nouv.get("issued_at") or "") != avant:
+            return {"ok": True, "domain": dom, "output": "renouvelé par le panneau, valable jusqu'au %s" % str(nouv.get("expired_at") or "?")[:10]}
+    return {"ok": False, "domain": dom, "reason": "le panneau a accepté la demande mais la date d'émission n'a pas changé après 60 s"}
+
+
 def fp_ssl_issue(domain: str, confirm: bool = False, staging: bool = False) -> dict:
     """Émet ou renouvelle un certificat Let's Encrypt pour un domaine.
 
@@ -10838,7 +10867,8 @@ def fp_ssl_issue(domain: str, confirm: bool = False, staging: bool = False) -> d
                           "qui limite le nombre de tentatives par domaine." % dom}
     import shutil as _sh
     if not _sh.which("certbot"):
-        return {"ok": False, "reason": "certbot n'est pas installé sur ce serveur"}
+        # Pas de certbot : les certificats sont ceux du panneau (Let's Encrypt émis par FastPanel). On lui demande.
+        return _fp_ssl_renouveler_panneau(dom, staging)
     cmd = ("certbot --nginx -d %s -d www.%s --non-interactive --agree-tos "
            "--keep-until-expiring --redirect%s" % (dom, dom, " --staging" if staging else ""))
     try:
