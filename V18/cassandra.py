@@ -73072,9 +73072,44 @@ def _detect_vault() -> list:
                                   "lire/écrire les secrets." % st.get("status"),
                         "suggested_action": "systemctl restart cassandra-vault",
                         "action_kind": "service.restart"})
+        else:
+            out += _detect_secrets_anciens()
     except Exception:
         pass
     return out
+
+
+# Ce qui n'est pas un secret : identifiants publics, pseudos, mots de passe des coffres de comptes (leur rotation est un changement de mot de passe d'utilisateur).
+_SEC_PAS_UN_SECRET = ("/id", "/nom", "/pseudo", "/tel", "/qui", "/api_user", "/api_id")
+
+
+def _detect_secrets_anciens() -> list:
+    """Règle « Rotation des secrets › Signaler un secret trop ancien » : lecture seule, les NOMS seulement, jamais une valeur.
+    Un secret dont la dernière révision dépasse le seuil (180 jours par défaut) est signalé en un seul constat."""
+    seuil = int(_mem_cfg("secret_age_jours", 180) or 180)
+    r = _vault_req("GET", "/list/object/items")
+    items = ((r.get("data") or {}).get("data")) or []
+    maintenant = time.time()
+    vieux = []
+    for it in items:
+        nom = str(it.get("name") or "")
+        if not nom or nom.startswith("cassandra/comptes/") or nom.endswith(_SEC_PAS_UN_SECRET):
+            continue
+        try:
+            rev = datetime.strptime(str(it.get("revisionDate") or "")[:19], "%Y-%m-%dT%H:%M:%S")
+            jours = int((datetime.utcnow() - rev).total_seconds() // 86400)
+        except Exception:
+            continue
+        if jours >= seuil:
+            vieux.append((jours, nom))
+    if not vieux:
+        return []
+    vieux.sort(reverse=True)
+    liste = ", ".join("%s (%d j)" % (n, j) for j, n in vieux[:12])
+    return [{"fkey": "secrets_anciens", "category": "vault", "severity": "info",
+             "title": "%d secret%s sans changement depuis plus de %d jours" % (len(vieux), "s" if len(vieux) > 1 else "", seuil),
+             "detail": "Les plus anciens : %s. À faire tourner quand tu peux ; seuls les noms sont affichés." % liste,
+             "suggested_action": "", "action_kind": "diagnostic"}]
 
 
 # ── Échantillonnage de métriques (alimente la tendance disque + les sparklines) ──
@@ -73701,7 +73736,7 @@ _AUT_CATALOGUE = [
    ('purger-les-sauvegardes-hors-retention', 'Purger les sauvegardes hors rétention', 'dur', 'non', 'suppression irréversible'),
  ]),
  ('rotation-des-secrets', 'Rotation des secrets', 'Clés SSH, jetons, mots de passe de service.', [
-   ('signaler-un-secret-trop-ancien', 'Signaler un secret trop ancien', 'ecrire', 'oui', 'lecture seule'),
+   ('signaler-un-secret-trop-ancien', 'Signaler un secret trop ancien', 'ok', 'oui', 'lecture seule'),
    ('faire-tourner-une-cle-ssh', 'Faire tourner une clé SSH', 'ecrire', 'part', 'ancienne clé valide 24 h'),
    ('regenerer-un-jeton-d-api', "Régénérer un jeton d'API", 'ecrire', 'part', 'service vérifié après coup'),
    ('remplacer-un-mot-de-passe-de-service', 'Remplacer un mot de passe de service', 'ecrire', 'part', 'écrit dans le coffre avant usage'),
