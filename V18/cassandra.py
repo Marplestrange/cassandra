@@ -73877,7 +73877,7 @@ def _detect_surface() -> list:
             for k, v in sorted(actuel.items()) if k not in attendu]
 
 
-_PLAN_NOM = "Cassandra — sauvegarde quotidienne"
+_PLAN_NOM = "Cassandra - sauvegarde quotidienne"
 _PLAN_STOCKAGE = ("cassandra-local", "/var/backups/fastpanel")
 _PLAN_CLE = "hebergement/creer-ou-modifier-un-plan-de-sauvegarde"
 
