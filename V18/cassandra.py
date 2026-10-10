@@ -89361,8 +89361,24 @@ def _sec_geste_prendre_acte(gid: int) -> None:
         conn.close()
 
 
+def _sec_classe_acteur(qui) -> str:
+    """Qui a agi, en quatre classes : humain, cassandra, agent, automate."""
+    q = str(qui or "").strip().lower()
+    if q in ("", "?"):
+        return "inconnu"
+    if q == "cassandra":
+        return "cassandra"
+    if q in ("cron", "systeme", "système", "collecteur", "sensorium", "evolution", "évolution"):
+        return "automate"
+    if q in ("itare", "agent", "marple", "claude", "codex", "gemini", "deepseek", "athena", "orion") or q.startswith(("agent", "itare")):
+        return "agent"
+    return "humain"
+
+
 def securite_journal(limite: int = 120) -> dict:
-    """Le journal fusionné : authentifications SSH, fail2ban, la cage, les actions d'administration."""
+    """Le journal fusionné « qui a fait quoi » : authentifications SSH, fail2ban, la cage, les actions
+    d'administration, les gestes de sécurité, les consultations d'agents, le coffre, l'évolution.
+    Chaque événement porte un acteur et sa classe (humain, cassandra, agent, automate) ; lecture seule."""
     ev = []
     try:
         with open(ADMIN_LOG_FILE, encoding="utf-8", errors="replace") as f:
@@ -89377,7 +89393,8 @@ def securite_journal(limite: int = 120) -> dict:
             res = rr.group(1) if rr else "?"
             ev.append({"ts": m.group(1) + " " + m.group(2), "src": "admin",
                        "niveau": "panne" if res in ("FAIL", "FAILED", "REFUSED") else "",
-                       "texte": "%s · %s · %s" % (a.group(1) if a else "?", res, qui.group(1) if qui else "?")})
+                       "acteur": qui.group(1) if qui else "?", "classe": _sec_classe_acteur(qui.group(1) if qui else ""),
+                       "texte": "%s · %s" % (a.group(1) if a else "?", res)})
     except Exception:
         pass
     try:
@@ -89387,7 +89404,44 @@ def securite_journal(limite: int = 120) -> dict:
                 "ORDER BY id DESC LIMIT 80"):
             veto = str(motif or "").startswith("veto")
             ev.append({"ts": str(ts)[:16], "src": "cage", "niveau": "regarder" if veto else "",
-                       "texte": ("Veto : %s · " % motif if veto else "Catalogue (%s) · " % (act or "?")) + str(cmd or "")[:140]})
+                       "acteur": act or "", "classe": _sec_classe_acteur(act),
+                       "texte": ("Veto : %s · " % motif if veto else "Catalogue · ") + str(cmd or "")[:140]})
+        conn.close()
+    except Exception:
+        pass
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            for r in conn.execute("SELECT * FROM gestes_humains ORDER BY id DESC LIMIT 80"):
+                ev.append({"ts": str(r["ts"] or "")[:16], "src": "geste", "niveau": "" if r["ok"] else "panne",
+                           "acteur": r["qui"] or "?", "classe": _sec_classe_acteur(r["qui"]),
+                           "texte": "%s %s · %s%s" % (_SEC_GESTES_LIB.get(r["geste"], r["geste"]), r["cible"] or "",
+                                                       (r["detail"] or "fait") if r["ok"] else ("échec : " + (r["resultat"] or "")),
+                                                       " · défait ensuite" if r["defait"] else "")})
+        except Exception:
+            pass
+        try:
+            for r in conn.execute("SELECT ts, qui, etiquette FROM journal_agents ORDER BY id DESC LIMIT 60"):
+                ev.append({"ts": str(r["ts"] or "")[:16], "src": "agent", "niveau": "", "acteur": r["qui"] or "?",
+                           "classe": _sec_classe_acteur(r["qui"]) if _sec_classe_acteur(r["qui"]) != "humain" else "agent",
+                           "texte": str(r["etiquette"] or "")[:160]})
+        except Exception:
+            pass
+        try:
+            for r in conn.execute("SELECT ts, username, action, secret_name FROM vault_audit ORDER BY id DESC LIMIT 60"):
+                ev.append({"ts": str(r["ts"] or "")[:16], "src": "coffre", "niveau": "", "acteur": r["username"] or "?",
+                           "classe": _sec_classe_acteur(r["username"]),
+                           "texte": "%s %s" % (r["action"] or "?", r["secret_name"] or "")})
+        except Exception:
+            pass
+        try:
+            for r in conn.execute("SELECT ts, target_file, description, status FROM evolution_log ORDER BY id DESC LIMIT 40"):
+                ev.append({"ts": str(r["ts"] or "")[:16], "src": "evo", "niveau": "" if (r["status"] or "applied") == "applied" else "regarder",
+                           "acteur": "cassandra", "classe": "cassandra",
+                           "texte": "%s · %s · %s" % (r["status"] or "applied", os.path.basename(str(r["target_file"] or "")), str(r["description"] or "")[:120])})
+        except Exception:
+            pass
         conn.close()
     except Exception:
         pass
@@ -106828,13 +106882,17 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
         </section>
 
         <section class="mx-sec" data-page="journal" id="sc-s-journal" hidden>
-          <div class="mx-chart-h"><h2>Journal</h2><span class="mx-meta">authentifications · fail2ban · la cage · administration</span></div>
+          <div class="mx-chart-h"><h2>Journal</h2><span class="mx-meta">qui a fait quoi : humains, Cassandra, agents</span></div>
           <div class="mx-periods" role="group" aria-label="Sources du journal">
             <button class="mx-per on" type="button" data-f="tout" onclick="scFiltre('tout')">tout</button>
             <button class="mx-per" type="button" data-f="auth" onclick="scFiltre('auth')">authentifications</button>
             <button class="mx-per" type="button" data-f="f2b" onclick="scFiltre('f2b')">fail2ban</button>
             <button class="mx-per" type="button" data-f="cage" onclick="scFiltre('cage')">la cage</button>
             <button class="mx-per" type="button" data-f="admin" onclick="scFiltre('admin')">administration</button>
+            <button class="mx-per" type="button" data-f="geste" onclick="scFiltre('geste')">gestes</button>
+            <button class="mx-per" type="button" data-f="agent" onclick="scFiltre('agent')">agents</button>
+            <button class="mx-per" type="button" data-f="coffre" onclick="scFiltre('coffre')">coffre</button>
+            <button class="mx-per" type="button" data-f="evo" onclick="scFiltre('evo')">évolution</button>
           </div>
           <div class="sc-flux" id="sc-flux"><div class="empty-state">Lecture…</div></div>
           <div class="mx-foot"><span>Journaux reste le registre intégral ; ici, la vue filtrée.</span><a onclick="switchTab('journal')">Tout voir dans Journaux →</a></div>
@@ -117182,11 +117240,12 @@ function scFiltre(f){
 }
 function scFlux(){
     if (!SC.flux) return;
-    const lib = {auth: 'SSH', f2b: 'FAIL2BAN', cage: 'CAGE', admin: 'ADMIN'};
+    const lib = {auth: 'SSH', f2b: 'FAIL2BAN', cage: 'CAGE', admin: 'ADMIN', geste: 'GESTE', agent: 'AGENT', coffre: 'COFFRE', evo: 'ÉVOLUTION'};
+    const cl = {humain: 'humain', cassandra: 'Cassandra', agent: 'agent', automate: 'automate', inconnu: '?'};
     const L = SC.flux.filter(function(e){ return SC.filtre === 'tout' || e.src === SC.filtre; });
     // « 2026-10-09 19:05 » → « 09/10 19:05 » (jour/mois ; l'ancien découpage donnait le mois d'abord).
     const quand = function(ts){ const m = /^\d{4}-(\d{2})-(\d{2})[ T](\d{2}:\d{2})/.exec(String(ts || '')); return m ? m[2] + '/' + m[1] + ' ' + m[3] : String(ts || ''); };
-    scHtml('sc-flux', L.length ? L.map(function(e){ return '<div class="sc-ev"><span class="h">' + mxE(quand(e.ts)) + '</span>' + scP(e.niveau || '', lib[e.src] || e.src) + '<span class="t">' + mxE(e.texte) + '</span></div>'; }).join('')
+    scHtml('sc-flux', L.length ? L.map(function(e){ return '<div class="sc-ev"><span class="h">' + mxE(quand(e.ts)) + '</span>' + scP(e.niveau || '', lib[e.src] || e.src) + '<span class="t">' + (e.acteur ? '<b>' + mxE(e.acteur) + '</b> <small>(' + mxE(cl[e.classe] || e.classe || '') + ')</small> · ' : '') + mxE(e.texte) + '</span></div>'; }).join('')
                                : '<div class="empty-state">Rien pour ce filtre.</div>');
 }
 async function scAuditLire(id){
