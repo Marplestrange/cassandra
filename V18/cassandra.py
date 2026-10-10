@@ -106672,7 +106672,7 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
           <button class="mx-item sc-item" type="button" data-page="audit" onclick="scAller('audit')" title="Audit commenté"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v11H9l-5 4z"/><path d="M8 9h8M8 12h5"/></svg></span><span class="nm">Audit commenté</span><span class="mx-st" id="sc-n-audit"></span><span class="mx-dot" id="sc-d-audit"></span></button>
           <button class="mx-item sc-item" type="button" data-page="ailleurs" onclick="scAller('ailleurs')" title="Ce qui vit ailleurs"><span class="sc-ico" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5H5V6h5"/></svg></span><span class="nm">Ce qui vit ailleurs</span><span class="mx-st" id="sc-n-ailleurs"></span><span class="mx-dot" id="sc-d-ailleurs"></span></button>
         </nav>
-        <div class="sc-rail-foot">Chaque geste demande le mot de passe administrateur et laisse une ligne au journal.</div>
+        <div class="sc-rail-foot">Chaque geste s’exécute aussitôt, laisse une ligne au journal, et Cassandra en est informée.</div>
       </aside>
       <main class="mx-main" id="sc-main">
 
