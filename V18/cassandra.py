@@ -9319,7 +9319,36 @@ def _fp_query_impl(args: dict) -> tuple:
             "%s (%d) :\n%s" % (sujet, len(rows), "\n".join(lignes)), "#7c5cfc")
 
 
+def _fp_base_creer_impl(args: dict) -> tuple:
+    nom = str(args.get("arg", "")).strip()
+    r = fp_db_creer(nom, confirm=False, acteur="agent")
+    if r.get("needs_confirm") and not args.get("confirm"):
+        _porte = _aut_outil("hebergement/creer-une-base-de-donnees", nom, "Créer la base « %s »" % nom)
+        if not _porte.get("ok"):
+            return ({"ok": False, "needs_confirm": True}, "Accord requis : %s\nRelance avec confirm=true si l'utilisateur approuve. (la règle ne l'autorise pas seule : %s)"
+                    % (r["reason"], _porte.get("motif", "?")), "#e8c660")
+    else:
+        _porte = None
+    if r.get("needs_confirm"):
+        r = fp_db_creer(nom, confirm=True, acteur="agent")
+    if not r.get("ok"):
+        if _porte:
+            aut_fin(_porte, False, "base « %s »" % nom, str(r.get("reason") or "")[:200])
+        return (r, "Échec : %s" % (r.get("reason") or "?"), "#e0564a")
+    note = ""
+    pw = r.pop("mot_de_passe", "")
+    if pw:
+        v = vault_set("fastpanel/base/%s" % nom, pw)
+        note = (" Mot de passe de l'utilisateur « %s » rangé dans le coffre sous « fastpanel/base/%s »." % (r.get("utilisateur", "?"), nom)) if v.get("ok") \
+            else " ⚠️ Le mot de passe n'a pas pu être rangé dans le coffre : il est perdu, supprime et recrée la base."
+    if _porte:
+        aut_fin(_porte, True, "base « %s » créée" % nom, "")
+    return (r, "Fait : %s%s" % (r.get("output", ""), note), "#27c168")
+
+
 def _fp_act_impl(args: dict) -> tuple:
+    if str(args.get("action", "")).strip() == "base_creer":
+        return _fp_base_creer_impl(args)
     r = fp_action_run(str(args.get("action", "")), str(args.get("arg", "")),
                       str(args.get("arg2", "")), bool(args.get("confirm")),
                       "agent")
@@ -64363,7 +64392,7 @@ CASSANDRA_TOOLS = [
                     "action": {"type": "string",
                                "description": "sites, certificats, limites, sauvegarde, "
                                               "analyse_site, dump_site, panel_backup, "
-                                              "ssl_reemettre, site_creer"},
+                                              "ssl_reemettre, site_creer, base_creer"},
                     "arg": {"type": "string",
                             "description": "Identifiant ou domaine, selon l'action."},
                     "arg2": {"type": "string",
@@ -66040,8 +66069,14 @@ def _fleet_health_impl(args: dict) -> tuple:
 
 
 def _create_cron_impl(args: dict) -> tuple:
+    _porte = _aut_outil("automatismes/creer-ou-modifier-une-tache-planifiee", str(args.get("description") or args.get("command") or "")[:80],
+                        "Créer la tâche planifiée « %s »" % str(args.get("description") or args.get("command") or "")[:60])
+    if not _porte.get("ok"):
+        r = {"success": False, "error": "Retenu par la règle « Automatismes › Créer ou modifier une tâche planifiée » : %s. Propose-la à l'utilisateur." % _porte.get("motif", "?")}
+        return r, json.dumps(r), "#ffa502"
     r = create_cron_from_natural(args.get("description", ""), args.get("command", ""),
                                  args.get("cron_expr", ""), bool(args.get("confirm_risky", False)))
+    aut_fin(_porte, bool(r.get("success")), "tâche planifiée : %s" % str(args.get("description") or args.get("command") or "")[:80], str(r.get("error") or "")[:200])
     return r, json.dumps(r), "#2ed573" if r.get("success") else "#ffa502"
 
 
@@ -66984,7 +67019,11 @@ def _vault_store_impl(args) -> tuple:
     value = args.get("value")
     if not name or value is None or value == "":
         return (False, "nom et valeur du secret requis", "#e0564a")
+    _porte = _aut_outil("coffre/creer-ou-versionner-un-secret", name, "Enregistrer le secret « %s »" % name)
+    if not _porte.get("ok"):
+        return (False, "Retenu par la règle « Coffre › Créer ou versionner un secret » : %s. Propose-le à l'utilisateur." % _porte.get("motif", "?"), "#e8c660")
     r = vault_set(name, str(value))
+    aut_fin(_porte, bool(r.get("ok")), "secret « %s » écrit dans le coffre" % name, str(r.get("error") or "")[:200])
     if r.get("ok"):
         return (True, "🔐 Secret « %s » enregistré dans le coffre (valeur jamais affichée)." % name, "#27c168")
     return (False, "Échec coffre : %s" % r.get("error"), "#e0564a")
@@ -74530,7 +74569,7 @@ _AUT_CATALOGUE = [
    ('relancer-un-site', 'Relancer un site', 'ok', 'oui', 'réponse HTTP vérifiée'),
    ('relancer-une-sauvegarde-en-echec', 'Relancer une sauvegarde en échec', 'ok', 'oui', 'une relance par échec, en arrière-plan'),
    ('renouveler-un-certificat', 'Renouveler un certificat', 'ok', 'oui', 'seuil de 30 jours'),
-   ('creer-une-base-de-donnees', 'Créer une base de données', 'ecrire', 'oui', 'cloisonnement par compte'),
+   ('creer-une-base-de-donnees', 'Créer une base de données', 'ok', 'oui', 'cloisonnement par compte'),
    ('creer-ou-modifier-un-plan-de-sauvegarde', 'Créer ou modifier un plan de sauvegarde', 'ecrire', 'oui', 'cloisonnement par compte'),
    ('ajouter-un-site-ou-un-domaine', 'Ajouter un site ou un domaine', 'ok', 'oui', 'cloisonnement par compte'),
    ('supprimer-une-base-ou-un-site', 'Supprimer une base ou un site', 'dur', 'non', 'confirmation humaine'),
@@ -74558,7 +74597,7 @@ _AUT_CATALOGUE = [
  ]),
  ('coffre', 'Coffre', 'Secrets et clés.', [
    ('se-servir-d-un-secret-pour-une-tache', "Se servir d'un secret pour une tâche", 'ok', 'oui', "jamais affiché, remplacé à l'exécution"),
-   ('creer-ou-versionner-un-secret', 'Créer ou versionner un secret', 'ecrire', 'oui', 'ancienne version gardée'),
+   ('creer-ou-versionner-un-secret', 'Créer ou versionner un secret', 'ok', 'oui', 'ancienne version gardée'),
    ('supprimer-un-secret', 'Supprimer un secret', 'dur', 'non', 'confirmation humaine'),
  ]),
  ('travail-d-itare', "Travail d'Itare", 'Notes, projets, agenda, GED, pièces jointes, navigateur.', [
@@ -74613,7 +74652,7 @@ _AUT_CATALOGUE = [
    ('depasser-un-plafond-de-depense', 'Dépasser un plafond de dépense', 'dur', 'non', 'dépense : accord humain'),
  ]),
  ('automatismes', 'Automatismes', 'Ses propres tâches planifiées.', [
-   ('creer-ou-modifier-une-tache-planifiee', 'Créer ou modifier une tâche planifiée', 'ecrire', 'oui', 'journal « qui a fait quoi »'),
+   ('creer-ou-modifier-une-tache-planifiee', 'Créer ou modifier une tâche planifiée', 'ok', 'oui', 'journal « qui a fait quoi »'),
    ('suspendre-une-tache-qui-boucle', 'Suspendre une tâche qui boucle', 'ecrire', 'oui', 'reprise en un geste'),
    ('corriger-un-cron-silencieux', 'Corriger un cron silencieux', 'ecrire', 'oui', 'ancienne ligne gardée'),
  ]),
@@ -75152,6 +75191,17 @@ def aut_retenue(eff: dict, sujet: str, titre: str = "", cmd: str = "", chemin: s
     if decl == "Sur demande seulement":
         return "déclencheur « sur demande seulement » : elle n'agit pas seule"
     return aut_perimetre_motif(eff, sujet, titre, cmd)
+
+
+def _aut_outil(cle: str, sujet: str, titre: str) -> dict:
+    """La porte d'un OUTIL d'agent. Rend le dict de `aut_porte` ({ok, motif, …}). Un tour qui a lu du contenu venu du dehors
+    n'est JAMAIS autorisé seul : une injection ne doit pas pouvoir faire agir les règles à la place de l'humain."""
+    try:
+        if origine_courante().get("teintes") or []:
+            return {"ok": False, "motif": "ce tour a lu du contenu venu du dehors : il faut l'accord de l'humain", "cle": cle}
+    except Exception:
+        pass
+    return aut_porte(cle, sujet, titre)
 
 
 def _aut_modele_creds(label: str):
