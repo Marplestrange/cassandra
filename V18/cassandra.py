@@ -115053,13 +115053,11 @@ async function pfNuit(){
     if(b) b.innerHTML='<div class="pf-bx">'+
       '<div class="pf-b" style="--c:var(--ok)"><div class="n">'+(d.faites||0)+'</div>'+
       '<div class="l">actions autonomes</div></div>'+
-      '<div class="pf-b" style="--c:var(--txt-muted)"><div class="n">'+
-      Math.max(0,(a.budget_jour||0)-(d.faites||0))+
-      '<span style="font-size:12px;color:var(--txt-ghost)">/'+(a.budget_jour||0)+
-      '</span></div><div class="l">budget restant</div></div></div>'+
+      '<div class="pf-b" style="--c:var(--txt-muted)"><div class="n">\u221e</div>'+
+      '<div class="l">plafond par jour : aucun</div></div></div>'+
       '<p style="margin:11px 0 0;font-size:11.5px;color:var(--txt-soft);line-height:1.6">'+
-      'L\u2019autonomie n\u2019est pas un interrupteur, c\u2019est un <b>budget</b>. '+
-      'Un budget épuisé n\u2019est pas une panne : elle continue de proposer.</p>'+
+      'Pas de plafond par jour : ce sont les <b>disjoncteurs</b> de chaque geste qui l\u2019arrêtent '+
+      '(échecs d\u2019affilée, boucle sur le même sujet), et toi seul les débloques.</p>'+
       '<button class="btn-x" style="margin-top:10px" onclick="pfVue(\'auto\')">'+
       'Régler l\u2019autonomie</button>';
 
@@ -120196,7 +120194,7 @@ function vuCass(d){
     z.innerHTML=`<div class="mx-chart-h"><h2>Cassandra, maintenant</h2><span class="mx-meta">cinq lignes · lues en cache</span></div>
       <dl class="mx-paires">
         <dt>modèle</dt><dd>${vuE(c.modele||'—')}${c.fournisseur?' · '+vuE(c.fournisseur):''}${c.itare?` <small>secondaire : ${vuE(c.itare)}</small>`:''}</dd>
-        <dt>autonomie</dt><dd>${c.palier!==undefined&&c.palier!==null?'palier '+vuE(c.palier)+(c.palier_nom?' « '+vuE(c.palier_nom)+' »':''):'—'} · budget du jour <b>${vuE(c.budget_utilise??0)} / ${vuE(c.budget_jour??'?')}</b>${c.pause?' <small>en pause</small>':''}</dd>
+        <dt>autonomie</dt><dd>${c.palier!==undefined&&c.palier!==null?'palier '+vuE(c.palier)+(c.palier_nom?' « '+vuE(c.palier_nom)+' »':''):'—'} · <b>${vuE(c.budget_utilise??0)}</b> action${(c.budget_utilise||0)>1?'s':''} aujourd’hui, sans plafond${c.pause?' <small>en pause</small>':''}</dd>
         <dt>depuis hier</dt><dd><b>${vuE(c.faites24||0)}</b> action${(c.faites24||0)>1?'s':''} seule${(c.faites24||0)>1?'s':''} · <b>${vuE(c.notifs24||0)}</b> notification${(c.notifs24||0)>1?'s':''} · <b>${vuE(c.avis||0)}</b> demande${(c.avis||0)>1?'s':''} d’avis <small><a style="color:var(--accent);cursor:pointer" onclick="switchTab('proactive')">le fil →</a></small></dd>
         <dt>salon</dt><dd><b>${vuE(c.salon_attente||0)}</b> fil${(c.salon_attente||0)>1?'s':''} en attente d’une réponse ${c.salon_attente?`<small><a style="color:var(--accent);cursor:pointer" onclick="switchTab('salon')">ouvrir →</a></small>`:''}</dd>
         <dt>en vie</dt><dd>${c.collecteur?'collecteur vivant':'<span style="color:var(--danger)">collecteur muet</span>'} · WebSocket ${c.ws_clients?c.ws_clients+' écran'+(c.ws_clients>1?'s':''):'aucun écran'} · <span class="mono">${vuE(c.version||'')}</span>${c.demarre?' · service démarré le '+vuE(c.demarre):''}</dd>
