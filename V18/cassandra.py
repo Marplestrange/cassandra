@@ -73186,7 +73186,7 @@ def secure_execute(cmd: str) -> str:
 #   disque / SSL / sécurité = détection + investigation + action sur clic.
 # ============================================================
 _PROACTIVE_LAST = [0.0]
-_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer")   # seules actions auto-remédiables (réversibles)
+_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer", "disque.purger")   # seules actions auto-remédiables (réversibles)
 
 
 def _detect_disk() -> list:
@@ -73202,14 +73202,37 @@ def _detect_disk() -> list:
         sev = "critical" if disk >= crit else "warning"
         out.append({"fkey": "disk_root", "category": "disk", "severity": sev,
                     "title": "Disque / à %.0f%%" % disk,
-                    "detail": "La partition racine est remplie à %.0f%% (seuil %.0f%%)." % (disk, crit if sev == "critical" else warn),
-                    "suggested_action": "", "action_kind": "diagnostic"})
+                    "detail": "La partition racine est remplie à %.0f%% (seuil %.0f%%). Les vieux journaux et les paquets téléchargés peuvent être purgés." % (disk, crit if sev == "critical" else warn),
+                    "suggested_action": "purger-caches", "action_kind": "disque.purger"})
     if swap >= 80:
         out.append({"fkey": "swap_high", "category": "disk", "severity": "warning",
                     "title": "Swap à %.0f%%" % swap,
                     "detail": "Utilisation swap élevée (%.0f%%) — pression mémoire probable." % swap,
                     "suggested_action": "", "action_kind": "diagnostic"})
     return out
+
+
+_PURGE_ETAPES = (("journaux de plus de 14 jours", ["journalctl", "--vacuum-time=14d"]),
+                 ("paquets téléchargés", ["apt-get", "clean"]))
+
+
+def _aut_purger_caches() -> tuple:
+    """(ok, détail). UNE liste fermée de purges inoffensives (vieux journaux, paquets déjà installés) : rien d'autre, jamais un chemin
+    venu du constat. Dit ce qui a été libéré, mesuré sur le disque."""
+    import shutil
+    avant = shutil.disk_usage("/").used
+    faits, rates = [], []
+    for nom, cmd in _PURGE_ETAPES:
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            (faits if p.returncode == 0 else rates).append(nom)
+        except Exception as e:
+            rates.append("%s (%s)" % (nom, str(e)[:40]))
+    libere = max(0, avant - shutil.disk_usage("/").used) // (1024 * 1024)
+    det = "%d Mo libérés (%s)" % (libere, ", ".join(faits) or "rien de purgé")
+    if rates:
+        return False, det + " · échec : " + ", ".join(rates)
+    return True, det
 
 
 def _detect_pieces() -> list:
@@ -74062,7 +74085,7 @@ _AUT_CATALOGUE = [
  ('machine', 'Machine', 'Services, paquets, correctifs, disque, redémarrages.', [
    ('relancer-un-service', 'Relancer un service', 'ok', 'oui', 'santé vérifiée après coup'),
    ('relancer-le-collecteur', 'Relancer le collecteur', 'ok', 'oui', 'même garde que les services'),
-   ('purger-journaux-et-caches', 'Purger journaux et caches', 'brancher', 'part', 'liste de caches inoffensifs'),
+   ('purger-journaux-et-caches', 'Purger journaux et caches', 'ok', 'part', 'liste de caches inoffensifs'),
    ('appliquer-les-correctifs-de-securite', 'Appliquer les correctifs de sécurité', 'brancher', 'part', 'aucune'),
    ('installer-ou-retirer-un-paquet-precis', 'Installer ou retirer un paquet précis', 'brancher', 'part', 'un paquet nommé'),
    ('redemarrer-la-machine', 'Redémarrer la machine', 'brancher', 'non', 'après mise à jour du noyau, hors heures ouvrées'),
@@ -74184,6 +74207,7 @@ _AUT_CATALOGUE = [
 # Le geste du catalogue que sait déclencher chaque action_kind du moteur proactif. Les autres restent au
 # palier global, sans disjoncteur : l'ancien comportement.
 _AUT_GESTE_DE_KIND = {
+    "disque.purger": "machine/purger-journaux-et-caches",
     "conteneur.relancer": "conteneurs/relancer-un-conteneur",
     "ssh.rotation": "rotation-des-secrets/faire-tourner-une-cle-ssh","service.restart": "machine/relancer-un-service",
                       "securite.bannir": "reseau-et-acces/bannir-ou-debannir-une-adresse-ou-un-pays",
@@ -76423,6 +76447,22 @@ def proactive_act(fid, auto: bool = False, acteur: str = "") -> dict:
         if not _m:
             return {"ok": False, "error": "commande de relance de conteneur illisible"}
         _ok, out = _aut_relancer_conteneur(_m.group(1))
+        try:
+            log_action("proactive", cmd, out, 0, True, False)
+        except Exception:
+            pass
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            conn.execute("UPDATE proactive_findings SET status='acted', acted_at=datetime('now'), action_result=? WHERE id=?",
+                         (("auto • " if auto else "") + str(out)[:1500], int(fid)))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+        return {"ok": bool(_ok), "output": str(out)[:2000], "gate": ""}
+    if kind == "disque.purger":
+        if cmd.strip() != "purger-caches":
+            return {"ok": False, "error": "commande de purge illisible"}
+        _ok, out = _aut_purger_caches()
         try:
             log_action("proactive", cmd, out, 0, True, False)
         except Exception:
