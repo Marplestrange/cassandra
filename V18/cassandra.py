@@ -18942,6 +18942,22 @@ def _perception_monde(q: str, deja: set, limite: int = 12, stricte: bool = False
     return out
 
 
+def _perception_gestes() -> list:
+    """Les gestes humains de sécurité des dernières 24 h : Cassandra les sait à chaque tour (10-10)."""
+    try:
+        conn = sqlite3.connect(MEMORY_DB_PATH, timeout=5)
+        try:
+            rows = conn.execute("SELECT ts, qui, geste, cible, ok, detail, resultat, defait FROM gestes_humains "
+                                "WHERE ts > datetime('now','localtime','-1 day') ORDER BY id DESC LIMIT 10").fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    return ["- geste humain %s · %s · %s %s · %s%s" % (r[0][11:16], r[1] or "?", _SEC_GESTES_LIB.get(r[2], r[2]), r[3] or "",
+                                                       ("fait : " + (r[5] or "")) if r[4] else ("échec : " + (r[6] or "")), " · DÉFAIT ensuite" if r[7] else "")
+            for r in rows]
+
+
 def perception_bloc(question: str = "", limite: int = 12) -> str:
     """Ce que les capteurs disent MAINTENANT, avec l'âge de chaque relevé et sa durée de
     validité. Un état périmé se dit « je ne sais plus, dernier relevé à T ». Filtré sur
@@ -19012,9 +19028,11 @@ def perception_bloc(question: str = "", limite: int = 12) -> str:
         lignes.extend(_perception_monde(q, deja, limite))
     except Exception as e:
         logging.debug("[MEMOIRE] perception du collecteur : %s", e)
-    if not lignes:
+    gestes = _perception_gestes()
+    if not lignes and not gestes:
         return "— perception : aucun relevé disponible ; mesure avant de répondre —"
-    return "— perception (mesurée à l'instant, jamais rappelée) —\n" + "\n".join(lignes[:limite * 2])
+    return "— perception (mesurée à l'instant, jamais rappelée) —\n" + "\n".join(lignes[:limite * 2]) + \
+        (("\n— ce que les humains ont fait (sécurité, 24 h) —\n" + "\n".join(gestes)) if gestes else "")
 
 
 # ── La distillation par déclencheur : comment un fait naît ───────────────────────
@@ -71405,6 +71423,22 @@ _CATALOGUE = {
                    "valeur": {"libre": True, "max": 140}},
         "reseau": False,
     },
+    "securite": {
+        "quoi": ("Les gestes de sécurité, les MÊMES que les boutons de l'onglet Sécurité, sans attendre personne : "
+                 "geste=bannir|debannir (cible = adresse ou plage ; jours facultatif, 30 par défaut) · bannir_pays|debannir_pays (cible = FR, CN…) · "
+                 "liste_blanche|retirer_liste_blanche (cible = adresse) · fermer_chemin|rouvrir_chemin (cible = /chemin, site = un site ou *) · "
+                 "robot_freiner|robot_bloquer|robot_liberer (cible = nom du robot, site) · service_arreter|service_demarrer (cible = unité) · "
+                 "maj_image (cible = nom du conteneur) · scan (cible = lynis|trivy|clamav|crowdsec). Chaque geste vérifie après coup et se "
+                 "défait seul s'il casse un site ; la maison, le tailnet et l'adresse publique ne sont jamais bannis ; un chemin qui sert "
+                 "aux visiteurs humains ne se ferme pas."),
+        "fonction": "_catalogue_securite",
+        "params": {"geste": {k: [k] for k in ("bannir", "debannir", "bannir_pays", "debannir_pays", "liste_blanche", "retirer_liste_blanche",
+                                              "fermer_chemin", "rouvrir_chemin", "robot_freiner", "robot_bloquer", "robot_liberer",
+                                              "service_arreter", "service_demarrer", "maj_image", "scan")},
+                   "cible": {"libre": True, "max": 200}, "site": {"libre": True, "max": 120}, "jours": {"entier": True, "min": 1, "max": 365}},
+        "facultatifs": ("site", "jours"),
+        "reseau": True,
+    },
     "ssh_sessions": {
         "quoi": ("Les connexions à Orion : op=liste (sessions logind, unités de session, connexions SSH établies) ; "
                  "op=nettoyer efface les sessions finies EN ÉCHEC (« Service en échec : session-cNNN.scope »)."),
@@ -87754,7 +87788,8 @@ def _sec_ecoutes() -> list:
             port = int(port)
         except ValueError:
             continue
-        out.append({"proto": c[0], "adresse": adr, "port": port, "processus": m.group(1) if m else "?"})
+        pid = re.search(r"pid=(\d+)", ligne)
+        out.append({"proto": c[0], "adresse": adr, "port": port, "processus": m.group(1) if m else "?", "pid": int(pid.group(1)) if pid else 0})
     return out
 
 
@@ -88122,6 +88157,16 @@ def _sec_parefeu() -> dict:
 
 
 
+def _sec_unite_du_pid(pid) -> str:
+    """L'unité systemd qui porte un processus, lue dans son cgroup (« …/system.slice/grafana-server.service »)."""
+    try:
+        t = open("/proc/%d/cgroup" % int(pid), encoding="utf-8").read()
+    except Exception:
+        return ""
+    m = re.findall(r"/([A-Za-z0-9@._-]+\.service)", t)
+    return m[-1] if m else ""
+
+
 def _sec_exposition(ecoutes: list, machine: dict, fw: dict) -> list:
     """Un service par ligne, sur quatre anneaux : machine, tailscale, reseau, internet (oui/non/box/filtre)."""
     port_cassandra = str(os.environ.get("CASSANDRA_PORT") or 9000)
@@ -88135,7 +88180,7 @@ def _sec_exposition(ecoutes: list, machine: dict, fw: dict) -> list:
         else:
             nom = _SEC_SENSIBLES.get(p) or _SEC_NOMS.get(p) or p
         s = par.setdefault(nom, {"nom": nom, "processus": p, "ports": set(), "portees": set(),
-                                 "sensible": p in _SEC_SENSIBLES})
+                                 "sensible": p in _SEC_SENSIBLES, "unite": _sec_unite_du_pid(e.get("pid"))})
         s["ports"].add("%s/%s" % (e["port"], e["proto"]))
         s["portees"].add(_sec_portee(e["adresse"]))
     derriere_box = not machine.get("public_v4")
@@ -88178,7 +88223,7 @@ def _sec_exposition(ecoutes: list, machine: dict, fw: dict) -> list:
         out.append({"nom": s["nom"], "processus": s["processus"],
                     "ports": sorted(s["ports"], key=lambda x: int(x.split("/")[0])),
                     "machine": True, "tailscale": bool(pt & {"tout", "tailscale"}), "reseau": reseau, "parc": parc,
-                    "internet": internet, "sensible": s["sensible"], "geste": geste})
+                    "internet": internet, "sensible": s["sensible"], "geste": geste, "unite": s.get("unite") or ""})
     out.sort(key=lambda x: (not (x["sensible"] and x["reseau"]), not x["reseau"], x["nom"].lower()))
     return out
 
@@ -88782,6 +88827,13 @@ def securite_images(compte: str = "") -> dict:
     tot_ip = sum(r["n"] for r in ips) or 1
     sites = q("SELECT site, SUM(requetes) n, SUM(robots) b FROM secu_jour WHERE jour >= date('now','localtime','-9 days') "
               "GROUP BY site HAVING n >= 100 ORDER BY n DESC LIMIT 8")
+    robots_noms = {}
+    for r in q("SELECT site, robot, SUM(n) n FROM secu_robot WHERE jour >= date('now','localtime','-9 days') GROUP BY site, robot ORDER BY n DESC"):
+        robots_noms.setdefault(r["site"], [])
+        if len(robots_noms[r["site"]]) < 3:
+            robots_noms[r["site"]].append({"robot": r["robot"], "n": r["n"]})
+    attaquants = q("SELECT ip, SUM(n) n, COUNT(DISTINCT jour) jours, MIN(jour) premier, MAX(jour) dernier FROM secu_ip "
+                   "WHERE jour >= date('now','localtime','-9 days') GROUP BY ip ORDER BY n DESC LIMIT 8")
 
     # Certificats : le dernier relevé de chaque site encore suivi
     certs = []
@@ -88808,6 +88860,12 @@ def securite_images(compte: str = "") -> dict:
     O = d.get("outils") or {}
     R = lambda k: (O.get(k) or {}).get("resultat") or {}
     cs, tv, ly, cl = R("crowdsec"), R("trivy"), R("lynis"), R("clamav")
+    bannies = {str(b.get("ip") or "").split(":", 1)[-1] if str(b.get("ip") or "").startswith("Ip:") else str(b.get("ip") or "") for b in (cs.get("bannies") or [])}
+    conteneurs = {}
+    _okd, _ps = _sec_sortie(["docker", "ps", "--format", "{{.Image}}|{{.Names}}"], timeout=10)
+    for _l in (_ps.splitlines() if _okd else []):
+        _im, _, _nm = _l.partition("|")
+        conteneurs.setdefault(_im, _nm)
     f2b = d.get("fail2ban") or {}
     maj = d.get("maj") or {}
     box = []
@@ -88837,11 +88895,16 @@ def securite_images(compte: str = "") -> dict:
         "jours": [{"jour": r["jour"], "sondes": r["s"] or 0, "refus": r["r"] or 0, "requetes": r["n"] or 0, "robots": r["b"] or 0} for r in jours],
         "chaleur": {"jours": jours7, "grille": [[grille.get((j, h), 0) for h in range(24)] for j in jours7]},
         "chemins": [{"chemin": r["chemin"], "n": r["n"]} for r in chemins],
-        "robots": [{"site": r["site"], "n": r["n"], "part": round(100 * (r["b"] or 0) / r["n"]) if r["n"] else 0} for r in sites],
+        "robots": [{"site": r["site"], "n": r["n"], "part": round(100 * (r["b"] or 0) / r["n"]) if r["n"] else 0,
+                    "noms": robots_noms.get(r["site"], []), "gere": bool(_sec_includes_site(r["site"]))} for r in sites],
+        "attaquants": [{"ip": a["ip"], "n": a["n"], "jours": a["jours"], "premier": a["premier"], "dernier": a["dernier"],
+                        "banni": a["ip"] in bannies, "confiance": _sec_de_confiance(a["ip"])} for a in attaquants],
+        "gestes": securite_gestes(15), "sites_geres": _sec_sites_geres(),
         "anneaux": anneaux, "certs": certs, "courriel": courriel, "box": box,
         "pays": [{"pays": _SEC_PAYS.get(p["pays"], p["pays"]), "n": p["n"]} for p in (cs.get("pays_7j") or [])],
         "scenarios": cs.get("scenarios_24h") or [],
-        "trivy": [{"image": i.get("image"), "critiques": i.get("critiques", 0), "hautes": i.get("hautes", 0)} for i in (tv.get("images") or []) if not i.get("erreur")],
+        "trivy": [{"image": i.get("image"), "critiques": i.get("critiques", 0), "hautes": i.get("hautes", 0), "conteneur": conteneurs.get(i.get("image"), "")}
+                  for i in (tv.get("images") or []) if not i.get("erreur")],
         "trivy_accepte": (O.get("trivy") or {}).get("niveau") == "accepte",
         "gardiens": {"lynis": {"score": ly.get("score"), "avertissements": len(ly.get("avertissements") or []), "conseils": ly.get("suggestions_n", 0), "installe": (O.get("lynis") or {}).get("installe")},
                      "clamav": {"menaces": len(cl.get("infectes") or []), "duree": cl.get("duree_min"), "installe": (O.get("clamav") or {}).get("installe")},
@@ -88851,6 +88914,451 @@ def securite_images(compte: str = "") -> dict:
                                   "bannies": sum(j.get("bannies", 0) for j in (f2b.get("jails") or [])), "actif": bool(f2b.get("actif"))}}}
     _SEC_IMG_CACHE.update({"t": time.time(), "d": out})
     return out
+
+
+# ── LES GESTES DIRECTS (10-10) ───────────────────────────────────────────────────────────────────────────
+# Décision de Drisse : un geste clair s'exécute TOUT DE SUITE, sans conversation ni mot de passe (session
+# administrateur), et Cassandra en est informée — journal des gestes, perception à chaque tour, note de prise
+# d'acte rédigée par son second. La sûreté est dans le geste : vérification après, retour arrière s'il casse,
+# et « Défaire » tant que l'inverse est connu. Principe : Cassandra n'attend personne ; l'humain agit en
+# parallèle, et elle sait tout ce qu'il fait.
+_SEC_CHEMIN_RE = re.compile(r"^/[A-Za-z0-9._@~-]{1,60}$")
+_SEC_ROBOT_RE = re.compile(r"^[A-Za-z0-9._-]{2,40}$")
+_SEC_SERVICES_INTOUCHABLES = ("ssh", "sshd", "nginx", "cassandra", "cassandra-collector", "tailscaled", "docker", "containerd",
+                              "networking", "NetworkManager", "systemd-", "dbus", "fail2ban", "crowdsec", "crowdsec-firewall-bouncer",
+                              "cassandra-dns-local", "cron", "rsyslog", "getty", "user@")
+_SEC_ROBOTS_CONF = "/etc/nginx/conf.d/cassandra-robots.conf"
+
+
+def _sec_gestes_conn():
+    conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE IF NOT EXISTS gestes_humains (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT DEFAULT (datetime('now','localtime')), "
+                 "qui TEXT, geste TEXT, cible TEXT, detail TEXT, ok INTEGER, resultat TEXT, defaire TEXT, defait INTEGER DEFAULT 0, "
+                 "note TEXT, note_ts TEXT)")
+    return conn
+
+
+def _sec_geste_noter(qui: str, geste: str, cible: str, r: dict, defaire=None) -> int:
+    conn = _sec_gestes_conn()
+    try:
+        cur = conn.execute("INSERT INTO gestes_humains (qui, geste, cible, detail, ok, resultat, defaire) VALUES (?,?,?,?,?,?,?)",
+                           (qui, geste, cible, str(r.get("detail") or "")[:400], 1 if r.get("ok") else 0,
+                            str(r.get("error") or r.get("resultat") or "")[:400], json.dumps(defaire, ensure_ascii=False) if defaire else ""))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def securite_gestes(limite: int = 30) -> list:
+    conn = _sec_gestes_conn()
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM gestes_humains ORDER BY id DESC LIMIT ?", (int(limite),))]
+    finally:
+        conn.close()
+
+
+def _sec_confiance() -> list:
+    """Ce qu'aucun geste ne bannit : la maison (réseaux locaux, préfixe IPv6), Tailscale, l'adresse publique
+    de la box, et les adresses de confiance des réglages (securite-outils.conf, CONFIANCE=)."""
+    nets = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "100.64.0.0/10", "::1/128", "fc00::/7", "fe80::/10", "fd7a:115c:a1e0::/48"]
+    try:
+        m = _sec_adresses_machine()
+        nets += list(m.get("reseaux_locaux") or [])
+        for a in m.get("public_v6") or []:
+            nets.append(str(_sec_ip.ip_network(a + "/64", strict=False)))
+    except Exception:
+        pass
+    try:
+        v = (query_db("SELECT valeur FROM mesures_diverses WHERE cle = 'box.connexion'") or [{}])[0].get("valeur") or ""
+        nets += re.findall(r"IPv4 ([0-9.]+)", v)
+    except Exception:
+        pass
+    try:
+        for l in open(os.path.join(CASSANDRA_CONF_DIR, "securite-outils.conf"), encoding="utf-8"):
+            if l.strip().startswith("CONFIANCE="):
+                nets += l.split("=", 1)[1].strip().strip('"').replace(",", " ").split()
+    except OSError:
+        pass
+    return nets
+
+
+def _sec_de_confiance(cible: str) -> bool:
+    try:
+        c = _sec_ip.ip_network(cible, strict=False)
+    except ValueError:
+        return True
+    for n in _sec_confiance():
+        try:
+            m = _sec_ip.ip_network(n, strict=False)
+        except ValueError:
+            continue
+        if m.version == c.version and (c.subnet_of(m) or m.subnet_of(c)):
+            return True
+    return False
+
+
+def _sec_includes_site(site: str) -> str:
+    """Le fichier d'ajouts nginx d'un site (celui d'un panneau : FastPanel), ou « »."""
+    import glob as _glob
+    if not re.match(r"^[a-z0-9.-]{3,120}$", site or ""):
+        return ""
+    f = _glob.glob("/etc/nginx/fastpanel2-sites/*/%s.includes" % site)
+    return f[0] if f else ""
+
+
+def _sec_sites_geres() -> list:
+    import glob as _glob
+    return sorted(os.path.basename(f)[:-len(".includes")] for f in _glob.glob("/etc/nginx/fastpanel2-sites/*/*.includes"))
+
+
+def _sec_nginx_ok() -> tuple:
+    r = subprocess.run(["nginx", "-t"], capture_output=True, text=True, timeout=30)
+    texte = (r.stdout or "") + (r.stderr or "")
+    return ("successful" in texte), texte.strip()[-300:]
+
+
+def _sec_site_repond(site: str) -> int:
+    """Le code de l'accueil d'un site, demandé à nginx sur la machine même (adresse locale)."""
+    ips = (_sec_adresses_machine().get("ips_locales") or []) + ["127.0.0.1"]
+    for ip in ips:
+        r = subprocess.run(["curl", "-ks", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "8", "--resolve", "%s:443:%s" % (site, ip),
+                            "https://%s/" % site], capture_output=True, text=True, timeout=12)
+        code = (r.stdout or "").strip()
+        if code.isdigit() and code != "000":
+            return int(code)
+    return 0
+
+
+def _sec_chemin_sert(site: str, chemin: str) -> int:
+    """Combien de visites HUMAINES ce chemin a servies (2xx/3xx) dans le journal courant du site : un chemin
+    utile au site ne se ferme pas — /api fait vivre Cassandra, même si des robots le sondent aussi."""
+    import glob as _glob
+    f = _glob.glob("/var/www/*/data/logs/%s-frontend.access.log" % site)
+    if not f:
+        return 0
+    n = 0
+    motif = re.compile(r'"(?:GET|POST|HEAD|PUT|DELETE|PATCH) %s(?:[/?.\s])[^"]*" ([23]\d\d) .*"([^"]*)"\s*$' % re.escape(chemin))
+    try:
+        taille = os.path.getsize(f[0])
+        with open(f[0], "rb") as h:
+            h.seek(max(0, taille - 20 * 1048576))
+            for l in h.read().decode("utf-8", "replace").splitlines():
+                m = motif.search(l)
+                if m and not re.search(r"bot|crawl|spider|curl|python|wget|scan|agent", m.group(2), re.I):
+                    n += 1
+    except Exception:
+        return 0
+    return n
+
+
+def _sec_bloc_poser(fichier: str, marque: str, contenu: str) -> str:
+    """Pose (ou remplace) un bloc marqué dans un fichier d'ajouts ; rend le texte d'avant (pour revenir)."""
+    try:
+        avant = open(fichier, encoding="utf-8").read()
+    except OSError:
+        avant = ""
+    deb, fin = "# cassandra:debut %s" % marque, "# cassandra:fin %s" % marque
+    texte = re.sub(r"\n?%s\n.*?\n%s\n?" % (re.escape(deb), re.escape(fin)), "\n", avant, flags=re.S) if deb in avant else avant
+    if contenu:
+        texte = texte.rstrip("\n") + "\n%s\n%s\n%s\n" % (deb, contenu, fin)
+    with open(fichier, "w", encoding="utf-8") as h:
+        h.write(texte)
+    return avant
+
+
+def _sec_nginx_appliquer(modifs: list, sites: list) -> dict:
+    """modifs = [(fichier, marque, contenu)] ; contrôle nginx -t puis l'accueil de chaque site, retour arrière sinon."""
+    avants = []
+    codes_avant = {s_: _sec_site_repond(s_) for s_ in sites}
+    for f, m, c in modifs:
+        avants.append((f, _sec_bloc_poser(f, m, c)))
+    ok, txt = _sec_nginx_ok()
+    casse = []
+    if ok:
+        _sec_sortie(["systemctl", "reload", "nginx"], timeout=30)
+        time.sleep(1)
+        for s_ in sites:
+            c = _sec_site_repond(s_)
+            if codes_avant.get(s_) and 200 <= codes_avant[s_] < 400 and not (200 <= c < 400):
+                casse.append("%s (%s → %s)" % (s_, codes_avant[s_], c))
+    if not ok or casse:
+        for f, a in avants:
+            with open(f, "w", encoding="utf-8") as h:
+                h.write(a)
+        _sec_sortie(["systemctl", "reload", "nginx"], timeout=30)
+        return {"ok": False, "error": ("nginx refuse le réglage : " + txt) if not ok else ("un site ne répondait plus (%s) : réglage retiré" % ", ".join(casse))}
+    return {"ok": True}
+
+
+def _sec_cscli(args: list) -> tuple:
+    return _sec_sortie(["cscli"] + args, timeout=60)
+
+
+def _sec_geste_executer(g: str, d: dict, qui: str) -> tuple:
+    """(résultat, inverse) d'un geste direct. Chaque branche vérifie après coup."""
+    import shutil
+    if g in ("bannir", "debannir"):
+        cible = str(d.get("ip") or "").strip()
+        try:
+            net = _sec_ip.ip_network(cible, strict=False)
+        except ValueError:
+            return {"ok": False, "error": "adresse ou plage illisible"}, None
+        plage = "/" in cible and net.num_addresses > 1
+        opt = ["--range", str(net)] if plage else ["--ip", str(net.network_address)]
+        if g == "bannir":
+            if _sec_de_confiance(str(net)):
+                return {"ok": False, "error": "%s est de confiance (la maison, le tailnet, l'adresse publique, ou les réglages) : jamais bannie" % cible}, None
+            if not shutil.which("cscli"):
+                return {"ok": False, "error": "CrowdSec n'est pas installé (Sécurité › Outils)"}, None
+            jours = max(1, min(365, int(d.get("jours") or 30)))
+            ok, o = _sec_cscli(["decisions", "add"] + opt + ["--duration", "%dh" % (24 * jours), "--reason", "geste de %s (Sécurité)" % (qui or "?")])
+            ok2, l = _sec_cscli(["decisions", "list"] + opt + ["-o", "json"])
+            if not ok or str(net.network_address) not in l:
+                return {"ok": False, "error": "CrowdSec n'a pas pris la décision : " + o.strip()[-200:]}, None
+            return {"ok": True, "detail": "CrowdSec · %d jours · appliqué par le pare-feu" % jours}, {"geste": "debannir", "ip": cible}
+        ok, o = _sec_cscli(["decisions", "delete"] + opt)
+        return ({"ok": True, "detail": "décision CrowdSec retirée"} if ok else {"ok": False, "error": o.strip()[-200:]}), {"geste": "bannir", "ip": cible}
+    if g in ("bannir_pays", "debannir_pays"):
+        cc = str(d.get("pays") or "").upper()
+        if not re.match(r"^[A-Z]{2}$", cc):
+            return {"ok": False, "error": "code pays sur deux lettres (FR, CN…)"}, None
+        if g == "bannir_pays":
+            ok, o = _sec_cscli(["decisions", "add", "--scope", "Country", "--value", cc, "--duration", "720h", "--reason", "geste de %s (Sécurité)" % (qui or "?")])
+            return ({"ok": True, "detail": "CrowdSec · pays %s · 30 jours" % cc} if ok else {"ok": False, "error": o.strip()[-200:]}), {"geste": "debannir_pays", "pays": cc}
+        ok, o = _sec_cscli(["decisions", "delete", "--scope", "Country", "--value", cc])
+        return ({"ok": True, "detail": "pays %s débanni" % cc} if ok else {"ok": False, "error": o.strip()[-200:]}), {"geste": "bannir_pays", "pays": cc}
+    if g in ("liste_blanche", "retirer_liste_blanche"):
+        cible = str(d.get("ip") or "").strip()
+        try:
+            _sec_ip.ip_network(cible, strict=False)
+        except ValueError:
+            return {"ok": False, "error": "adresse ou plage illisible"}, None
+        f = os.path.join(CASSANDRA_CONF_DIR, "securite-outils.conf")
+        try:
+            lignes = open(f, encoding="utf-8").read().splitlines()
+        except OSError:
+            lignes = []
+        conf = next((l.split("=", 1)[1].strip().strip('"').replace(",", " ").split() for l in lignes if l.startswith("CONFIANCE=")), [])
+        conf = [x for x in conf if x != cible] + ([cible] if g == "liste_blanche" else [])
+        lignes = [l for l in lignes if not l.startswith("CONFIANCE=")] + (["CONFIANCE=" + " ".join(conf)] if conf else [])
+        os.makedirs(CASSANDRA_CONF_DIR, exist_ok=True)
+        with open(f, "w", encoding="utf-8") as h:
+            h.write("\n".join(lignes) + "\n")
+        if g == "liste_blanche" and shutil.which("cscli"):
+            _sec_cscli(["decisions", "delete", "--ip" if "/" not in cible else "--range", cible])
+        if os.path.exists(_secu_outils_chemin()) and shutil.which("cscli"):
+            _sec_sortie(["python3", _secu_outils_chemin(), "lancer", "crowdsec"], timeout=300)   # réécrit la liste blanche de CrowdSec
+        return {"ok": True, "detail": "adresses de confiance : %s" % (" ".join(conf) or "aucune en plus")}, \
+            {"geste": "retirer_liste_blanche" if g == "liste_blanche" else "liste_blanche", "ip": cible}
+    if g in ("fermer_chemin", "rouvrir_chemin"):
+        chemin = str(d.get("chemin") or "")
+        if not _SEC_CHEMIN_RE.match(chemin) or chemin == "/":
+            return {"ok": False, "error": "chemin refusé (un segment, comme /.env ou /xmlrpc.php)"}, None
+        sites = _sec_sites_geres() if d.get("site") in ("*", "", None) else [str(d.get("site"))]
+        cibles, refus = [], []
+        for s_ in sites:
+            f = _sec_includes_site(s_)
+            if not f:
+                refus.append("%s (pas de fichier d'ajouts)" % s_); continue
+            if g == "fermer_chemin":
+                n = _sec_chemin_sert(s_, chemin)
+                if n:
+                    refus.append("%s (%d visites humaines servies : le chemin sert au site)" % (s_, n)); continue
+            cibles.append((s_, f))
+        if not cibles:
+            return {"ok": False, "error": "aucun site à toucher : " + "; ".join(refus)}, None
+        marque = "fermeture " + chemin
+        contenu = ("# geste de %s, %s\nlocation ^~ %s {\n    deny all;\n}" % (qui or "?", time.strftime("%Y-%m-%d %H:%M"), chemin)) if g == "fermer_chemin" else ""
+        r = _sec_nginx_appliquer([(f, marque, contenu) for _s, f in cibles], [s_ for s_, _f in cibles])
+        if not r["ok"]:
+            return r, None
+        r["detail"] = "%s %s sur %s%s" % ("fermé" if g == "fermer_chemin" else "rouvert", chemin, ", ".join(s_ for s_, _f in cibles),
+                                          (" · laissé ouvert : " + "; ".join(refus)) if refus else "")
+        return r, {"geste": "rouvrir_chemin" if g == "fermer_chemin" else "fermer_chemin", "chemin": chemin, "site": d.get("site") or "*"}
+    if g in ("robot_bloquer", "robot_freiner", "robot_liberer"):
+        robot, site = str(d.get("robot") or ""), str(d.get("site") or "")
+        f = _sec_includes_site(site)
+        if not _SEC_ROBOT_RE.match(robot) or not f:
+            return {"ok": False, "error": "robot ou site illisible (ou site sans fichier d'ajouts)"}, None
+        avant = d.get("_mode_avant") or ""
+        modifs = []
+        if g == "robot_bloquer":
+            contenu = 'if ($http_user_agent ~* "%s") {\n    return 403;\n}' % robot
+        elif g == "robot_freiner":
+            # Une zone par machine (http), une clé vide pour tout autre visiteur : seul ce robot est limité.
+            try:
+                zone = open(_SEC_ROBOTS_CONF, encoding="utf-8").read()
+            except OSError:
+                zone = ""
+            noms = sorted(set(re.findall(r'~\*([A-Za-z0-9._-]+) \$binary_remote_addr;', zone)) | {robot.lower()})
+            zone = ("# Écrit par Cassandra (Sécurité › robots freinés) — 30 requêtes par minute par adresse.\n"
+                    "map $http_user_agent $cassandra_robot_freine {\n    default \"\";\n%s}\n"
+                    "limit_req_zone $cassandra_robot_freine zone=cassandra_robots:10m rate=30r/m;\n") % "".join("    ~*%s $binary_remote_addr;\n" % n for n in noms)
+            with open(_SEC_ROBOTS_CONF, "w", encoding="utf-8") as h:
+                h.write(zone)
+            contenu = "limit_req zone=cassandra_robots burst=10 nodelay;\nlimit_req_status 429;"
+        else:
+            contenu = ""
+        r = _sec_nginx_appliquer([(f, "robot " + robot, contenu)], [site])
+        if not r["ok"]:
+            return r, None
+        r["detail"] = {"robot_bloquer": "%s bloqué sur %s (403)", "robot_freiner": "%s freiné sur %s (30 requêtes/min par adresse)",
+                       "robot_liberer": "%s libéré sur %s"}[g] % (robot, site)
+        return r, {"geste": "robot_liberer", "robot": robot, "site": site} if g != "robot_liberer" else None
+    if g in ("service_arreter", "service_demarrer"):
+        u = str(d.get("unite") or "")
+        if not re.match(r"^[A-Za-z0-9@._-]{2,80}$", u) or u.replace(".service", "").startswith(_SEC_SERVICES_INTOUCHABLES):
+            return {"ok": False, "error": "service hors d'atteinte d'un geste direct : %s" % u}, None
+        args = ["systemctl", "disable", "--now", u] if g == "service_arreter" else ["systemctl", "enable", "--now", u]
+        _sec_sortie(args, timeout=60)
+        ok, etat = _sec_sortie(["systemctl", "is-active", u], timeout=10)
+        actif = etat.strip() == "active"
+        if (g == "service_arreter") == actif:
+            return {"ok": False, "error": "%s est toujours %s" % (u, etat.strip())}, None
+        return {"ok": True, "detail": "%s %s" % (u, "arrêté et désactivé" if g == "service_arreter" else "redémarré et activé")}, \
+            {"geste": "service_demarrer" if g == "service_arreter" else "service_arreter", "unite": u}
+    if g == "maj_image":
+        nom = str(d.get("conteneur") or "")
+        if not re.match(r"^[A-Za-z0-9_.-]{1,80}$", nom):
+            return {"ok": False, "error": "conteneur illisible"}, None
+        ok, j = _sec_sortie(["docker", "inspect", nom], timeout=20)
+        try:
+            info = json.loads(j)[0]
+        except Exception:
+            return {"ok": False, "error": "conteneur introuvable : %s" % nom}, None
+        lab = (info.get("Config") or {}).get("Labels") or {}
+        dossier, service, image, ancien = lab.get("com.docker.compose.project.working_dir"), lab.get("com.docker.compose.service"), \
+            (info.get("Config") or {}).get("Image"), info.get("Image")
+        if not dossier or not service:
+            return {"ok": False, "error": "%s n'est pas géré par docker compose : mise à jour à la main" % nom}, None
+        # En arrière-plan : tirer, relancer, attendre la santé ; sinon remettre l'ancienne image.
+        import shlex
+        script = ("cd %s\ndocker compose pull -q %s\nNEUF=$(docker image inspect -f '{{.Id}}' %s)\n"
+                  "if [ \"$NEUF\" = %s ]; then echo 'RESULTAT déjà la dernière version'; exit 0; fi\n"
+                  "docker compose up -d %s\nfor i in $(seq 1 30); do S=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' %s); "
+                  "[ \"$S\" = healthy ] || [ \"$S\" = running ] && break; sleep 4; done\n"
+                  "if [ \"$S\" != healthy ] && [ \"$S\" != running ]; then docker tag %s %s; docker compose up -d %s; echo \"RESULTAT retour à l'ancienne image ($S)\"; exit 1; fi\n"
+                  "echo \"RESULTAT mis à jour ($S)\"\n") % (shlex.quote(dossier), shlex.quote(service), shlex.quote(image), shlex.quote(ancien),
+                                                        shlex.quote(service), shlex.quote(nom), shlex.quote(ancien), shlex.quote(image), shlex.quote(service))
+        r = _sys_detache("secu-maj-" + re.sub(r"[^a-z0-9]", "", nom.lower())[:20], script)
+        if not r.get("ok"):
+            return {"ok": False, "error": "lancement impossible"}, None
+        return {"ok": True, "detail": "mise à jour lancée en arrière-plan (%s) : pull, relance, santé, retour à l'ancienne image si besoin" % r.get("unite"),
+                "unite": r.get("unite")}, None
+    if g == "scan":
+        o = str(d.get("outil") or "")
+        if o not in _SECU_OUTILS or not os.path.exists(_secu_outils_chemin()):
+            return {"ok": False, "error": "outil inconnu ou absent"}, None
+        r = _sys_detache("secu-lancer-" + o, "export CASSANDRA_DATA_DIR=%s CASSANDRA_CONF_DIR=%s\n/usr/bin/python3 %s lancer %s\n" % (
+            CASSANDRA_DATA_DIR, CASSANDRA_CONF_DIR, _secu_outils_chemin(), o))
+        return ({"ok": True, "detail": "%s lancé en arrière-plan" % _SECU_OUTILS[o]["nom"]} if r.get("ok") else {"ok": False, "error": "lancement impossible"}), None
+    return {"ok": False, "error": "geste inconnu"}, None
+
+
+_SEC_GESTES_LIB = {"bannir": "Bannir", "debannir": "Débannir", "bannir_pays": "Bannir le pays", "debannir_pays": "Débannir le pays",
+                   "liste_blanche": "Mettre en liste blanche", "retirer_liste_blanche": "Retirer de la liste blanche",
+                   "fermer_chemin": "Fermer le chemin", "rouvrir_chemin": "Rouvrir le chemin", "robot_bloquer": "Bloquer le robot",
+                   "robot_freiner": "Freiner le robot", "robot_liberer": "Libérer le robot", "service_arreter": "Arrêter le service",
+                   "service_demarrer": "Redémarrer le service", "maj_image": "Mettre à jour l'image", "scan": "Lancer un scan"}
+
+
+def securite_direct(data: dict, sid: str, qui: str) -> dict:
+    import threading
+    g = str(data.get("geste") or "")
+    if g not in _SEC_GESTES_LIB:
+        return {"ok": False, "error": "geste inconnu"}
+    cible = str(data.get("ip") or data.get("pays") or data.get("chemin") or data.get("robot") or data.get("unite") or data.get("conteneur") or data.get("outil") or "")
+    if data.get("site") and g in ("fermer_chemin", "rouvrir_chemin", "robot_bloquer", "robot_freiner", "robot_liberer"):
+        cible += " · " + str(data.get("site"))
+    try:
+        r, inverse = _sec_geste_executer(g, data, qui)
+    except Exception as e:
+        r, inverse = {"ok": False, "error": "%s : %s" % (type(e).__name__, e)}, None
+    r["id"] = _sec_geste_noter(qui, g, cible, r, inverse if r.get("ok") else None)
+    r["libelle"] = _SEC_GESTES_LIB[g]
+    r["defaire"] = bool(inverse and r.get("ok"))
+    _SEC_CACHE["d"] = None
+    _SEC_IMG_CACHE["d"] = None
+    try:
+        log_admin_action(sid, "securite_direct_" + g, "OK" if r.get("ok") else "FAIL", ("%s %s" % (cible, r.get("error") or r.get("detail") or ""))[:240])
+    except Exception:
+        pass
+    if r.get("ok") and qui != "Cassandra":
+        # Un geste humain : Cassandra en prend acte (le sien, elle le sait déjà).
+        threading.Thread(target=_sec_geste_prendre_acte, args=(r["id"],), daemon=True).start()
+    return r
+
+
+def _catalogue_securite(p: dict) -> tuple:
+    """Le catalogue « securite » : Cassandra fait les gestes de l'onglet, sous son propre nom."""
+    g, cible, site = str(p.get("geste") or ""), str(p.get("cible") or "").strip(), str(p.get("site") or "").strip()
+    cle = {"bannir": "ip", "debannir": "ip", "liste_blanche": "ip", "retirer_liste_blanche": "ip", "bannir_pays": "pays", "debannir_pays": "pays",
+           "fermer_chemin": "chemin", "rouvrir_chemin": "chemin", "robot_freiner": "robot", "robot_bloquer": "robot", "robot_liberer": "robot",
+           "service_arreter": "unite", "service_demarrer": "unite", "maj_image": "conteneur", "scan": "outil"}.get(g)
+    if not cle:
+        return 1, "geste inconnu"
+    data = {"geste": g, cle: cible, "site": site or ("*" if g in ("fermer_chemin", "rouvrir_chemin") else "")}
+    if str(p.get("jours") or "").isdigit():
+        data["jours"] = int(p["jours"])
+    r = securite_direct(data, "", "Cassandra")
+    return (0, "✓ %s %s — %s (geste n° %s, défaisable depuis l'onglet Sécurité)" % (r.get("libelle"), cible, r.get("detail") or "", r.get("id"))) if r.get("ok") \
+        else (1, "✗ %s %s — %s" % (r.get("libelle") or g, cible, r.get("error") or "échec"))
+
+
+def securite_defaire(gid: int, sid: str, qui: str) -> dict:
+    conn = _sec_gestes_conn()
+    try:
+        row = conn.execute("SELECT * FROM gestes_humains WHERE id = ?", (int(gid),)).fetchone()
+    finally:
+        conn.close()
+    if not row or not row["defaire"] or row["defait"]:
+        return {"ok": False, "error": "rien à défaire pour ce geste"}
+    inv = json.loads(row["defaire"])
+    r = securite_direct(dict(inv), sid, qui)
+    if r.get("ok"):
+        conn = _sec_gestes_conn()
+        try:
+            conn.execute("UPDATE gestes_humains SET defait = 1 WHERE id = ?", (int(gid),))
+            conn.commit()
+        finally:
+            conn.close()
+    return r
+
+
+def _sec_geste_prendre_acte(gid: int) -> None:
+    """Cassandra prend acte d'un geste humain : une note courte, rédigée par son second à partir de l'état
+    mesuré ; sans modèle disponible, une note fixe. Elle ne bloque jamais le geste, elle le connaît."""
+    time.sleep(2)
+    conn = _sec_gestes_conn()
+    try:
+        row = conn.execute("SELECT * FROM gestes_humains WHERE id = ?", (int(gid),)).fetchone()
+    finally:
+        conn.close()
+    if not row or row["note"]:
+        return
+    note = "vu. Je l'ajoute à ce que je surveille."
+    try:
+        if _itare_agent_available():
+            etat = securite_etat("")
+            v = (etat.get("verdict") or {}).get("titre") or ""
+            ctx = "Geste humain : %s — %s (%s). Résultat : %s. Verdict sécurité actuel : %s." % (
+                _SEC_GESTES_LIB.get(row["geste"], row["geste"]), row["cible"], row["qui"], row["detail"] or row["resultat"], v)
+            t = (_itare_agent_text([{"role": "user", "content": ctx}], max_tokens=160,
+                                   system=("Tu es Cassandra, l'IA qui administre cette machine. Un humain vient de faire un geste de sécurité. "
+                                           "Prends-en acte en UNE ou DEUX phrases courtes, en français, au tutoiement : commence par « vu. », "
+                                           "dis ce que tu en fais (surveillance, conséquence, effet de bord éventuel). Pas de formule de politesse.")) or "").strip()
+            if t:
+                note = t[:400]
+    except Exception as e:
+        logging.info("[SECURITE] note de prise d'acte : %s", e)
+    conn = _sec_gestes_conn()
+    try:
+        conn.execute("UPDATE gestes_humains SET note = ?, note_ts = datetime('now','localtime') WHERE id = ?", (note, int(gid)))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def securite_journal(limite: int = 120) -> dict:
@@ -89291,7 +89799,7 @@ def securite_pf_geste(g: str, data: dict) -> dict:
 
 
 
-def _sys_garde(handler, data: dict, action: str, mot: str = "") -> tuple:
+def _sys_garde(handler, data: dict, action: str, mot: str = "", mdp: bool = True) -> tuple:
     """LA GARDE DES GESTES DE LA MACHINE, une seule pour tous : session valide, rôle administrateur,
     limite de fréquence, mot de passe administrateur (hash), mot tapé pour les destructifs, journal.
     Rend (sid, user) ou None après avoir répondu."""
@@ -89307,7 +89815,9 @@ def _sys_garde(handler, data: dict, action: str, mot: str = "") -> tuple:
         handler.send_json({"ok": False, "error": "Trop de gestes d'affilée : réessaie dans %s s" % attente}, 429); return None
     expected = get_admin_password_hash()
     pwd = str(data.get("admin_password", "") or "")
-    if not expected or not hmac.compare_digest(hashlib.sha256(pwd.encode()).hexdigest(), str(expected)):
+    # mdp=False (10-10, Drisse : « si t'es connecté en admin, retaper son mot de passe c'est chiant ») : les gestes
+    # de l'onglet Sécurité s'en passent ; session valide, rôle administrateur, fréquence et journal restent.
+    if mdp and (not expected or not hmac.compare_digest(hashlib.sha256(pwd.encode()).hexdigest(), str(expected))):
         log_admin_action(sid, action, "FAILED", "mauvais mot de passe")
         handler.send_json({"ok": False, "error": "Mot de passe administrateur incorrect"}, 403); return None
     if mot and str(data.get("mot", "") or data.get("confirm", "") or "").strip() != mot:
@@ -95337,8 +95847,14 @@ class CassandraHandler(BaseHTTPRequestHandler):
                 self.send_json(securite_audits(int(data.get("id") or 0))); return
             log_admin_action(_sid, "securite_audit", "LAUNCHED", "")
             self.send_json(securite_audit_rediger()); return
+        if path in ("/api/securite/direct", "/api/securite/defaire"):
+            _g = _sys_garde(self, data, "securite_direct", mdp=False)
+            if not _g:
+                return
+            _r = securite_direct(data, _g[0], _g[1]) if path == "/api/securite/direct" else securite_defaire(int(data.get("id") or 0), _g[0], _g[1])
+            self.send_json(_r, 200 if _r.get("ok") else 400); return
         if path == "/api/securite/geste":
-            _g = _sys_garde(self, data, "securite_geste")
+            _g = _sys_garde(self, data, "securite_geste", mdp=False)
             if not _g:
                 return
             _r = securite_geste(data, _g[0], _g[1])
@@ -105481,6 +105997,53 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
 }
 
 
+
+/* SÉCURITÉ › AGIR (10-10) */
+.sc-i-cmd{display:flex;gap:10px;align-items:center;background:var(--surface);border-radius:16px;padding:10px 12px;border:1px solid var(--line)}
+.sc-i-cmd:focus-within{border-color:var(--accent)}
+.sc-i-cmd input{flex:1;border:0;background:transparent;color:var(--txt);font-size:14px;outline:none}
+.sc-i-sceau{width:28px;height:28px;border-radius:8px;background:var(--accent);color:var(--surface-solid);display:grid;place-items:center;font:700 13px var(--mono,"JetBrains Mono",monospace);flex:none}
+.sc-i-chips{display:flex;gap:6px;flex-wrap:wrap}
+.sc-i-chips button{border:1px solid var(--line);background:transparent;color:var(--txt-soft);border-radius:999px;padding:3px 10px;font-size:12px;cursor:pointer}
+.sc-i-chips button:hover{border-color:var(--accent);color:var(--accent)}
+.sc-i-astuce{font-size:12px;color:var(--txt-faint);margin:0} .sc-i-astuce b{color:var(--accent)}
+.sc-i-ask{margin-left:auto;border:1px solid var(--line);background:transparent;color:var(--accent);border-radius:9px;padding:2px 9px 2px 4px;font:600 11px var(--mono,"JetBrains Mono",monospace);cursor:pointer;display:inline-flex;gap:6px;align-items:center}
+.sc-i-ask::before{content:"C";width:16px;height:16px;border-radius:5px;background:var(--accent);color:var(--surface-solid);display:grid;place-items:center;font-size:10px}
+.sc-i-ask:hover{border-color:var(--accent)}
+.sc-img .mx-chart-h .sc-i-ask + .mx-meta{margin-left:8px}
+.sc-i-l{display:grid;grid-template-columns:1fr auto;gap:4px 12px;padding:8px 0;border-bottom:1px solid var(--line);align-items:center;font-size:13px}
+.sc-i-l .q{display:flex;flex-direction:column;gap:2px;min-width:0} .sc-i-l .q span{font-size:12px;color:var(--txt-faint)}
+.sc-i-l .a{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.sc-i-b{border:1px solid var(--line);background:transparent;color:var(--txt);border-radius:9px;padding:3px 10px;font-size:12px;cursor:pointer;white-space:nowrap;font-weight:600}
+.sc-i-b:hover{border-color:var(--accent);color:var(--accent)} .sc-i-b.d:hover{border-color:var(--danger);color:var(--danger)} .sc-i-b:disabled{opacity:.5;cursor:default}
+.sc-img svg .clic{cursor:pointer}
+.sc-i-menu{position:fixed;z-index:3100;background:var(--surface-solid);border:1px solid var(--line);border-radius:12px;box-shadow:0 12px 32px rgba(16,24,40,.18);padding:6px;min-width:250px;display:none}
+.sc-i-menu.on{display:block}
+.sc-i-menu .t{font:600 11px var(--mono,"JetBrains Mono",monospace);color:var(--txt-faint);padding:6px 10px 4px;text-transform:uppercase;letter-spacing:.05em}
+.sc-i-menu button{display:block;width:100%;text-align:left;border:0;background:transparent;color:var(--txt);padding:7px 10px;border-radius:8px;font-size:13px;cursor:pointer}
+.sc-i-menu button:hover{background:var(--sc-grille,rgba(16,24,40,.07))} .sc-i-menu button.c{color:var(--accent);font-weight:600}
+.sc-i-menu hr{border:0;border-top:1px solid var(--line);margin:4px 0}
+.sc-i-toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(20px);background:var(--surface-solid);color:var(--txt);border:1px solid var(--line);box-shadow:0 12px 32px rgba(16,24,40,.18);border-radius:12px;padding:10px 14px;font-size:13px;opacity:0;pointer-events:none;transition:all .2s;z-index:3200;display:flex;gap:10px;align-items:center;max-width:92vw}
+.sc-i-toast.on{opacity:1;transform:translateX(-50%);pointer-events:auto} .sc-i-toast i{font-style:normal;font-weight:700;color:var(--ok)} .sc-i-toast.ko i{color:var(--danger)}
+.sc-i-geste{display:grid;grid-template-columns:48px 1fr auto;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px;align-items:start}
+.sc-i-geste .h{font:500 12px var(--mono,"JetBrains Mono",monospace);color:var(--txt-faint);padding-top:2px}
+.sc-i-geste .note{margin-top:4px;font-size:12px;color:var(--txt-soft);border-left:2px solid var(--accent);padding-left:8px}
+.sc-i-geste .note b{color:var(--accent)} .sc-i-geste .attente{color:var(--txt-faint);font-style:italic} .sc-i-geste .ko{color:var(--danger)}
+.sc-i-pan{position:fixed;top:0;right:0;bottom:0;width:420px;max-width:100vw;background:var(--surface-solid);box-shadow:-12px 0 40px rgba(16,24,40,.16);z-index:3000;display:flex;flex-direction:column;transform:translateX(105%);transition:transform .22s}
+.sc-i-pan.on{transform:none}
+.sc-i-pan-h{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.sc-i-pan-h b{color:var(--txt-strong,var(--txt))} .sc-i-pan-h span{font-size:12px;color:var(--txt-faint);display:block}
+.sc-i-x{margin-left:auto;border:0;background:transparent;color:var(--txt-faint);font-size:20px;cursor:pointer}
+.sc-i-ctx{margin:12px 16px 0;border:1px dashed var(--line);border-radius:10px;padding:8px 10px;font-size:12px;color:var(--txt-soft)}
+.sc-i-ctx b{font:600 11px var(--mono,"JetBrains Mono",monospace);color:var(--txt-faint);display:block;margin-bottom:2px;text-transform:uppercase}
+.sc-i-fil{flex:1;overflow:auto;padding:12px 16px;display:flex;flex-direction:column;gap:10px}
+.sc-i-msg{max-width:94%;font-size:13.5px;line-height:1.5}
+.sc-i-msg.moi{align-self:flex-end;background:var(--accent);color:var(--surface-solid);padding:8px 12px;border-radius:14px 14px 4px 14px}
+.sc-i-msg.cas{align-self:flex-start;background:var(--sc-grille,rgba(16,24,40,.07));padding:10px 12px;border-radius:14px 14px 14px 4px;overflow-wrap:anywhere}
+.sc-i-saisie{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--line)}
+.sc-i-saisie input{flex:1;border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:transparent;color:var(--txt);font-size:13.5px;outline:none}
+.sc-i-saisie input:focus{border-color:var(--accent)}
+.sc-i-saisie button{border:0;background:var(--accent);color:var(--surface-solid);border-radius:10px;padding:0 14px;font-weight:600;cursor:pointer}
 /* SÉCURITÉ › EN IMAGES (10-10) — la catégorielle (bleu, violet) est validée par thème ; l'état garde ok/warn/danger */
 .sc-img{--sc-s1:#0369a1;--sc-s2:#7c3aed;--sc-grille:rgba(16,24,40,.07);display:flex;flex-direction:column;gap:16px}
 :root[data-theme="dark"] .sc-img{--sc-s1:#1d9bd1;--sc-s2:#8b5cf6;--sc-grille:rgba(173,186,199,.09)}
@@ -106195,47 +106758,56 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
 
 
         <div class="sc-img" data-page="images" hidden>
-          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>D’un coup d’œil</h2><span class="mx-meta" id="sc-i-mesure">—</span></div>
+          <div class="sc-i-cmd"><span class="sc-i-sceau">C</span><input id="sc-i-cmd" placeholder="Dis à Cassandra ce qu’elle doit faire… (ex. « ferme tout ce qui est ouvert au réseau local sauf le DNS »)" onkeydown="if(event.key==='Enter'&&this.value.trim()){sciDemander('Onglet Sécurité', this.value.trim()); this.value='';}"></div>
+          <div class="sc-i-chips"><button type="button" onclick="sciDemander('Onglet Sécurité','Fais un audit de la sécurité et corrige ce que tu peux.')">Fais un audit et corrige ce que tu peux</button><button type="button" onclick="sciDemander('Les attaques, jour par jour','Pourquoi le plus gros pic de ces derniers jours ?')">Pourquoi le dernier pic ?</button><button type="button" onclick="sciDemander('Failles des images Docker','Mets à jour les images qui ont une version plus récente.')">Mets à jour les images en retard</button><button type="button" onclick="sciDemander('Onglet Sécurité','Je crois qu’on m’attaque : photographie la machine (sessions, connexions, clés, processus, fichiers modifiés) et contiens si besoin.')">Je crois qu’on m’attaque</button></div>
+          <p class="sc-i-astuce">Les <b>gestes directs</b> (Bannir, Fermer, Freiner, Mettre à jour…) s’exécutent tout de suite et Cassandra en est informée ; le bouton <b>Cassandra</b> d’une carte lui en parle, carte en contexte. Clic sur une barre ou une ligne : ce qu’on peut y faire.</p>
+          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Tes gestes, et ce que Cassandra en sait</h2><span class="mx-meta">24 h</span></div>
+            <p class="sc-i-sous">Un geste direct s’exécute aussitôt. Cassandra le reçoit dans sa perception et en prend acte ; elle ne le bloque jamais.</p>
+            <div id="sc-i-gestes"></div></section>
+          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>D’un coup d’œil</h2><button class="sc-i-ask" type="button" onclick="sciDemander('D\u2019un coup d\u2019œil')">Cassandra</button><span class="mx-meta" id="sc-i-mesure">—</span></div>
             <div class="sc-i-verdict"><svg id="sc-i-jauge" viewBox="0 0 180 180" width="170" height="170" role="img" aria-label="Indice de sécurité"></svg>
               <div><p class="sc-i-titre" id="sc-i-titre">—</p>
                 <p class="sc-i-note">L’indice part de 100 et retire des points par famille : « à regarder » −6, « à faire » −15. Il résume le verdict mesuré, il ne le remplace pas.</p>
                 <div class="sc-i-fams" id="sc-i-fams"></div></div></div></section>
           <div class="sc-i-kpis" id="sc-i-kpis"></div>
-          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Les attaques, jour par jour</h2><span class="mx-meta">journaux des sites · 14 jours</span></div>
+          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Les attaques, jour par jour</h2><button class="sc-i-ask" type="button" onclick="sciDemander('Les attaques, jour par jour')">Cassandra</button><span class="mx-meta">journaux des sites · 14 jours</span></div>
             <p class="sc-i-sous">Tentatives repoussées sur les sites publics, hors maison et Tailscale. Les robots d’indexation ne sont pas des attaques : ils sont donnés à part, au survol.</p>
             <div class="sc-i-leg"><span><i style="background:var(--sc-s1)"></i>Sondes d’effraction (.env, .git, xmlrpc, greffons…)</span><span><i style="background:var(--sc-s2)"></i>Mots de passe refusés (WordPress, Cassandra, coffre)</span></div>
             <svg id="sc-i-barres" viewBox="0 0 1100 260" width="100%" role="img" aria-label="Attaques par jour"></svg>
             <details class="sc-details"><summary>Voir en tableau</summary><div class="sc-tbl"><table id="sc-i-t-barres"></table></div></details></section>
-          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Quand ça frappe</h2><span class="mx-meta">7 jours · heure par heure</span></div>
+          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Quand ça frappe</h2><button class="sc-i-ask" type="button" onclick="sciDemander('Quand ça frappe')">Cassandra</button><span class="mx-meta">7 jours · heure par heure</span></div>
             <p class="sc-i-sous">Plus la case est foncée, plus il y a eu d’attaques repoussées dans l’heure.</p>
             <svg id="sc-i-chaleur" viewBox="0 0 1100 230" width="100%" role="img" aria-label="Carte de chaleur des attaques"></svg></section>
+          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Qui attaque le plus</h2><button class="sc-i-ask" type="button" onclick="sciDemander('Qui attaque le plus')">Cassandra</button><span class="mx-meta">10 jours</span></div>
+            <p class="sc-i-sous">Chaque adresse se bannit, s’explique ou se met en liste blanche. La maison et le tailnet ne se bannissent jamais.</p>
+            <div class="mx-rows" id="sc-i-attaquants"></div></section>
           <div class="sc-i-g2">
-            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Qui peut joindre quoi</h2><span class="mx-meta">pare-feu et box compris</span></div>
+            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Qui peut joindre quoi</h2><button class="sc-i-ask" type="button" onclick="sciDemander('Qui peut joindre quoi')">Cassandra</button><span class="mx-meta">pare-feu et box compris</span></div>
               <p class="sc-i-sous">Chaque service sur l’anneau le plus lointain qui peut l’atteindre.</p>
-              <svg id="sc-i-anneaux" viewBox="0 0 520 300" width="100%" role="img" aria-label="Exposition des services"></svg></section>
-            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>D’où viennent les attaques</h2><span class="mx-meta">CrowdSec · 7 jours</span></div>
+              <svg id="sc-i-anneaux" viewBox="0 0 520 300" width="100%" role="img" aria-label="Exposition des services"></svg><div class="mx-rows" id="sc-i-expo-l"></div></section>
+            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>D’où viennent les attaques</h2><button class="sc-i-ask" type="button" onclick="sciDemander('D\u2019où viennent les attaques')">Cassandra</button><span class="mx-meta">CrowdSec · 7 jours</span></div>
               <p class="sc-i-sous">Le pays d’origine des alertes, et ce qu’elles tentaient (24 h).</p>
               <svg id="sc-i-pays" viewBox="0 0 520 170" width="100%" role="img" aria-label="Pays d'origine"></svg><div class="sc-i-note" id="sc-i-scen"></div></section>
           </div>
           <div class="sc-i-g2">
-            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Ce qu’ils cherchent</h2><span class="mx-meta">10 jours</span></div>
+            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Ce qu’ils cherchent</h2><button class="sc-i-ask" type="button" onclick="sciDemander('Ce qu\u2019ils cherchent')">Cassandra</button><span class="mx-meta">10 jours</span></div>
               <p class="sc-i-sous">Les chemins les plus sondés.</p><svg id="sc-i-chemins" viewBox="0 0 520 230" width="100%" role="img" aria-label="Chemins sondés"></svg></section>
-            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Robots et humains</h2><span class="mx-meta">10 jours</span></div>
-              <p class="sc-i-sous">La part des robots dans le trafic de chaque site.</p><svg id="sc-i-robots" viewBox="0 0 520 230" width="100%" role="img" aria-label="Part des robots par site"></svg></section>
+            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Robots et humains</h2><button class="sc-i-ask" type="button" onclick="sciDemander('Robots et humains')">Cassandra</button><span class="mx-meta">10 jours</span></div>
+              <p class="sc-i-sous">La part des robots dans le trafic de chaque site.</p><svg id="sc-i-robots" viewBox="0 0 520 230" width="100%" role="img" aria-label="Part des robots par site"></svg><div class="mx-rows" id="sc-i-robots-l"></div></section>
           </div>
           <div class="sc-i-g2">
-            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Certificats</h2><span class="mx-meta">jours avant expiration</span></div>
+            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Certificats</h2><button class="sc-i-ask" type="button" onclick="sciDemander('Certificats')">Cassandra</button><span class="mx-meta">jours avant expiration</span></div>
               <p class="sc-i-sous">Renouvellement automatique à 30 jours, alerte sous 21.</p><svg id="sc-i-certs" viewBox="0 0 520 210" width="100%" role="img" aria-label="Certificats"></svg></section>
-            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Courriel des domaines</h2><span class="mx-meta">relu toutes les heures</span></div>
+            <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Courriel des domaines</h2><button class="sc-i-ask" type="button" onclick="sciDemander('Courriel des domaines')">Cassandra</button><span class="mx-meta">relu toutes les heures</span></div>
               <p class="sc-i-sous">Qui peut envoyer en votre nom.</p><div class="sc-i-matrice" id="sc-i-courriel"></div>
               <p class="sc-i-note">SPF dit quels serveurs envoient pour vous ; DKIM signe chaque message ; DMARC dit quoi faire d’un faux.</p></section>
           </div>
-          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>La maison</h2><span class="mx-meta">box · DNS local · tailnet</span></div>
+          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>La maison</h2><button class="sc-i-ask" type="button" onclick="sciDemander('La maison')">Cassandra</button><span class="mx-meta">box · DNS local · tailnet</span></div>
             <div class="sc-i-liste" id="sc-i-box"></div></section>
-          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Failles des images Docker</h2><span class="mx-meta" id="sc-i-trivy-meta">Trivy</span></div>
+          <section class="mx-sec sc-i-carte"><div class="mx-chart-h"><h2>Failles des images Docker</h2><button class="sc-i-ask" type="button" onclick="sciDemander('Failles des images Docker')">Cassandra</button><span class="mx-meta" id="sc-i-trivy-meta">Trivy</span></div>
             <p class="sc-i-sous">Une faille « corrigée en amont » disparaît quand l’éditeur publie une nouvelle image.</p>
             <div class="sc-i-leg"><span><i style="background:var(--danger)"></i>Critiques</span><span><i style="background:var(--warn)"></i>Hautes</span></div>
-            <svg id="sc-i-trivy" viewBox="0 0 1100 220" width="100%" role="img" aria-label="Failles par image"></svg></section>
+            <svg id="sc-i-trivy" viewBox="0 0 1100 220" width="100%" role="img" aria-label="Failles par image"></svg><div class="mx-rows" id="sc-i-trivy-l"></div></section>
           <div class="sc-i-g4" id="sc-i-gardiens"></div>
         </div>
         <section class="mx-sec" data-page="outils" id="sc-s-outils" hidden>
@@ -106287,7 +106859,16 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
       </main>
     </div>
   </div>
-  <div id="fleet-add-modal" class="fleet-add-modal hidden">
+  
+<aside class="sc-i-pan" id="sc-i-pan" aria-label="Cassandra">
+  <div class="sc-i-pan-h"><span class="sc-i-sceau">C</span><div><b>Cassandra</b><span id="sc-i-pan-sous">à ton écoute</span></div><button type="button" class="sc-i-x" onclick="sciFermer()" aria-label="Fermer">×</button></div>
+  <div class="sc-i-ctx" id="sc-i-ctx"></div>
+  <div class="sc-i-fil" id="sc-i-fil"></div>
+  <div class="sc-i-saisie"><input id="sc-i-saisie" placeholder="Écris à Cassandra…" onkeydown="if(event.key==='Enter')sciEnvoyer()"><button type="button" onclick="sciEnvoyer()">Envoyer</button></div>
+</aside>
+<div class="sc-i-menu" id="sc-i-menu"></div>
+<div class="sc-i-toast" id="sc-i-toast"></div>
+<div id="fleet-add-modal" class="fleet-add-modal hidden">
     <div class="fleet-add-card" style="width:420px;max-height:90vh;overflow-y:auto">
       <h2>+ Ajouter un équipement</h2>
 
@@ -116003,7 +116584,7 @@ const SC_GESTES = {
 async function scGeste(g, extra){
     const G = SC_GESTES[g]; if (!G) return;
     const titre = G.t + (extra && extra.ip ? ' ' + extra.ip : '');
-    const r = await fp2Demander(G.x + '\n\n' + titre + ' ?', titre, {mdp: true, danger: !!G.danger, ok: G.ok});
+    const r = await fp2Demander(G.x + '\n\n' + titre + ' ?', titre, {mdp: false, danger: !!G.danger, ok: G.ok});
     if (!r.ok) return;
     let d = null;
     try { d = await apiPost('/api/securite/geste', Object.assign({geste: g, admin_password: r.mdp}, extra || {})); } catch(e) { d = {ok: false, error: 'Erreur réseau'}; }
@@ -116160,7 +116741,7 @@ function scPfPreparer(nom, port){
     setTimeout(function(){ const f = document.getElementById('sc-s-fw-form'); if (f) f.scrollIntoView({behavior: 'smooth', block: 'start'}); }, 60);
 }
 async function scPfEnvoyer(corps, titre, texte, danger, fb){
-    const r = await fp2Demander(texte + '\n\n' + titre + ' ?', titre, {mdp: true, danger: !!danger, ok: 'Confirmer'});
+    const r = await fp2Demander(texte + '\n\n' + titre + ' ?', titre, {mdp: false, danger: !!danger, ok: 'Confirmer'});
     if (!r.ok) return null;
     let d = null;
     try { d = await apiPost('/api/securite/geste', Object.assign({admin_password: r.mdp}, corps)); } catch(e) { d = {ok: false, error: 'Erreur réseau'}; }
@@ -116253,9 +116834,14 @@ function sciPeindre(){
     const cls = {ok: 'ok', regarder: 'warn', panne: 'danger', accepte: 'acc', '': 'ok'};
     scHtml('sc-i-fams', (d.familles || []).map(function(f){ return '<div class="sc-i-fam" title="' + mxE(f.dit) + '"><span class="sc-i-pt ' + (cls[f.niveau] || 'ok') + '"></span><div><b>' + mxE(f.lib) + '</b><span>' + mxE(f.dit) + '</span></div></div>'; }).join(''));
     scHtml('sc-i-kpis', (d.kpis || []).map(function(k){ return '<div class="sc-i-kpi" title="' + mxE(k.dit) + '"><b>' + mxE(k.v) + '</b><em><span class="sc-i-pt ' + mxE(k.niveau) + '"></span>' + mxE(k.lib) + '</em><small>' + mxE(k.dit) + '</small></div>'; }).join(''));
-    sciBarres(d); sciChaleur(d); sciAnneaux(d); sciPays(d); sciH('sc-i-chemins', (d.chemins || []).map(function(x){ return [x.chemin, x.n]; }), 'var(--sc-s1)', '');
+    sciBarres(d); sciChaleur(d); sciAnneaux(d); sciPays(d);
+    sciH('sc-i-chemins', (d.chemins || []).map(function(x){ return [x.chemin, x.n, '', '', sciFr(x.n) + ' appels · clic : agir', function(e){
+        sciMenu(e, x.chemin, [['Fermer sur tous les sites', function(){ sciDirect({geste: 'fermer_chemin', chemin: x.chemin, site: '*'}, 'Fermer ' + x.chemin + ' partout'); }],
+            '-'].concat((d.sites_geres || []).map(function(st){ return ['Fermer sur ' + st, function(){ sciDirect({geste: 'fermer_chemin', chemin: x.chemin, site: st}, 'Fermer ' + x.chemin + ' sur ' + st); }]; }))
+            .concat(['-', ['Cassandra, ce chemin sert-il à un de mes sites ?', function(){ sciDemander('Ce qu’ils cherchent', 'Le chemin ' + x.chemin + ' sert-il à un de mes sites ? Si non, ferme-le où il est sondé.'); }, 'c']])); }]; }), 'var(--sc-s1)', '');
     sciH('sc-i-robots', (d.robots || []).map(function(x){ return [x.site.replace('.cassandra.center', ''), x.part, '', x.part + ' %', sciFr(x.n) + ' requêtes, ' + x.part + ' % de robots']; }), 'var(--sc-s2)', '', 100);
     sciCerts(d); sciCourriel(d); sciBox(d); sciTrivy(d); sciGardiens(d);
+    sciGestes(d); sciAttaquants(d); sciLignesActions(d);
 }
 function sciBarres(d){
     const s = sciVider('sc-i-barres'), J = d.jours || [];
@@ -116269,8 +116855,11 @@ function sciBarres(d){
     J.forEach(function(j, i){
         const somme = j.sondes + j.refus, coupe = somme > max, base = m.t + ih, x = m.l + bw * i + (bw - larg) / 2;
         const h2 = coupe ? Math.max(3, ih * j.refus / somme) : ih * j.refus / max, h1 = coupe ? ih - h2 - 2 : ih * j.sondes / max;
-        const grp = sciEl('g', {}, s);
+        const grp = sciEl('g', {class: 'clic'}, s);
         sciEl('rect', {x: x - 6, y: m.t, width: larg + 12, height: ih, fill: 'transparent'}, grp);
+        grp.addEventListener('click', function(e){ sciMenu(e, 'Le ' + sciJourCourt(j.jour) + ' · ' + sciFr(somme) + ' attaques', [
+            ['Cassandra, pourquoi ce jour-là ?', function(){ sciDemander('Les attaques, jour par jour', 'Pourquoi ' + sciFr(somme) + ' attaques le ' + j.jour + ' ? Qui, quoi, et faut-il agir ?'); }, 'c'],
+            ['Cassandra, bannis les plus actives de ce jour', function(){ sciDemander('Les attaques, jour par jour', 'Bannis les adresses les plus actives du ' + j.jour + ' (jamais la maison ni le tailnet).'); }, 'c']]); });
         if (h1 > 0) sciEl('path', {d: h2 >= 1 ? 'M' + x + ',' + base + 'V' + (base - h1) + 'H' + (x + larg) + 'V' + base + 'Z' : sciBout(x, base - h1, larg, h1), fill: 'var(--sc-s1)'}, grp);
         if (h2 >= 1) sciEl('path', {d: sciBout(x, base - h1 - h2 - (h1 > 0 ? 2 : 0), larg, h2), fill: 'var(--sc-s2)'}, grp);
         if (coupe){ sciEl('rect', {x: x - 2, y: m.t + ih * .18, width: larg + 4, height: 5, fill: 'var(--surface-solid)'}, grp);
@@ -116319,7 +116908,8 @@ function sciH(id, rows, couleur, suffixe, maxForce){
     const max = maxForce || ((vals.length > 1 && vals[0] > 4 * vals[1]) ? vals[1] * 1.6 : vals[0]) || 1;
     rows.forEach(function(r, i){ const y = 6 + i * 27, coupe = r[1] > max, l = Math.max(3, w * Math.min(r[1], max) / max);
         const t = sciEl('text', {x: x0 - 10, y: y + 13, 'text-anchor': 'end', style: 'fill:var(--txt-soft)'}, s); t.textContent = String(r[0]).length > 18 ? String(r[0]).slice(0, 17) + '…' : r[0];
-        const b = sciEl('path', {d: sciDroite(x0, y, l, 18), fill: coupe ? 'var(--warn)' : (r[2] || couleur)}, s);
+        const b = sciEl('path', {d: sciDroite(x0, y, l, 18), fill: coupe ? 'var(--warn)' : (r[2] || couleur), class: r[5] ? 'clic' : ''}, s);
+        if (r[5]) b.addEventListener('click', function(e){ r[5](e); });
         const v = sciEl('text', {x: x0 + l + 6, y: y + 13, class: 'val'}, s); v.textContent = (r[3] || sciFr(r[1])) + (coupe ? ' ↑' : '') + (suffixe || '');
         sciSurvol(b, '<b>' + mxE(r[0]) + '</b><br>' + (r[4] || sciFr(r[1]))); });
 }
@@ -116372,6 +116962,136 @@ function sciGardiens(d){
         carte('ClamAV', C.installe ? '<div class="chiffre">' + (C.menaces || 0) + '</div><div class="lib">menace' + (C.menaces > 1 ? 's' : '') + (C.duree != null ? ' · balayage en ' + C.duree + ' min' : '') + '</div>' + p(!C.menaces, C.menaces ? 'ALERTE' : 'BON') : '<div class="lib">non installé</div>') +
         carte('CrowdSec', S.installe ? '<div class="chiffre">' + sciFr(S.locales) + '</div><div class="lib">bannies ici · ' + sciFr(S.communaute) + ' dans la liste communautaire · ' + (S.alertes || 0) + ' alertes en 24 h</div>' + p(S.actif, S.actif ? 'ACTIF' : 'ARRÊTÉ') : '<div class="lib">non installé</div>') +
         carte('fail2ban', '<div class="chiffre">' + (F.prisons || 0) + '</div><div class="lib">prisons · ' + sciFr(F.total) + ' bannissements depuis le démarrage · ' + (F.bannies || 0) + ' en cours</div>' + p(F.actif, F.actif ? 'ACTIF' : 'ABSENT')));
+}
+// SÉCURITÉ › AGIR (10-10) — gestes directs (Cassandra informée) et conversation avec la carte en contexte.
+function sciMenu(e, titre, items){
+    e.stopPropagation(); sciTip().style.opacity = 0;
+    const m = document.getElementById('sc-i-menu'); if (!m) return;
+    m.innerHTML = '<div class="t">' + mxE(titre) + '</div>' + items.map(function(it, i){ return it === '-' ? '<hr>' : '<button type="button" class="' + (it[2] || '') + '" data-i="' + i + '">' + mxE(it[0]) + '</button>'; }).join('');
+    m.querySelectorAll('button').forEach(function(b){ b.onclick = function(){ m.classList.remove('on'); items[+b.dataset.i][1](); }; });
+    m.classList.add('on');
+    const r = m.getBoundingClientRect();
+    m.style.left = Math.max(8, Math.min(e.clientX, innerWidth - r.width - 12)) + 'px'; m.style.top = Math.max(8, Math.min(e.clientY + 6, innerHeight - r.height - 12)) + 'px';
+}
+document.addEventListener('click', function(){ const m = document.getElementById('sc-i-menu'); if (m) m.classList.remove('on'); });
+let _sciToastT = null;
+function sciToast(ok, html, id){
+    const t = document.getElementById('sc-i-toast'); if (!t) return;
+    t.className = 'sc-i-toast on' + (ok ? '' : ' ko');
+    t.innerHTML = '<i>' + (ok ? '✓' : '✕') + '</i><span>' + html + '</span>' + (id ? '<button type="button" class="sc-i-b" onclick="sciDefaire(' + parseInt(id, 10) + ')">Défaire</button>' : '');
+    clearTimeout(_sciToastT); _sciToastT = setTimeout(function(){ t.classList.remove('on'); }, ok ? 6000 : 9000);
+}
+async function sciDirect(params, libelle){
+    let d = null;
+    sciToast(true, mxE(libelle || 'Geste') + ' — en cours…');
+    try { d = await apiPost('/api/securite/direct', params); } catch(e) { d = {ok: false, error: 'Erreur réseau'}; }
+    if (d && d.ok) sciToast(true, '<b>' + mxE(d.libelle || libelle) + '</b> — fait. ' + mxE(d.detail || '') + ' Cassandra est informée.', d.defaire ? d.id : 0);
+    else sciToast(false, '<b>' + mxE((d && d.libelle) || libelle || 'Geste') + '</b> — ' + mxE((d && d.error) || 'échec'));
+    await scImages(); setTimeout(scImages, 6000);       // la note de Cassandra arrive après le geste
+}
+async function sciDefaire(id){
+    let d = null;
+    try { d = await apiPost('/api/securite/defaire', {id: id}); } catch(e) { d = {ok: false, error: 'Erreur réseau'}; }
+    sciToast(!!(d && d.ok), d && d.ok ? '<b>Défait</b> — ' + mxE(d.detail || '') : mxE((d && d.error) || 'échec'));
+    scImages();
+}
+function sciGestes(d){
+    const G = d.gestes || [], lib = {bannir: 'Bannir', debannir: 'Débannir', bannir_pays: 'Bannir le pays', debannir_pays: 'Débannir le pays', liste_blanche: 'Liste blanche',
+        retirer_liste_blanche: 'Retirer de la liste blanche', fermer_chemin: 'Fermer', rouvrir_chemin: 'Rouvrir', robot_bloquer: 'Bloquer le robot', robot_freiner: 'Freiner le robot',
+        robot_liberer: 'Libérer le robot', service_arreter: 'Arrêter', service_demarrer: 'Redémarrer', maj_image: 'Mettre à jour', scan: 'Lancer'};
+    scHtml('sc-i-gestes', G.length ? G.slice(0, 12).map(function(g){
+        const note = g.qui === 'Cassandra' ? '' : (g.note ? '<div class="note"><b>Cassandra :</b> ' + mxE(g.note) + '</div>' : (g.ok ? '<div class="note attente">Cassandra en prend acte…</div>' : ''));
+        return '<div class="sc-i-geste"><span class="h">' + mxE(String(g.ts || '').slice(11, 16)) + '</span><div><b>' + mxE(g.qui || '?') + '</b> · ' + mxE(lib[g.geste] || g.geste) + ' ' + mxE(g.cible || '')
+             + '<div class="' + (g.ok ? '' : 'ko') + '" style="font-size:12px;color:' + (g.ok ? 'var(--txt-faint)' : '') + '">' + mxE(g.ok ? (g.detail || '') : ('échec : ' + (g.resultat || ''))) + (g.defait ? ' · <b>défait ensuite</b>' : '') + '</div>' + note + '</div>'
+             + (g.ok && g.defaire && !g.defait ? '<button type="button" class="sc-i-b" onclick="sciDefaire(' + parseInt(g.id, 10) + ')">Défaire</button>' : '<span></span>') + '</div>';
+    }).join('') : '<div class="empty-state">Aucun geste encore. Bannir, fermer, freiner, mettre à jour : chaque geste apparaîtra ici, avec la note de Cassandra.</div>');
+}
+function sciAttaquants(d){
+    scHtml('sc-i-attaquants', (d.attaquants || []).map(function(a){
+        const ip = mxE(a.ip), jours = a.jours > 1 ? a.jours + ' jours (' + sciJourCourt(a.premier) + ' → ' + sciJourCourt(a.dernier) + ')' : 'le ' + sciJourCourt(a.dernier);
+        const etat = a.confiance ? '<span class="mx-pill ok">CONFIANCE</span>' : a.banni ? '<span class="mx-pill regarder">BANNIE</span>' : '';
+        const act = a.confiance ? '' : (a.banni ? '<button type="button" class="sc-i-b" onclick="sciDirect({geste:\'debannir\', ip:\'' + ip + '\'}, \'Débannir ' + ip + '\')">Débannir</button>'
+                    : '<button type="button" class="sc-i-b d" onclick="sciDirect({geste:\'bannir\', ip:\'' + ip + '\'}, \'Bannir ' + ip + '\')">Bannir</button>')
+                    + '<button type="button" class="sc-i-b" onclick="sciMenuIp(event, \'' + ip + '\')">…</button>';
+        return '<div class="sc-i-l"><div class="q"><b class="mono">' + etat + ip + '</b><span>' + sciFr(a.n) + ' attaques · ' + jours + '</span></div><div class="a">' + act + '</div></div>';
+    }).join('') || '<div class="empty-state">Aucune attaque relevée sur 10 jours.</div>');
+}
+function sciMenuIp(e, ip){
+    const plage = ip.indexOf(':') >= 0 ? ip.split(':').slice(0, 4).join(':') + '::/64' : ip.split('.').slice(0, 3).join('.') + '.0/24';
+    sciMenu(e, ip, [['Cassandra, qui est-ce ?', function(){ sciDemander('Qui attaque le plus', 'Qui est ' + ip + ', que cherchait-elle, et faut-il aller plus loin ?'); }, 'c'],
+        ['Bannir 30 jours', function(){ sciDirect({geste: 'bannir', ip: ip}, 'Bannir ' + ip); }],
+        ['Bannir toute sa plage (' + plage + ')', function(){ sciDirect({geste: 'bannir', ip: plage}, 'Bannir ' + plage); }],
+        '-', ['Mettre en liste blanche', function(){ sciDirect({geste: 'liste_blanche', ip: ip}, 'Liste blanche ' + ip); }]]);
+}
+function sciLignesActions(d){
+    // exposition : les services ouverts au-delà de la machine, avec leur unité
+    const E = (SC.d && SC.d.exposition) || [];
+    scHtml('sc-i-expo-l', E.filter(function(x){ return (x.reseau || x.parc) && x.internet !== 'oui' && x.unite; }).slice(0, 8).map(function(x){
+        return '<div class="sc-i-l"><div class="q"><b>' + mxE(x.nom) + '</b><span>' + mxE((x.ports || []).join(', ')) + ' · ' + (x.reseau ? 'réseau local' : 'le parc') + ' · ' + mxE(x.unite) + '</span></div><div class="a">'
+             + '<button type="button" class="sc-i-b d" onclick="sciDirect({geste:\'service_arreter\', unite:\'' + mxE(x.unite) + '\'}, \'Arrêter ' + mxE(x.nom) + '\')">Arrêter</button>'
+             + '<button type="button" class="sc-i-b" onclick="sciDemander(\'Qui peut joindre quoi\', \'Limite ' + mxE(x.nom).replace(/'/g, '') + ' à ce qui en a besoin.\')">C · Limiter</button></div></div>';
+    }).join(''));
+    scHtml('sc-i-robots-l', (d.robots || []).filter(function(r){ return r.gere && (r.noms || []).length; }).slice(0, 4).map(function(r){
+        const rb = r.noms[0];
+        return '<div class="sc-i-l"><div class="q"><b>' + mxE(r.site) + ' · ' + mxE(rb.robot) + '</b><span>' + sciFr(rb.n) + ' requêtes en 10 jours · ' + r.part + ' % de robots sur le site</span></div><div class="a">'
+             + '<button type="button" class="sc-i-b" onclick="sciDirect({geste:\'robot_freiner\', robot:\'' + mxE(rb.robot) + '\', site:\'' + mxE(r.site) + '\'}, \'Freiner ' + mxE(rb.robot) + '\')">Freiner</button>'
+             + '<button type="button" class="sc-i-b d" onclick="sciDirect({geste:\'robot_bloquer\', robot:\'' + mxE(rb.robot) + '\', site:\'' + mxE(r.site) + '\'}, \'Bloquer ' + mxE(rb.robot) + '\')">Bloquer</button></div></div>';
+    }).join(''));
+    scHtml('sc-i-trivy-l', (d.trivy || []).filter(function(i){ return i.conteneur && (i.critiques + i.hautes); }).map(function(i){
+        return '<div class="sc-i-l"><div class="q"><b>' + mxE(i.conteneur) + '</b><span>' + mxE(i.image) + ' · ' + i.critiques + ' critique(s), ' + i.hautes + ' haute(s)</span></div><div class="a">'
+             + '<button type="button" class="sc-i-b" onclick="sciDirect({geste:\'maj_image\', conteneur:\'' + mxE(i.conteneur) + '\'}, \'Mettre à jour ' + mxE(i.conteneur) + '\')">Mettre à jour</button>'
+             + '<button type="button" class="sc-i-b" onclick="sciDemander(\'Failles des images Docker\', \'Explique les failles de ' + mxE(i.conteneur) + ' et ce qu’on peut faire.\')">C · Expliquer</button></div></div>';
+    }).join(''));
+}
+// ── la conversation : le panneau de Cassandra, carte en contexte ──
+const SCI_CTX = {};
+function sciContexte(carte){
+    const d = SCI.d || {}, j = function(x){ try { return JSON.stringify(x).slice(0, 1400); } catch(e) { return ''; } };
+    const par = {'Les attaques, jour par jour': d.jours, 'Quand ça frappe': d.chaleur, 'Qui attaque le plus': d.attaquants, 'Qui peut joindre quoi': d.anneaux,
+        'D’où viennent les attaques': {pays: d.pays, scenarios: d.scenarios}, 'Ce qu’ils cherchent': d.chemins, 'Robots et humains': d.robots, 'Certificats': d.certs,
+        'Courriel des domaines': d.courriel, 'La maison': d.box, 'Failles des images Docker': d.trivy, 'D’un coup d’œil': {indice: d.indice, familles: d.familles}};
+    return par[carte] !== undefined ? j(par[carte]) : j({indice: d.indice, kpis: d.kpis});
+}
+function sciDemander(carte, texte){
+    const p = document.getElementById('sc-i-pan'); if (!p) return;
+    p.classList.add('on'); SCI_CTX.carte = carte;
+    scHtml('sc-i-ctx', '<b>Contexte transmis</b>Sécurité › ' + mxE(carte) + ' — ses chiffres du moment.');
+    if (texte) { sciEnvoyer(texte); return; }
+    const f = document.getElementById('sc-i-fil');
+    if (f && !f.children.length) sciBulle('cas', 'Je regarde <b>' + mxE(carte) + '</b>. Dis-moi ce que tu veux : j’explique, ou j’agis.');
+    const i = document.getElementById('sc-i-saisie'); if (i) i.focus();
+}
+function sciFermer(){ const p = document.getElementById('sc-i-pan'); if (p) p.classList.remove('on'); }
+function sciBulle(cls, html){ const f = document.getElementById('sc-i-fil'), b = document.createElement('div'); b.className = 'sc-i-msg ' + cls; b.innerHTML = html; f.appendChild(b); f.scrollTop = f.scrollHeight; return b; }
+async function sciEnvoyer(texte){
+    const i = document.getElementById('sc-i-saisie');
+    const t = (texte || (i && i.value) || '').trim(); if (!t) return;
+    if (i) i.value = '';
+    sciBulle('moi', mxE(t));
+    const b = sciBulle('cas', '<i>…</i>');
+    scTexte('sc-i-pan-sous', 'au travail');
+    const message = '[Onglet Sécurité › ' + (SCI_CTX.carte || 'Sécurité') + ' — contexte : ' + sciContexte(SCI_CTX.carte) + ']\n\n' + t;
+    let full = '';
+    try {
+        const resp = await fetch('/api/chat/stream', {method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({message: message, session: (typeof sessionId !== 'undefined' ? sessionId : ''), expert_mode: false, plan_mode: false})});
+        const reader = resp.body.getReader(), dec = new TextDecoder(); let buf = '', fini = false, prevu = null;
+        while (!fini) {
+            const c = await reader.read(); if (c.done) break;
+            buf += dec.decode(c.value, {stream: true});
+            const L = buf.split('\n'); buf = L.pop();
+            for (const l of L) {
+                if (!l.startsWith('data: ')) continue;
+                try { const x = JSON.parse(l.slice(6)); if (x.done) { fini = true; break; }
+                    if (x.etat && x.etat.libelle) scTexte('sc-i-pan-sous', String(x.etat.libelle).slice(0, 60));
+                    if (x.token) { full += x.token; if (!prevu) prevu = setTimeout(function(){ prevu = null; b.innerHTML = (typeof formatResponse === 'function') ? formatResponse(full) : mxE(full); document.getElementById('sc-i-fil').scrollTop = 1e9; }, 200); } } catch(e) {}
+            }
+        }
+        try { reader.cancel(); } catch(e) {}
+    } catch(e) { full = full || 'Erreur réseau.'; }
+    b.innerHTML = (typeof formatResponse === 'function') ? formatResponse(full || '…') : mxE(full || '…');
+    scTexte('sc-i-pan-sous', 'à ton écoute');
+    scImages();          // ce qu'elle a fait se lit aussitôt sur les cartes
 }
 // LES OUTILS DE SÉCURITÉ (10-10) : chacun installé par le même programme qu'install.sh, puis lu ici.
 const SC_OUTILS_X = {

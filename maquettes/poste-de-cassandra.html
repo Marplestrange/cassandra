@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Poste de Cassandra</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#eef1f5;--halo:#e9edf3;--surface:rgba(255,255,255,.66);--surface-solid:#fff;
+  --txt-strong:#101828;--txt:#2b3646;--txt-soft:#5a6675;--txt-faint:#76808e;--line:rgba(16,24,40,.09);
+  --accent:#0a726b;--ok:#047857;--warn:#b45309;--danger:#be123c;--info:#0369a1;--violet:#7c3aed;
+  --shadow:0 1px 2px rgba(16,24,40,.04),0 8px 24px rgba(16,24,40,.06);
+}
+:root[data-theme="dark"]{
+  --bg:#1c2128;--halo:#22272e;--surface:rgba(45,51,59,.72);--surface-solid:#2d333b;
+  --txt-strong:#e6edf3;--txt:#c9d1d9;--txt-soft:#adbac7;--txt-faint:#768390;--line:rgba(173,186,199,.12);
+  --accent:#3ddbb0;--ok:#27c168;--warn:#e8c660;--danger:#ff4757;--info:#1d9bd1;--violet:#8b5cf6;
+  --shadow:0 1px 2px rgba(0,0,0,.2),0 8px 24px rgba(0,0,0,.25);
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#1c2128;--halo:#22272e;--surface:rgba(45,51,59,.72);--surface-solid:#2d333b;
+  --txt-strong:#e6edf3;--txt:#c9d1d9;--txt-soft:#adbac7;--txt-faint:#768390;--line:rgba(173,186,199,.12);
+  --accent:#3ddbb0;--ok:#27c168;--warn:#e8c660;--danger:#ff4757;--info:#1d9bd1;--violet:#8b5cf6;}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg) radial-gradient(ellipse at 50% -25%,var(--halo),transparent 60%) no-repeat;color:var(--txt);font:14px/1.5 Inter,system-ui,sans-serif;padding:24px 16px 48px}
+.page{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.mono{font-family:"JetBrains Mono",ui-monospace,monospace}
+.tete{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap}
+.tete h1{margin:0;font:600 22px "JetBrains Mono",monospace;color:var(--txt-strong)}
+.tete p{margin:2px 0 0;color:var(--txt-soft)}
+.bascule{border:1px solid var(--line);background:var(--surface);color:var(--txt);border-radius:10px;padding:6px 12px;cursor:pointer;font:500 12px "JetBrains Mono",monospace}
+.carte{background:var(--surface);backdrop-filter:blur(18px) saturate(160%);-webkit-backdrop-filter:blur(18px) saturate(160%);border-radius:16px;box-shadow:var(--shadow);padding:18px 20px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.carte h2{margin:0;font:600 12px "JetBrains Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--txt-soft)}
+.sous{margin:-6px 0 0;font-size:12.5px;color:var(--txt-faint)}
+.g2{display:grid;grid-template-columns:1.25fr 1fr;gap:16px}
+@media (max-width:900px){.g2{grid-template-columns:1fr}}
+.pill{display:inline-block;font:600 10.5px "JetBrains Mono",monospace;letter-spacing:.05em;padding:2px 8px;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
+.pill.ok{color:var(--ok)}.pill.warn{color:var(--warn)}.pill.danger{color:var(--danger)}.pill.info{color:var(--info)}.pill.violet{color:var(--violet)}.pill.neutre{color:var(--txt-faint)}
+.btn{border:1px solid var(--line);background:transparent;color:var(--txt);border-radius:9px;padding:4px 10px;font:500 12px Inter,sans-serif;cursor:pointer}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+/* état du poste */
+.etat{display:grid;grid-template-columns:auto 1fr;gap:18px;align-items:center}
+.sceau{width:64px;height:64px;border-radius:18px;background:var(--accent);display:grid;place-items:center;color:var(--surface-solid);font:700 26px "JetBrains Mono",monospace}
+.etat h3{margin:0;font:600 19px Inter,sans-serif;color:var(--txt-strong)}
+.chiffres{display:flex;gap:22px;flex-wrap:wrap;margin-top:8px}
+.chiffres div b{display:block;font:600 22px "JetBrains Mono",monospace;color:var(--txt-strong)}
+.chiffres div span{font-size:12px;color:var(--txt-faint)}
+.hier{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12.5px;color:var(--txt-soft);margin-top:6px}
+.hier .rang{border:1px solid var(--line);border-radius:10px;padding:4px 10px}
+.hier .rang b{color:var(--txt-strong)}
+/* missions */
+.mission{border:1px solid var(--line);border-radius:14px;padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+.m-tete{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.m-tete b{font-size:14.5px;color:var(--txt-strong)}
+.m-tete .heure{margin-left:auto;font:500 11.5px "JetBrains Mono",monospace;color:var(--txt-faint)}
+.pourquoi{font-size:12.5px;color:var(--txt-soft)}
+.etapes{display:flex;gap:0;flex-wrap:wrap;align-items:stretch}
+.etape{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--txt);padding:4px 10px 4px 0}
+.etape i{font-style:normal;width:18px;height:18px;border-radius:50%;display:grid;place-items:center;font-size:11px;font-weight:700;color:var(--surface-solid);flex:none}
+.etape.f i{background:var(--ok)} .etape.c i{background:var(--warn)} .etape.a i{background:var(--txt-faint)} .etape.r i{background:var(--danger)}
+.etape+.etape::before{content:"";width:14px;height:1px;background:var(--line);margin-right:4px}
+.m-pied{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--txt-faint)}
+.m-pied .btn{margin-left:0}
+/* journal */
+.filtres{display:flex;gap:6px;flex-wrap:wrap}
+.filtres button{border:1px solid var(--line);background:transparent;color:var(--txt-soft);border-radius:999px;padding:3px 10px;font:500 12px Inter,sans-serif;cursor:pointer}
+.filtres button.on{border-color:var(--accent);color:var(--accent)}
+.ligne .quoi{min-width:0;overflow-wrap:anywhere}
+.ligne{display:grid;grid-template-columns:52px 150px minmax(0,1fr);gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px;align-items:start}
+.ligne .h{font:500 12px "JetBrains Mono",monospace;color:var(--txt-faint);padding-top:2px}
+.qui{display:flex;flex-direction:column;gap:2px}
+.qui b{font-size:12.5px}
+.qui span{font-size:11px;color:var(--txt-faint)}
+.arbitrage{margin-top:4px;font-size:12px;color:var(--txt-soft);border-left:2px solid var(--accent);padding-left:8px}
+.arbitrage b{color:var(--accent)}
+@media (max-width:640px){.ligne{grid-template-columns:44px 1fr}.ligne .qui{grid-column:2}.ligne .quoi{grid-column:1/-1}}
+/* sources et règles */
+.src{display:grid;grid-template-columns:1fr auto;gap:6px 12px;font-size:13px;align-items:center}
+.src span{color:var(--txt-faint);font-size:12px;display:block}
+.regle{display:grid;grid-template-columns:1fr auto;gap:4px 12px;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px}
+.regle span{color:var(--txt-faint);font-size:12px;grid-column:1}
+.regle .pill{grid-row:1/3;grid-column:2;align-self:center}
+.mq{border:1px dashed var(--line);border-radius:12px;padding:10px 12px;font-size:12.5px;color:var(--txt-soft)}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="tete">
+    <div><h1>Le poste de Cassandra</h1><p>MAQUETTE · Sécurité › Poste · les événements réels d’Orion du 10-10, rejoués selon la nouvelle règle</p></div>
+    <button class="bascule" onclick="theme()">clair / sombre</button>
+  </div>
+
+  <!-- 1. L'état du poste -->
+  <section class="carte">
+    <div class="etat">
+      <div class="sceau">C</div>
+      <div>
+        <h3>Cassandra tient la machine. Elle agit seule, vérifie, et défait ce qui ne tient pas.</h3>
+        <div class="hier"><span class="rang"><b>Cassandra</b> · décide et arbitre</span>→<span class="rang"><b>Itare</b> · second : enquête, prépare, veille</span>→<span class="rang">les humains · agissent aussi, elle sait tout</span></div>
+        <div class="chiffres">
+          <div><b>5</b><span>missions faites aujourd’hui</span></div>
+          <div><b>1</b><span>en cours (Itare)</span></div>
+          <div><b>1</b><span>planifiée</span></div>
+          <div><b>0</b><span>défaite</span></div>
+          <div><b>11</b><span>actions humaines vues</span></div>
+          <div><b>0</b><span>attente d’un humain</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="g2">
+    <!-- 2. Les missions -->
+    <section class="carte">
+      <h2>Ce qu’elle a décidé</h2>
+      <p class="sous">Chaque mission : le déclencheur mesuré, la décision, les étapes. Défaire reste possible tant que la sauvegarde existe.</p>
+      <div id="missions" style="display:flex;flex-direction:column;gap:10px"></div>
+    </section>
+
+    <!-- 3. Qui a fait quoi -->
+    <section class="carte">
+      <h2>Qui a fait quoi</h2>
+      <p class="sous">Toutes les mains sur la machine, 24 h. Quand une action humaine croise la sienne, Cassandra arbitre et le dit.</p>
+      <div class="filtres" id="filtres"></div>
+      <div id="journal"></div>
+    </section>
+  </div>
+
+  <div class="g2">
+    <!-- 4. Ce qu'elle fait seule -->
+    <section class="carte">
+      <h2>Ce qu’elle fait seule</h2>
+      <p class="sous">Ses règles d’action, à construire en deux lots. Aucune n’attend un humain ; toutes sauvegardent avant et vérifient après.</p>
+      <div id="regles"></div>
+    </section>
+    <!-- 5. Ce qu'elle voit -->
+    <section class="carte">
+      <h2>Ce qu’elle voit des humains</h2>
+      <p class="sous">D’où viennent les lignes du journal. Ce qui n’est pas encore branché, elle ne le voit pas.</p>
+      <div class="src" id="sources"></div>
+    </section>
+  </div>
+
+  <div class="mq"><b>À trancher sur cette maquette :</b> l’emplacement (une page du rail Sécurité, ou un onglet « Poste » à part, au-dessus de Sécurité — ses missions dépasseront la sécurité) ; ce qu’Itare reçoit d’office ; la durée pendant laquelle « Défaire » reste offert ; et si Cassandra défait une action humaine contraire à sa politique sans prévenir avant, ou en la signalant d’abord à la cloche.</div>
+</div>
+
+<script>
+const MISSIONS = [
+  {etat: "fait", h: "03:41", t: "Mettre à jour Vaultwarden (1.37.3 → 1.37.4)", qui: "Cassandra",
+   p: "Trivy : 7 failles critiques dans l’image ; la version publiée en corrige 3.",
+   e: [["f", "sauvegarde de la base (508 secrets, intègre)"], ["f", "nouvelle image"], ["f", "redémarrage"], ["f", "santé : healthy"], ["f", "coffre déverrouillé, 15 secrets lus"]],
+   pied: "critiques 7 → 4 · défaire possible 30 jours (image et base gardées)"},
+  {etat: "fait", h: "06:01", t: "Fermer /xmlrpc.php sur maisonboheme.org", qui: "Cassandra",
+   p: "61 906 appels en 10 jours : la porte de la force brute contre WordPress. Aucune extension du site ne s’en sert.",
+   e: [["f", "copie du réglage nginx"], ["f", "règle posée"], ["f", "nginx -t : réussi"], ["f", "xmlrpc → 403, accueil → 200"]],
+   pied: "les appels restent au journal (fail2ban, CrowdSec, diagrammes)"},
+  {etat: "fait", h: "05:12", t: "Effacer la session finie session-c63.scope", qui: "Cassandra",
+   p: "« Service en échec » : une session sudo du 5 octobre, terminée. Une session ne se redémarre pas, elle s’efface.",
+   e: [["f", "c’est une session, pas un service"], ["f", "reset-failed"], ["f", "0 unité en échec"]],
+   pied: "avant : elle avait demandé un humain — c’est fini"},
+  {etat: "fait", h: "04:58", t: "Refermer l’alerte « Santé 65/100 »", qui: "Cassandra",
+   p: "La santé est remontée à 90 ; l’alerte restait ouverte (verrou de base).",
+   e: [["f", "mesure revenue"], ["f", "alerte refermée"]], pied: ""},
+  {etat: "fait", h: "05:03", t: "Mettre en quarantaine vault_native_get_pour_agent", qui: "Cassandra · moteur d’évolution",
+   p: "Aucun usage en 30 jours. Le corps est mis de côté ; s’il est appelé, il revient seul.", e: [["f", "copie"], ["f", "quarantaine jusqu’au 08-01-2027"]],
+   pied: "retrait définitif seulement après 90 jours de silence"},
+  {etat: "cours", h: "depuis 04:12", t: "Veiller la sortie d’Authentik 2026.8.4", qui: "Itare, pour Cassandra",
+   p: "3 failles critiques dans Authentik (PyJWT, anyio, libxml2), à corriger par l’éditeur. Exposé sur Internet : priorité.",
+   e: [["c", "surveille les versions publiées"], ["a", "dès la sortie : sauvegarde, mise à jour, test de connexion"]],
+   pied: "Itare rend compte à Cassandra, qui décide"},
+  {etat: "plan", h: "dim. 04:00", t: "Freiner meta-externalagent sur maisonboheme.org", qui: "Cassandra",
+   p: "92 % du trafic du site vient de robots, 63 % d’un seul. Elle mesure une semaine de plus avant de limiter son débit.",
+   e: [["a", "mesure de référence"], ["a", "limite de débit nginx"], ["a", "vérifier que les humains passent"]], pied: ""}
+];
+const JOURNAL = [
+  {h: "06:28", qui: "root", par: "SSH depuis Hermès · Claude Code", quoi: "Déploiement de Cassandra (deploy.sh) — 3 fois depuis 05:34", type: "humain"},
+  {h: "06:01", qui: "root", par: "SSH depuis Hermès · Claude Code", quoi: "nginx : maisonboheme.org.includes modifié (bloc /xmlrpc.php), nginx rechargé", type: "humain",
+   arb: ["garde", "va dans le sens de sa politique (chemin sondé 61 906 fois) ; elle l’ajoute à ses règles"]},
+  {h: "05:03", qui: "Cassandra", par: "moteur d’évolution", quoi: "Quarantaine de vault_native_get_pour_agent", type: "cassandra"},
+  {h: "04:56", qui: "Drisse", par: "écran de Cassandra", quoi: "Sensorium : Trivy accepté jusqu’à hausse des critiques", type: "humain",
+   arb: ["garde", "l’acceptation entre dans ses seuils ; Itare garde la veille Authentik"]},
+  {h: "04:12", qui: "Itare", par: "pour Cassandra", quoi: "Veille Authentik 2026.8.4 ouverte", type: "itare"},
+  {h: "04:08", qui: "Drisse", par: "écran de Cassandra", quoi: "Lancer Trivy, lancer ClamAV", type: "humain"},
+  {h: "03:41", qui: "root", par: "SSH depuis Hermès · Claude Code", quoi: "Docker : vaultwarden/server mis à jour (1.37.4), sauvegarde dans /var/backups/cassandra/images-…", type: "humain",
+   arb: ["garde", "c’était sa propre mission en attente ; elle la marque faite et reprend la surveillance du coffre"]},
+  {h: "03:02", qui: "root", par: "SSH depuis Hermès · Claude Code", quoi: "Paquets : crowdsec, crowdsec-firewall-bouncer ; pare-feu : chaîne CROWDSEC_CHAIN en tête d’INPUT", type: "humain",
+   arb: ["garde", "le socle du pare-feu reste en place derrière ; elle surveille le videur"]},
+  {h: "01:17", qui: "Drisse", par: "FastPanel", quoi: "Compte système kkjoi_vvvv_usr supprimé (userdel)", type: "humain",
+   arb: ["garde", "compte de test, jamais connecté"]},
+  {h: "00:41", qui: "Drisse", par: "Freebox OS", quoi: "Box : DHCP — DNS 192.168.1.199 puis la box ; DNS IPv6 personnalisés", type: "humain",
+   arb: ["garde", "c’est le DNS local qu’elle sert ; elle surveille qu’il répond"]},
+  {h: "00:36", qui: "root", par: "SSH depuis Hermès · Claude Code", quoi: "Service cassandra-dns-local créé ; pare-feu : port 53 ouvert au réseau local", type: "humain",
+   arb: ["garde", "conforme ; ajouté à la carte d’exposition"]}
+];
+const REGLES = [
+  ["Mettre à jour une image Docker quand une version corrige une faille critique", "sauvegarde → mise à jour → santé → retour à l’ancienne si le service ne revient pas", "info", "LOT 1"],
+  ["Bloquer un chemin sondé en masse sur un site", "copie nginx → règle → nginx -t → contrôle de l’accueil ; retrait si le site casse", "info", "LOT 1"],
+  ["Effacer une session finie en échec, refermer une alerte orpheline", "l’état d’avant est noté", "info", "LOT 1"],
+  ["Bannir une adresse qui dépasse 1 000 attaques en une heure", "par CrowdSec, 7 jours ; jamais la maison ni le tailnet", "info", "LOT 1"],
+  ["Mettre en quarantaine un fichier signalé par ClamAV", "déplacé, jamais effacé ; remis en place si faux positif", "neutre", "LOT 2"],
+  ["Renouveler un certificat à moins de 14 jours", "certbot, puis contrôle du site", "neutre", "LOT 2"],
+  ["Freiner un robot qui dépasse la moitié du trafic d’un site", "limite de débit nginx, puis mesure", "neutre", "LOT 2"],
+  ["Procédure de crise", "photographie, confinement gradué, rapport — déclenchée par ses mesures", "neutre", "LOT 2"]
+];
+const SOURCES = [
+  ["Écran de Cassandra", "chaque geste (journal d’administration)", "ok", "BRANCHÉ"],
+  ["Itare et les agents", "journal des agents", "ok", "BRANCHÉ"],
+  ["La box", "changements lus par son API (DHCP, redirections, Wi-Fi…)", "ok", "BRANCHÉ"],
+  ["Commandes humaines sur les machines", "audit du noyau (auditd) : chaque commande d’une session SSH ou sudo, qui et quand", "warn", "À BRANCHER"],
+  ["Fichiers de réglage", "/etc, nginx, docker-compose : qui a changé quoi", "warn", "À BRANCHER"],
+  ["Docker", "créations, mises à jour, arrêts de conteneurs", "warn", "À BRANCHER"],
+  ["FastPanel", "ses actions laissent des fichiers et des comptes : vues par les deux lignes au-dessus", "warn", "PAR RICOCHET"]
+];
+const QUI = {cassandra: ["Cassandra", "info"], itare: ["Itare", "violet"], humain: ["Humain", "neutre"]};
+let filtre = "tout";
+function missions(){
+  const col = {fait: ["ok", "FAITE"], cours: ["warn", "EN COURS"], plan: ["neutre", "PLANIFIÉE"]};
+  document.getElementById("missions").innerHTML = MISSIONS.map(m => '<div class="mission"><div class="m-tete"><span class="pill ' + col[m.etat][0] + '">' + col[m.etat][1] + '</span><b>' + m.t + '</b><span class="heure">' + m.h + '</span></div>' +
+    '<div class="pourquoi"><span class="pill ' + (m.qui.startsWith("Itare") ? "violet" : "info") + '">' + m.qui + '</span> ' + m.p + '</div>' +
+    '<div class="etapes">' + m.e.map(e => '<span class="etape ' + e[0] + '"><i>' + ({f: "✓", c: "…", a: "·", r: "↺"}[e[0]]) + '</i>' + e[1] + '</span>').join("") + '</div>' +
+    '<div class="m-pied">' + (m.pied ? '<span>' + m.pied + '</span>' : '') + (m.etat === "fait" ? '<button class="btn">Défaire</button>' : m.etat === "plan" ? '<button class="btn">Faire maintenant</button>' : '<button class="btn">Voir le travail d’Itare</button>') + '</div></div>').join("");
+}
+function journal(){
+  document.getElementById("filtres").innerHTML = [["tout", "tout"], ["cassandra", "Cassandra"], ["itare", "Itare"], ["humain", "humains"], ["arb", "arbitrages"]]
+    .map(f => '<button class="' + (filtre === f[0] ? "on" : "") + '" onclick="filtre=\'' + f[0] + '\';journal()">' + f[1] + '</button>').join("");
+  const L = JOURNAL.filter(l => filtre === "tout" || l.type === filtre || (filtre === "arb" && l.arb));
+  document.getElementById("journal").innerHTML = L.map(l => '<div class="ligne"><span class="h">' + l.h + '</span><div class="qui"><b><span class="pill ' + QUI[l.type][1] + '">' + l.qui + '</span></b><span>' + l.par + '</span></div>' +
+    '<div class="quoi">' + l.quoi + (l.arb ? '<div class="arbitrage"><b>Cassandra ' + l.arb[0] + '</b> — ' + l.arb[1] + '</div>' : '') + '</div></div>').join("");
+}
+function listes(){
+  document.getElementById("regles").innerHTML = REGLES.map(r => '<div class="regle"><b>' + r[0] + '</b><span>' + r[1] + '</span><span class="pill ' + r[2] + '">' + r[3] + '</span></div>').join("");
+  document.getElementById("sources").innerHTML = SOURCES.map(s => '<div><b>' + s[0] + '</b><span>' + s[1] + '</span></div><span class="pill ' + s[2] + '">' + s[3] + '</span>').join("");
+}
+function theme(){ const r = document.documentElement, sombre = r.dataset.theme ? r.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; r.dataset.theme = sombre ? "light" : "dark"; }
+missions(); journal(); listes();
+</script>
+</body>
+</html>

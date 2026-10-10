@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sécurité — agir</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#eef1f5;--halo:#e9edf3;--surface:rgba(255,255,255,.66);--surface-solid:#fff;--txt-strong:#101828;--txt:#2b3646;--txt-soft:#5a6675;--txt-faint:#76808e;
+  --line:rgba(16,24,40,.09);--grid:rgba(16,24,40,.07);--accent:#0a726b;--ok:#047857;--warn:#b45309;--danger:#be123c;--s1:#0369a1;--s2:#7c3aed;
+  --shadow:0 1px 2px rgba(16,24,40,.04),0 8px 24px rgba(16,24,40,.06);
+}
+:root[data-theme="dark"]{
+  --bg:#1c2128;--halo:#22272e;--surface:rgba(45,51,59,.72);--surface-solid:#2d333b;--txt-strong:#e6edf3;--txt:#c9d1d9;--txt-soft:#adbac7;--txt-faint:#768390;
+  --line:rgba(173,186,199,.12);--grid:rgba(173,186,199,.09);--accent:#3ddbb0;--ok:#27c168;--warn:#e8c660;--danger:#ff4757;--s1:#1d9bd1;--s2:#8b5cf6;
+  --shadow:0 1px 2px rgba(0,0,0,.2),0 8px 24px rgba(0,0,0,.25);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg) radial-gradient(ellipse at 50% -25%,var(--halo),transparent 60%) no-repeat;color:var(--txt);font:14px/1.5 Inter,system-ui,sans-serif;padding:24px 16px 48px}
+.page{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:16px;transition:margin .2s}
+body.panneau .page{margin-right:max(16px,calc(420px + 16px))}
+@media (max-width:1000px){body.panneau .page{margin-right:auto}}
+.tete{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap}
+.tete h1{margin:0;font:600 22px "JetBrains Mono",monospace;color:var(--txt-strong)}
+.tete p{margin:2px 0 0;color:var(--txt-soft)}
+.bascule{border:1px solid var(--line);background:var(--surface);color:var(--txt);border-radius:10px;padding:6px 12px;cursor:pointer;font:500 12px "JetBrains Mono",monospace}
+.carte{background:var(--surface);backdrop-filter:blur(18px) saturate(160%);-webkit-backdrop-filter:blur(18px) saturate(160%);border-radius:16px;box-shadow:var(--shadow);padding:18px 20px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.c-tete{display:flex;align-items:center;gap:10px}
+.c-tete h2{margin:0;font:600 12px "JetBrains Mono",monospace;letter-spacing:.06em;text-transform:uppercase;color:var(--txt-soft)}
+.c-tete .ask{margin-left:auto}
+.sous{margin:-6px 0 0;font-size:12.5px;color:var(--txt-faint)}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media (max-width:860px){.g2{grid-template-columns:1fr}}
+/* barre de commande */
+.cmd{display:flex;gap:10px;align-items:center;background:var(--surface);border-radius:16px;box-shadow:var(--shadow);padding:10px 12px;border:1px solid transparent}
+.cmd:focus-within{border-color:var(--accent)}
+.cmd .sceau{width:30px;height:30px;border-radius:9px;background:var(--accent);color:var(--surface-solid);display:grid;place-items:center;font:700 14px "JetBrains Mono",monospace;flex:none}
+.cmd input{flex:1;border:0;background:transparent;color:var(--txt);font:14px Inter,sans-serif;outline:none}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{border:1px solid var(--line);background:transparent;color:var(--txt-soft);border-radius:999px;padding:3px 10px;font:500 12px Inter,sans-serif;cursor:pointer}
+.chip:hover{border-color:var(--accent);color:var(--accent)}
+.ask{border:1px solid var(--line);background:transparent;color:var(--accent);border-radius:9px;padding:3px 9px;font:600 11.5px "JetBrains Mono",monospace;cursor:pointer;display:inline-flex;gap:6px;align-items:center}
+.ask::before{content:"C";width:16px;height:16px;border-radius:5px;background:var(--accent);color:var(--surface-solid);display:grid;place-items:center;font-size:10px}
+.ask:hover{border-color:var(--accent)}
+.btn{border:1px solid var(--line);background:transparent;color:var(--txt);border-radius:9px;padding:3px 10px;font:500 12px Inter,sans-serif;cursor:pointer;white-space:nowrap}
+.btn:hover{border-color:var(--accent);color:var(--accent)} .btn.d:hover{border-color:var(--danger);color:var(--danger)}
+.leg{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:var(--txt-soft)} .leg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+svg text{font-family:"JetBrains Mono",monospace;fill:var(--txt-faint);font-size:11px} svg .val{fill:var(--txt);font-weight:600}
+svg .clic{cursor:pointer} svg .clic:hover path,svg .clic:hover rect{filter:brightness(1.12)}
+.astuce{font-size:12px;color:var(--txt-faint)} .astuce b{color:var(--accent)}
+/* lignes actionnables */
+.rows{display:flex;flex-direction:column}
+.row{display:grid;grid-template-columns:1fr auto;gap:4px 12px;padding:9px 0;border-bottom:1px solid var(--line);align-items:center;font-size:13px}
+.row .q{display:flex;flex-direction:column;gap:2px;min-width:0} .row .q span{font-size:12px;color:var(--txt-faint)}
+.row .a{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.pill{display:inline-block;font:600 10.5px "JetBrains Mono",monospace;letter-spacing:.05em;padding:2px 7px;border-radius:999px;border:1px solid currentColor;margin-right:6px}
+.pill.ok{color:var(--ok)}.pill.warn{color:var(--warn)}.pill.danger{color:var(--danger)}.pill.n{color:var(--txt-faint)}
+/* menu d'action */
+.menu{position:fixed;z-index:40;background:var(--surface-solid);border:1px solid var(--line);border-radius:12px;box-shadow:0 12px 32px rgba(16,24,40,.18);padding:6px;min-width:250px;display:none}
+.menu.on{display:block}
+.menu .t{font:600 11px "JetBrains Mono",monospace;color:var(--txt-faint);padding:6px 10px 4px;text-transform:uppercase;letter-spacing:.05em}
+.menu button{display:flex;width:100%;text-align:left;border:0;background:transparent;color:var(--txt);padding:7px 10px;border-radius:8px;font:13px Inter,sans-serif;cursor:pointer;gap:8px;align-items:center}
+.menu button:hover{background:var(--grid)} .menu button.c{color:var(--accent);font-weight:600}
+.menu hr{border:0;border-top:1px solid var(--line);margin:4px 0}
+/* panneau Cassandra */
+.pan{position:fixed;top:0;right:0;bottom:0;width:420px;max-width:100vw;background:var(--surface-solid);box-shadow:-12px 0 40px rgba(16,24,40,.16);z-index:30;display:flex;flex-direction:column;transform:translateX(105%);transition:transform .22s}
+body.panneau .pan{transform:none}
+.pan-h{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.pan-h .sceau{width:30px;height:30px;border-radius:9px;background:var(--accent);color:var(--surface-solid);display:grid;place-items:center;font:700 14px "JetBrains Mono",monospace}
+.pan-h b{color:var(--txt-strong)} .pan-h span{font-size:12px;color:var(--txt-faint);display:block}
+.pan-h .x{margin-left:auto;border:0;background:transparent;color:var(--txt-faint);font-size:20px;cursor:pointer}
+.ctx{margin:12px 16px 0;border:1px dashed var(--line);border-radius:10px;padding:8px 10px;font-size:12px;color:var(--txt-soft)}
+.ctx b{font:600 11px "JetBrains Mono",monospace;color:var(--txt-faint);display:block;margin-bottom:2px;text-transform:uppercase}
+.fil{flex:1;overflow:auto;padding:12px 16px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:92%;font-size:13.5px;line-height:1.5}
+.msg.moi{align-self:flex-end;background:var(--accent);color:var(--surface-solid);padding:8px 12px;border-radius:14px 14px 4px 14px}
+.msg.cas{align-self:flex-start;background:var(--grid);padding:10px 12px;border-radius:14px 14px 14px 4px}
+.msg.cas b{color:var(--txt-strong)}
+.pas{display:flex;flex-direction:column;gap:4px;margin-top:6px;font-size:12.5px}
+.pas div{display:flex;gap:8px;align-items:center} .pas i{font-style:normal;width:16px;height:16px;border-radius:50%;display:grid;place-items:center;font-size:10px;font-weight:700;color:var(--surface-solid);flex:none}
+.pas .f i{background:var(--ok)} .pas .c i{background:var(--warn)} .pas .a i{background:var(--txt-faint)}
+.res{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
+.saisie{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--line)}
+.saisie input{flex:1;border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:transparent;color:var(--txt);font:13.5px Inter,sans-serif;outline:none}
+.saisie input:focus{border-color:var(--accent)}
+.saisie button{border:0;background:var(--accent);color:var(--surface-solid);border-radius:10px;padding:0 14px;font:600 13px Inter,sans-serif;cursor:pointer}
+.tip{position:fixed;pointer-events:none;background:var(--surface-solid);color:var(--txt);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:10px;padding:8px 10px;font-size:12.5px;opacity:0;z-index:50;max-width:260px}
+.mq{border:1px dashed var(--line);border-radius:12px;padding:10px 12px;font-size:12.5px;color:var(--txt-soft)}
+
+.toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(20px);background:var(--surface-solid);color:var(--txt);border:1px solid var(--line);box-shadow:0 12px 32px rgba(16,24,40,.18);border-radius:12px;padding:10px 14px;font-size:13px;opacity:0;transition:all .2s;z-index:60;display:flex;gap:10px;align-items:center}
+.toast.on{opacity:1;transform:translateX(-50%)} .toast i{font-style:normal;color:var(--ok);font-weight:700}
+.geste{display:grid;grid-template-columns:48px 1fr;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px}
+.geste .h{font:500 12px "JetBrains Mono",monospace;color:var(--txt-faint);padding-top:2px}
+.geste .note{margin-top:4px;font-size:12px;color:var(--txt-soft);border-left:2px solid var(--accent);padding-left:8px}
+.geste .note b{color:var(--accent)} .attente{color:var(--txt-faint);font-style:italic}
+.btn.direct{font-weight:600}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="tete">
+    <div><h1>Sécurité — en images, et on agit</h1><p>MAQUETTE · la page « En images » avec ce qui lui manquait : parler à Cassandra et agir depuis chaque élément · les chiffres viennent d’Orion, les réponses de Cassandra sont des exemples écrits pour la maquette</p></div>
+    <button class="bascule" onclick="theme()">clair / sombre</button>
+  </div>
+
+  <!-- La barre de commande -->
+  <div class="cmd"><span class="sceau">C</span><input id="cmd" placeholder="Dis à Cassandra ce qu’elle doit faire… (ex. « ferme tout ce qui est ouvert au réseau local sauf le DNS »)" onkeydown="if(event.key==='Enter'&&this.value.trim()){demander('Onglet Sécurité', this.value.trim()); this.value='';}"></div>
+  <div class="chips">
+    <button class="chip" onclick="scenario('audit')">Fais un audit et corrige ce que tu peux</button>
+    <button class="chip" onclick="scenario('pic')">Pourquoi le pic du 30-09 ?</button>
+    <button class="chip" onclick="scenario('maj')">Mets à jour les images en retard</button>
+    <button class="chip" onclick="scenario('crise')">Je crois qu’on m’attaque</button>
+  </div>
+  <p class="astuce">Deux sortes de boutons : les <b>gestes directs</b> (Bannir, Fermer, Mettre à jour…) s’exécutent tout de suite et Cassandra en est informée ; le bouton <b>C</b> et les entrées « Cassandra, … » ouvrent une conversation pour ce qui demande son jugement.</p>
+
+
+  <section class="carte">
+    <div class="c-tete"><h2>Tes gestes, et ce que Cassandra en sait</h2></div>
+    <p class="sous">Un geste direct s’exécute aussitôt, sans conversation. Cassandra le reçoit dans sa perception et en prend acte à son passage suivant — sans jamais le bloquer.</p>
+    <div id="gestes"><div class="geste"><span class="h">—</span><span class="attente">Clique un geste (Bannir, Fermer, Mettre à jour…) : il apparaît ici, puis la note de Cassandra.</span></div></div>
+  </section>
+  <section class="carte">
+    <div class="c-tete"><h2>Les attaques, jour par jour</h2><button class="ask" onclick="demander('Les attaques, jour par jour', '')">Cassandra</button></div>
+    <p class="sous">Clique une barre : comprendre ce jour-là, ou bannir ceux qui l’ont fait.</p>
+    <div class="leg"><span><i style="background:var(--s1)"></i>Sondes d’effraction</span><span><i style="background:var(--s2)"></i>Mots de passe refusés</span></div>
+    <svg id="barres" viewBox="0 0 1100 250" width="100%"></svg>
+  </section>
+
+  <div class="g2">
+    <section class="carte">
+      <div class="c-tete"><h2>Qui attaque le plus</h2><button class="ask" onclick="demander('Qui attaque le plus', '')">Cassandra</button></div>
+      <p class="sous">10 jours, depuis les journaux. Chaque adresse se bannit, s’explique ou se met en liste blanche.</p>
+      <div class="rows" id="ips"></div>
+    </section>
+    <section class="carte">
+      <div class="c-tete"><h2>Ce qu’ils cherchent</h2><button class="ask" onclick="demander('Ce qu’ils cherchent', '')">Cassandra</button></div>
+      <p class="sous">Clique un chemin pour le fermer sur un site, ou partout.</p>
+      <svg id="chemins" viewBox="0 0 520 230" width="100%"></svg>
+    </section>
+  </div>
+
+  <div class="g2">
+    <section class="carte">
+      <div class="c-tete"><h2>Failles des images Docker</h2><button class="ask" onclick="demander('Failles des images Docker', '')">Cassandra</button></div>
+      <div class="rows" id="images"></div>
+    </section>
+    <section class="carte">
+      <div class="c-tete"><h2>Qui peut joindre quoi</h2><button class="ask" onclick="demander('Qui peut joindre quoi', '')">Cassandra</button></div>
+      <div class="rows" id="expo"></div>
+    </section>
+  </div>
+
+  <div class="g2">
+    <section class="carte">
+      <div class="c-tete"><h2>Robots et humains</h2><button class="ask" onclick="demander('Robots et humains', '')">Cassandra</button></div>
+      <div class="rows" id="robots"></div>
+    </section>
+    <section class="carte">
+      <div class="c-tete"><h2>Courriel et certificats</h2><button class="ask" onclick="demander('Courriel et certificats', '')">Cassandra</button></div>
+      <div class="rows" id="courriel"></div>
+    </section>
+  </div>
+
+  <div class="mq"><b>Comment ça marche :</b> chaque bouton est une demande à Cassandra — c’est elle qui exécute (sauvegarde avant, contrôle après, retour arrière si ça casse), elle le note au journal, et elle reste libre de faire les mêmes gestes seule. Rien n’attend une validation : ton mot de passe administrateur n’est demandé qu’une fois par session pour ouvrir les gestes. <b>À trancher :</b> ce mot de passe une fois par session (ou jamais) ; la liste des gestes de chaque carte ; le panneau à droite ou en bas sur téléphone.</div>
+</div>
+
+<div class="menu" id="menu"></div>
+<aside class="pan" id="pan">
+  <div class="pan-h"><span class="sceau">C</span><div><b>Cassandra</b><span id="pan-sous">à ton écoute</span></div><button class="x" onclick="fermer()">×</button></div>
+  <div class="ctx" id="ctx"><b>Contexte</b>—</div>
+  <div class="fil" id="fil"></div>
+  <div class="saisie"><input id="saisie" placeholder="Écris à Cassandra…" onkeydown="if(event.key==='Enter')envoyer()"><button onclick="envoyer()">Envoyer</button></div>
+</aside>
+<div class="tip" id="tip"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+const JOURS = [["29-09",3859,386],["30-09",29094,2],["01-10",4304,152],["02-10",3092,281],["03-10",4056,338],["04-10",3285,280],["05-10",9110,680],
+  ["06-10",4208,433],["07-10",7658,324],["08-10",5728,1160],["09-10",5057,247],["10-10",284,11]];
+const IPS = [["203.0.113.11", 10001, "le 30-09 seulement"], ["203.0.113.12", 4725, "07-10 17 h · Google Cloud"], ["203.0.113.15", 4725, "07-10 17 h · Google Cloud"],
+  ["203.0.113.13", 4725, "07-10 17 h"], ["203.0.113.14", 1601, "un jour"]];
+const CHEMINS = [["/xmlrpc.php", 61906, "fermé le 10-10 sur maisonboheme.org"], ["/.git", 558], ["/.env", 370], ["/api", 321], ["/@fs", 266], ["/cgi-bin", 251], ["/.env.local", 194]];
+const NS = "http://www.w3.org/2000/svg", tip = document.getElementById("tip"), menuEl = document.getElementById("menu");
+const el = (n, a, p) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); if (p) p.appendChild(e); return e; };
+const fr = n => n.toLocaleString("fr-FR");
+function survol(node, html){ node.addEventListener("mousemove", e => { tip.innerHTML = html; tip.style.opacity = 1; tip.style.left = Math.min(e.clientX + 14, innerWidth - 270) + "px"; tip.style.top = (e.clientY + 14) + "px"; });
+  node.addEventListener("mouseleave", () => tip.style.opacity = 0); }
+// ── le menu d'action ──────────────────────────────────────────────────────
+function menu(e, titre, items){
+  e.stopPropagation(); tip.style.opacity = 0;
+  menuEl.innerHTML = '<div class="t">' + titre + '</div>' + items.map((it, i) => it === "-" ? "<hr>" : '<button class="' + (it[2] || "") + '" data-i="' + i + '">' + it[0] + '</button>').join("");
+  menuEl.querySelectorAll("button").forEach(b => b.onclick = () => { menuEl.classList.remove("on"); items[+b.dataset.i][1](); });
+  menuEl.classList.add("on");
+  const r = menuEl.getBoundingClientRect();
+  menuEl.style.left = Math.min(e.clientX, innerWidth - r.width - 12) + "px"; menuEl.style.top = Math.min(e.clientY + 6, innerHeight - r.height - 12) + "px";
+}
+document.addEventListener("click", () => menuEl.classList.remove("on"));
+
+// ── le geste direct : exécuté tout de suite, Cassandra informée ────────────
+let toastT = null;
+function direct(quoi, detail, note){
+  const t = document.getElementById("toast");
+  t.innerHTML = "<i>✓</i><span><b>" + quoi + "</b> — fait. Cassandra est informée.</span><button class='btn'>Défaire</button>";
+  t.classList.add("on"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("on"), 4200);
+  const g = document.getElementById("gestes"), h = new Date().toTimeString().slice(0, 5);
+  if (g.querySelector(".attente")) g.innerHTML = "";
+  const d = document.createElement("div"); d.className = "geste";
+  d.innerHTML = "<span class='h'>" + h + "</span><div><b>Drisse</b> · " + quoi + "<div style='color:var(--txt-faint);font-size:12px'>" + detail + "</div><div class='note attente'>Cassandra en prend acte…</div></div>";
+  g.prepend(d);
+  setTimeout(() => { const n = d.querySelector(".note"); n.classList.remove("attente"); n.innerHTML = "<b>Cassandra :</b> " + note; }, 1600);
+}
+// ── le panneau ────────────────────────────────────────────────────────────
+function ouvrir(ctx){ document.body.classList.add("panneau"); document.getElementById("ctx").innerHTML = "<b>Contexte transmis</b>" + ctx; }
+function fermer(){ document.body.classList.remove("panneau"); }
+function dire(cls, html){ const f = document.getElementById("fil"), d = document.createElement("div"); d.className = "msg " + cls; d.innerHTML = html; f.appendChild(d); f.scrollTop = f.scrollHeight; return d; }
+function etapes(msg, liste, fin){
+  // les étapes se cochent une à une, comme Cassandra les fait
+  const p = document.createElement("div"); p.className = "pas"; msg.appendChild(p);
+  liste.forEach((t, i) => setTimeout(() => { const d = document.createElement("div"); d.className = "c"; d.innerHTML = "<i>…</i>" + t; p.appendChild(d);
+    setTimeout(() => { d.className = "f"; d.querySelector("i").textContent = "✓"; if (i === liste.length - 1 && fin) setTimeout(() => fin(msg), 300); }, 550); }, i * 700));
+}
+function demander(carte, texte){
+  ouvrir("Carte « " + carte + " » — ses chiffres du moment.");
+  document.getElementById("fil").innerHTML = "";
+  if (texte){ dire("moi", texte); setTimeout(() => dire("cas", "Compris. Je m’en occupe et je te rends compte ici."), 400); }
+  else dire("cas", "Je regarde <b>" + carte + "</b>. Que veux-tu que je fasse ? Je peux expliquer un chiffre, agir sur une ligne, ou corriger tout ce qui le mérite.");
+  document.getElementById("saisie").focus();
+}
+function envoyer(){ const i = document.getElementById("saisie"), t = i.value.trim(); if (!t) return; i.value = ""; dire("moi", t);
+  setTimeout(() => { const m = dire("cas", "Je m’en occupe."); etapes(m, ["je lis ce qu’il faut", "j’agis", "je vérifie"], x => { x.insertAdjacentHTML("beforeend", "<div style='margin-top:6px'>C’est fait. Tout est au journal ; <b>Défaire</b> reste possible.</div>"); }); }, 400); }
+// ── les scénarios (ce que Cassandra répondrait, avec les vraies données) ──
+function scenario(k){
+  document.getElementById("fil").innerHTML = "";
+  if (k === "pic"){
+    ouvrir("Barre du 30-09 · 29 094 sondes · 2 mots de passe refusés.");
+    dire("moi", "Pourquoi le pic du 30-09 ?");
+    setTimeout(() => { const m = dire("cas", "Je regarde les journaux de ce jour-là.");
+      etapes(m, ["journaux des sites du 30-09", "adresses classées par volume", "chemins visés"], x => x.insertAdjacentHTML("beforeend",
+        "<div style='margin-top:6px'><b>Une seule adresse fait le tiers du pic : 203.0.113.11</b> — 10 001 des 29 094 attaques de ce jour-là, et aucune un autre jour. Le reste vient de centaines d’adresses.</div>" +
+        "<div class='res'><button class='btn' onclick=\"scenario('bannir')\">Bannis-la quand même</button><button class='btn'>D’où vient-elle ?</button></div>")); }, 400);
+  }
+  if (k === "bannir"){
+    ouvrir("Adresse 203.0.113.11 · 10 001 attaques · 30-09.");
+    dire("moi", "Bannis 203.0.113.11.");
+    setTimeout(() => { const m = dire("cas", "Je la bannis.");
+      etapes(m, ["elle n’est ni la maison, ni le tailnet, ni une adresse de confiance", "décision CrowdSec : bannie 30 jours", "le pare-feu l’applique (chaîne CROWDSEC)", "contrôle : elle est bien dans la liste"], x => x.insertAdjacentHTML("beforeend",
+        "<div style='margin-top:6px'>Bannie jusqu’au 09-11. Je l’ai notée au journal, à ton nom.</div><div class='res'><button class='btn'>Défaire</button><button class='btn'>Bannis aussi celles du 07-10</button></div>")); }, 400);
+  }
+  if (k === "maj"){
+    ouvrir("Failles des images : Vaultwarden 4 critiques, Authentik 3, Postgres 1.");
+    dire("moi", "Mets à jour les images en retard.");
+    setTimeout(() => { const m = dire("cas", "Je vérifie s’il existe des versions plus récentes.");
+      etapes(m, ["Vaultwarden : 1.37.4, déjà la dernière", "Authentik : 2026.8.3, déjà la dernière", "Postgres 16 : déjà la dernière image"], x => x.insertAdjacentHTML("beforeend",
+        "<div style='margin-top:6px'>Rien à mettre à jour aujourd’hui : les 8 failles critiques attendent leurs éditeurs. <b>Je surveille</b> les sorties (Itare en a la veille) et je mettrai à jour dès qu’une version les corrige — sauvegarde, mise à jour, contrôle, retour arrière si besoin.</div>")); }, 400);
+  }
+  if (k === "audit"){
+    ouvrir("Toute la sécurité d’Orion.");
+    dire("moi", "Fais un audit et corrige ce que tu peux.");
+    setTimeout(() => { const m = dire("cas", "J’y vais. Je corrige ce qui est sûr et réversible, je te liste le reste.");
+      etapes(m, ["exposition : 3 services au réseau local, conformes", "pare-feu : refuse par défaut, socle en place", "courriel : SPF de cassandra.center sans cette machine → enregistrement corrigé écrit", "DMARC en surveillance sur 2 domaines → passage en quarantaine préparé", "Lynis : 4 conseils sans risque appliqués (noyau, SSH)", "box : WPS actif → à couper (droit « réglages » de la box manquant)"], x => x.insertAdjacentHTML("beforeend",
+        "<div style='margin-top:6px'><b>Fait :</b> 4 réglages durcis, enregistrements DNS écrits. <b>Il me manque</b> : l’accès à la zone DNS (pour poser SPF et DMARC moi-même) et le droit « réglages » sur la box (pour couper le WPS). Donne-les-moi et je finis seule.</div>")); }, 400);
+  }
+  if (k === "crise"){
+    ouvrir("Procédure de crise.");
+    dire("moi", "Je crois qu’on m’attaque.");
+    setTimeout(() => { const m = dire("cas", "Je photographie la machine d’abord, puis je contiens.");
+      etapes(m, ["sessions ouvertes : 2 (toi sur Hermès, root par Tailscale)", "connexions sortantes inhabituelles : aucune", "clés SSH ajoutées depuis 24 h : aucune", "fichiers système modifiés : nginx (xmlrpc, 06:01 — c’était nous)", "processus inconnus : aucun", "bannissements : 8 adresses actives"], x => x.insertAdjacentHTML("beforeend",
+        "<div style='margin-top:6px'><b>Rien n’indique une intrusion.</b> Je reste en veille renforcée une heure (relevés toutes les minutes).</div><div class='res'><button class='btn d'>Confine quand même (niveau 2)</button><button class='btn'>Rapport complet</button></div>")); }, 400);
+  }
+}
+// ── le dessin, avec les points d'action ───────────────────────────────────
+function barres(){
+  const s = document.getElementById("barres"); s.innerHTML = ""; const W = 1100, H = 250, g = {l: 60, r: 12, t: 22, b: 30}, iw = W - g.l - g.r, ih = H - g.t - g.b, max = 12000;
+  [0, 3000, 6000, 9000, 12000].forEach(v => { const y = g.t + ih - ih * v / max; el("line", {x1: g.l, x2: W - g.r, y1: y, y2: y, stroke: "var(--grid)"}, s); const t = el("text", {x: g.l - 8, y: y + 4, "text-anchor": "end"}, s); t.textContent = fr(v); });
+  const bw = iw / JOURS.length, larg = Math.min(46, bw * .62);
+  JOURS.forEach((j, i) => { const coupe = j[1] + j[2] > max, x = g.l + bw * i + (bw - larg) / 2, base = g.t + ih;
+    const h2 = coupe ? 3 : ih * j[2] / max, h1 = coupe ? ih - h2 - 2 : ih * j[1] / max;
+    const grp = el("g", {class: "clic"}, s); el("rect", {x: x - 6, y: g.t, width: larg + 12, height: ih, fill: "transparent"}, grp);
+    el("path", {d: "M" + x + "," + base + "V" + (base - h1) + "H" + (x + larg) + "V" + base + "Z", fill: "var(--s1)"}, grp);
+    el("path", {d: "M" + x + "," + (base - h1 - 2) + "V" + (base - h1 - h2 - 2 + 3) + "Q" + x + "," + (base - h1 - h2 - 2) + " " + (x + 3) + "," + (base - h1 - h2 - 2) + "H" + (x + larg - 3) + "Q" + (x + larg) + "," + (base - h1 - h2 - 2) + " " + (x + larg) + "," + (base - h1 - h2 - 2 + 3) + "V" + (base - h1 - 2) + "Z", fill: "var(--s2)"}, grp);
+    if (coupe){ el("rect", {x: x - 2, y: g.t + ih * .2, width: larg + 4, height: 5, fill: "var(--surface-solid)"}, grp); const v = el("text", {x: x + larg / 2, y: g.t - 6, "text-anchor": "middle", class: "val"}, s); v.textContent = fr(j[1] + j[2]) + " ↑"; }
+    const l = el("text", {x: x + larg / 2, y: H - 10, "text-anchor": "middle"}, s); l.textContent = j[0];
+    survol(grp, "<b>" + j[0] + "</b><br>" + fr(j[1]) + " sondes · " + fr(j[2]) + " mots de passe refusés<br><i>clic : agir</i>");
+    grp.addEventListener("click", e => menu(e, "Le " + j[0] + " · " + fr(j[1] + j[2]) + " attaques", [
+      ["Cassandra, pourquoi ce jour-là ?", () => scenario(j[0] === "30-09" ? "pic" : "pic"), "c"],
+      ["Bannir les adresses les plus actives de ce jour", () => scenario("bannir")],
+      ["Voir les lignes du journal", () => demander("Journal du " + j[0], "Montre-moi le journal du " + j[0] + ".")]]));
+  });
+}
+function ips(){
+  document.getElementById("ips").innerHTML = IPS.map((p, i) => '<div class="row"><div class="q"><b class="mono" style="font-family:JetBrains Mono,monospace">' + p[0] + '</b><span>' + fr(p[1]) + ' attaques · ' + p[2] + '</span></div><div class="a">' +
+    '<button class="btn d direct" onclick="direct(\'Bannir ' + p[0] + '\', \'CrowdSec, 30 jours · ' + fr(p[1]) + ' attaques\', \'vu. Je la garde dans ma surveillance des bannies ; si sa plage revient, je bannis la plage.\')">Bannir</button><button class="btn" onclick="menu(event, \'' + p[0] + '\', MENU_IP)">…</button></div></div>').join("");
+}
+const MENU_IP = [["Cassandra, qui est-ce ?", () => demander("Qui attaque le plus", "Qui est cette adresse, et que cherchait-elle ?"), "c"], ["Bannir 30 jours", () => direct("Bannir l’adresse", "CrowdSec, 30 jours", "vu. Elle rejoint ma surveillance des bannies.")], ["Bannir toute sa plage (/24)", () => direct("Bannir la plage /24", "CrowdSec, 30 jours", "vu. J’ai vérifié qu’aucun de tes services n’y vit.")],
+  ["Bannir son pays", () => direct("Bannir le pays", "CrowdSec, décision par pays", "vu. Un pays entier peut couper un visiteur légitime : je surveille les refus sur tes sites.")], "-", ["Mettre en liste blanche", () => direct("Mettre en liste blanche", "jamais bannie désormais", "vu. Je l’ajoute aux adresses de confiance et je cesse de la compter comme attaquante.")]];
+function chemins(){
+  const s = document.getElementById("chemins"); s.innerHTML = ""; const x0 = 120, w = 300, max = 1200;
+  CHEMINS.forEach((c, i) => { const y = 6 + i * 30, coupe = c[1] > max, l = w * Math.min(c[1], max) / max;
+    const t = el("text", {x: x0 - 10, y: y + 13, "text-anchor": "end", style: "fill:var(--txt-soft)"}, s); t.textContent = c[0];
+    const g = el("g", {class: "clic"}, s); el("rect", {x: x0, y: y, width: 400, height: 18, fill: "transparent"}, g);
+    el("path", {d: "M" + x0 + "," + y + "H" + (x0 + l - 4) + "Q" + (x0 + l) + "," + y + " " + (x0 + l) + "," + (y + 4) + "V" + (y + 14) + "Q" + (x0 + l) + "," + (y + 18) + " " + (x0 + l - 4) + "," + (y + 18) + "H" + x0 + "Z", fill: coupe ? "var(--warn)" : "var(--s1)"}, g);
+    const v = el("text", {x: x0 + l + 6, y: y + 13, class: "val"}, s); v.textContent = fr(c[1]) + (coupe ? " ↑" : "") + (c[2] ? " · fermé" : "");
+    survol(g, "<b>" + c[0] + "</b><br>" + fr(c[1]) + " appels" + (c[2] ? "<br>" + c[2] : "") + "<br><i>clic : agir</i>");
+    g.addEventListener("click", e => menu(e, c[0], [["Fermer sur tous les sites", () => direct("Fermer " + c[0] + " partout", "nginx : règle posée, testée, rechargée · accueils contrôlés", "vu. Je l’ajoute à mes chemins fermés et je surveille qu’aucun site n’en souffre.")],
+      ["Fermer sur maisonboheme.org", () => direct("Fermer " + c[0] + " sur maisonboheme.org", "nginx : règle posée, testée, rechargée", "vu.")], ["Cassandra, ce chemin sert-il à un de mes sites ?", () => demander("Ce qu’ils cherchent", "Est-ce que " + c[0] + " sert à un de mes sites ?"), "c"]]));
+  });
+}
+function lignes(){
+  const R = (id, rows) => document.getElementById(id).innerHTML = rows.map(r => '<div class="row"><div class="q"><b><span class="pill ' + r[0] + '">' + r[1] + '</span>' + r[2] + '</b><span>' + r[3] + '</span></div><div class="a">' + r[4] + '</div></div>').join("");
+  const B = (t, a, c) => '<button class="btn' + (c ? " " + c : "") + '" onclick="' + a + '">' + t + '</button>';
+  R("images", [["warn", "4 CRIT.", "vaultwarden/server", "1.37.4 · la dernière · 62 hautes", B("Mettre à jour", "direct('Mettre à jour vaultwarden', 'déjà la dernière version : rien à faire', 'vu. Rien à faire aujourd’hui ; je mettrai à jour à la prochaine version.')", "direct") + B("C · Expliquer", "demander('Failles des images Docker','Explique les failles de Vaultwarden.')")],
+    ["warn", "3 CRIT.", "goauthentik/server 2026.8.3", "la dernière · PyJWT, anyio, libxml2", B("Mettre à jour", "scenario('maj')") + B("Surveiller la sortie", "demander('Failles des images Docker','Préviens-moi et mets à jour dès que 2026.8.4 sort.')")],
+    ["warn", "1 CRIT.", "postgres:16-alpine", "gosu (Go) · non exposé", B("Mettre à jour", "scenario('maj')")],
+    ["ok", "0", "searxng · valkey", "aucune faille", ""]]);
+  R("expo", [["ok", "INTERNET", "Sites web (80/443)", "redirigés par la box · nginx", B("Ne garder que la maison", "demander('Qui peut joindre quoi','Rends les sites joignables de la maison seulement.')", "d")],
+    ["ok", "RÉSEAU", "DNS local (53)", "le réseau de la maison", B("Fermer", "demander('Qui peut joindre quoi','Ferme le DNS local au réseau.')", "d")],
+    ["ok", "PARC", "Grafana (3000)", "le parc et Tailscale", B("Limiter à la machine", "direct('Limiter Grafana à la machine', 'écoute sur 127.0.0.1, redémarré, contrôlé', 'vu. Mis à jour sur ma carte d’exposition.')", "direct") + B("Arrêter", "direct('Arrêter Grafana', 'service arrêté et désactivé', 'vu. Prometheus l’alimentait encore : je le garde, je te dirai s’il devient inutile.')", "d direct")],
+    ["ok", "PARC", "avahi (5353)", "découverte réseau · sensible", B("Arrêter", "direct('Arrêter avahi', 'service arrêté et désactivé', 'vu. Plus de découverte réseau d’Orion.')", "d direct")]]);
+  R("robots", [["warn", "92 %", "maisonboheme.org", "1,4 M requêtes de robots · meta-externalagent en tête", B("Freiner ce robot", "direct('Freiner meta-externalagent', 'nginx : 1 requête/s pour ce robot sur maisonboheme.org', 'vu. Je mesure l’effet une semaine : si le trafic des humains bouge, je te le dis.')", "direct") + B("Bloquer", "direct('Bloquer meta-externalagent', 'nginx : 403 pour ce robot', 'vu. C’est le robot qui collecte pour l’IA de Meta ; les aperçus de liens Facebook (facebookexternalhit) ne sont pas touchés.')", "d direct")],
+    ["ok", "27 %", "auth.cassandra.center", "2 439 requêtes", B("Expliquer", "demander('Robots et humains','Pourquoi 27 % de robots sur auth ?')")]]);
+  R("courriel", [["warn", "SPF", "cassandra.center", "souple, sans cette machine", B("Corriger", "scenario('audit')")],
+    ["danger", "DKIM", "maisonboheme.org", "aucune signature (OVH)", B("Me guider", "demander('Courriel et certificats','Comment activer DKIM chez OVH ?')")],
+    ["warn", "DMARC", "les 2 domaines", "en surveillance seulement", B("Passer en quarantaine", "scenario('audit')")],
+    ["ok", "79 j", "certificats", "6 domaines · Let’s Encrypt", B("Renouveler maintenant", "direct('Renouveler les certificats', 'Let’s Encrypt : 6 domaines, sites contrôlés', 'vu.')", "direct")]]);
+}
+function theme(){ const r = document.documentElement, sombre = r.dataset.theme ? r.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches; r.dataset.theme = sombre ? "light" : "dark"; barres(); chemins(); }
+barres(); ips(); chemins(); lignes();
+</script>
+</body>
+</html>

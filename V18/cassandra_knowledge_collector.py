@@ -4394,6 +4394,7 @@ def _secu_tables(k):
     k.execute("CREATE TABLE IF NOT EXISTS secu_heure (jour TEXT, heure INTEGER, attaques INTEGER DEFAULT 0, PRIMARY KEY (jour, heure))")
     k.execute("CREATE TABLE IF NOT EXISTS secu_chemin (jour TEXT, chemin TEXT, n INTEGER DEFAULT 0, PRIMARY KEY (jour, chemin))")
     k.execute("CREATE TABLE IF NOT EXISTS secu_ip (jour TEXT, ip TEXT, n INTEGER DEFAULT 0, PRIMARY KEY (jour, ip))")
+    k.execute("CREATE TABLE IF NOT EXISTS secu_robot (jour TEXT, site TEXT, robot TEXT, n INTEGER DEFAULT 0, PRIMARY KEY (jour, site, robot))")
     k.execute("CREATE TABLE IF NOT EXISTS world_meta (cle TEXT PRIMARY KEY, valeur TEXT)")
 
 
@@ -4424,8 +4425,11 @@ def _secu_compter(site: str, lignes, acc: dict):
         jour = "%s-%02d-%s" % (yy, _MOIS.get(mo, 0), dd)
         j = acc["jour"].setdefault((jour, site), [0, 0, 0, 0, 0])
         j[0] += 1
-        if _ROBOT_RE.search(ua):
+        rb = _ROBOT_RE.search(ua)
+        if rb:
             j[1] += 1
+            cle = (jour, site, rb.group(0).lower()[:40])
+            acc.setdefault("robot", {})[cle] = acc.setdefault("robot", {}).get(cle, 0) + 1
         if c.startswith("5"):
             j[4] += 1
         attaque = False
@@ -4454,6 +4458,9 @@ def _secu_ecrire(k, acc: dict):
         k.execute("INSERT INTO secu_heure (jour, heure, attaques) VALUES (?,?,?) ON CONFLICT(jour, heure) DO UPDATE SET attaques=attaques+excluded.attaques", (jour, h, n))
     for (jour, p), n in acc["chemin"].items():
         k.execute("INSERT INTO secu_chemin (jour, chemin, n) VALUES (?,?,?) ON CONFLICT(jour, chemin) DO UPDATE SET n=n+excluded.n", (jour, p, n))
+    for (jour, site, robot), n in acc.get("robot", {}).items():
+        k.execute("INSERT INTO secu_robot (jour, site, robot, n) VALUES (?,?,?,?) ON CONFLICT(jour, site, robot) DO UPDATE SET n=n+excluded.n",
+                  (jour, site, robot, n))
     for (jour, ip), n in acc["ip"].items():
         k.execute("INSERT INTO secu_ip (jour, ip, n) VALUES (?,?,?) ON CONFLICT(jour, ip) DO UPDATE SET n=n+excluded.n", (jour, ip, n))
 
@@ -4487,7 +4494,7 @@ def collect_securite_historique() -> list:
             etat = {r[0][9:]: r[1] for r in k.execute("SELECT cle, valeur FROM world_meta WHERE cle LIKE 'secu_log:%'")}
             premier = not etat
             for site, chemin in _journaux_acces().items():
-                acc = {"jour": {}, "heure": {}, "chemin": {}, "ip": {}}
+                acc = {"jour": {}, "heure": {}, "chemin": {}, "ip": {}, "robot": {}}
                 try:
                     st = os.stat(chemin)
                 except OSError:
@@ -4519,7 +4526,7 @@ def collect_securite_historique() -> list:
                 k.execute("INSERT OR REPLACE INTO world_meta (cle, valeur) VALUES (?,?)", ("secu_log:" + chemin, "%d:%d" % (st.st_ino, fin)))
                 k.commit()
             limite = (datetime.now() - timedelta(days=_SECU_GARDE_JOURS)).strftime("%Y-%m-%d")
-            for t in ("secu_jour", "secu_heure", "secu_chemin", "secu_ip"):
+            for t in ("secu_jour", "secu_heure", "secu_chemin", "secu_ip", "secu_robot"):
                 k.execute("DELETE FROM %s WHERE jour < ?" % t, (limite,))
             k.commit()
         finally:

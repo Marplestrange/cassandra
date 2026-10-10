@@ -441,7 +441,10 @@ def lancer_crowdsec():
             continue
         origines[c[1]] = origines.get(c[1], 0) + 1
         if c[1] in ("crowdsec", "cscli"):
-            locales.append({"ip": c[2], "raison": c[3], "action": c[4], "expire": c[8] if len(c) > 8 else ""})
+            # La colonne « ip » porte la portée en préfixe (« Ip:1.2.3.4 », « Range:… », « Country:FR »).
+            portee, _, valeur = c[2].partition(":") if ":" in c[2] and c[2].split(":", 1)[0] in ("Ip", "Range", "Country", "AS") else ("Ip", "", c[2])
+            locales.append({"ip": valeur, "portee": portee.lower(), "raison": c[3], "action": c[4], "expire": c[8] if len(c) > 8 else "",
+                            "origine": c[1]})
     rc, o = sh(["cscli", "alerts", "list", "--since", "24h", "-o", "json"], timeout=120)
     try:
         alertes = json.loads(o) or []
