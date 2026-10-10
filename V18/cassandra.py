@@ -4917,6 +4917,9 @@ def _itare_vision_creds() -> tuple:
 
     Un Desk que personne n'a réglé reste donc ENTIÈREMENT dans l'instance.
     """
+    _lie = modele_role_creds("vision")           # registre de modèles (10-10) : un rôle lié prime
+    if _lie:
+        return _lie[0], _lie[1], _lie[2]
     cfg = get_cassandra_config()
     prov = str(cfg.get("itare_vision_provider") or "").strip()
     model = str(cfg.get("itare_vision_model") or "").strip()
@@ -4967,6 +4970,9 @@ def _itare_agent_creds() -> tuple:
     Retourne (key, model, base_url) pour ITARE CITADELLE — celui qui parle à
     Cassandra. Lit `itare_citadelle_*`, et `itare_*` en repli.
     """
+    _lie = modele_role_creds("itare_citadelle")  # registre de modèles (10-10) : un rôle lié prime
+    if _lie:
+        return _lie[0], _lie[1], _lie[2]
     cfg      = get_cassandra_config()
     # Sans réglage propre, Itare HÉRITE du fournisseur principal (V18 générique) : un inconnu
     # qui n'a qu'une clé, ou qu'un Ollama, a ses deux agents sans rien régler de plus.
@@ -5055,11 +5061,328 @@ def _ita_ollama(base_url, provider=None) -> bool:
     return ":11434" in str(base_url or "") or prov == "ollama"
 
 
+# ════════════════════════════════════════════════════════
+#  REGISTRE DE MODÈLES (10-10) — un modèle se déclare UNE fois ; les rôles y puisent.
+#
+#  Quatre rôles saisissaient chacun leur modèle, leur clé et leur serveur de leur côté, et la clé du
+#  relecteur dormait EN CLAIR dans config.json. Ici : une table, et les clés dans le coffre de SERVICE
+#  (`modele/<id>`), jamais ailleurs. Un rôle LIÉ au registre prime sur son ancien réglage ; non lié, ou
+#  coffre muet : l'ancien réglage joue comme avant — rien ne change tant qu'on ne bascule pas.
+#  Branchés : Itare Citadelle, Vision, Relecteur de l'évolution. Pas encore : le principal (modèle global
+#  chargé au démarrage), Itare des comptes (local par défaut, choix par compte, volontairement), le second
+#  avis (rôle neuf, il naît avec Proactivité).
+# ════════════════════════════════════════════════════════
+_MODELES_ROLES = {"itare_citadelle": "Itare Citadelle", "vision": "Vision", "relecteur": "Relecteur de l'évolution"}
+_MODELES_CREDS_CACHE = {}          # id -> (epoch, creds) ; 60 s : le coffre est un aller-retour HTTP
+_MODELES_NOM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@+-]{0,160}")
+_MODELES_COFFRE_AIDE = "le coffre de service est indisponible ou verrouillé : la clé n'a été écrite nulle part (délibéré)"
+
+
+def _modeles_conn():
+    conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE IF NOT EXISTS modeles_registre ("
+                 "id TEXT PRIMARY KEY, fournisseur TEXT NOT NULL, nom TEXT NOT NULL, base_url TEXT DEFAULT '', "
+                 "a_cle INTEGER DEFAULT 0, ts TEXT DEFAULT (datetime('now','localtime')), ajoute_par TEXT DEFAULT '', "
+                 "essai_ts TEXT DEFAULT '', essai_ok INTEGER, essai_s REAL, essai_msg TEXT DEFAULT '')")
+    return conn
+
+
+def _modele_secret_nom(mid: str) -> str:
+    return "modele/" + mid
+
+
+def modele_creds(mid: str):
+    """(clé, modèle, base, fournisseur) d'un modèle du registre, ou None. Jamais d'exception : un coffre
+    muet rend None, et l'appelant retombe sur l'ancien réglage du rôle."""
+    mid = str(mid or "").strip()
+    if not mid:
+        return None
+    c = _MODELES_CREDS_CACHE.get(mid)
+    if c and time.time() - c[0] < 60:
+        return c[1]
+    precedent = c[1] if c else None      # le dernier modèle qui a marché : le coffre peut tousser, l'agent continue
+    creds = None
+    try:
+        conn = _modeles_conn()
+        try:
+            r = conn.execute("SELECT * FROM modeles_registre WHERE id = ?", (mid,)).fetchone()
+        finally:
+            conn.close()
+        if r:
+            prov = r["fournisseur"]
+            key = ""
+            if r["a_cle"]:
+                key = str(vault_get(_modele_secret_nom(mid)) or "").strip()
+            elif prov == "ollama":
+                key = "ollama"
+            else:
+                key = "none"            # serveur sans clé : le client exige une valeur non vide
+            base = (r["base_url"] or "").strip() or _SECONDARY_PROVIDERS.get(prov, "")
+            if key:
+                creds = (key, r["nom"], base, prov)
+            else:
+                logging.warning("[MODÈLES] %s : clé introuvable dans le coffre — repli sur l'ancien réglage", mid)
+    except Exception as e:
+        logging.warning("[MODÈLES] creds %s : %s", mid, e)
+    if creds is None and precedent:
+        logging.warning("[MODÈLES] %s : coffre muet, dernier état connu conservé", mid)
+        creds = precedent
+    _MODELES_CREDS_CACHE[mid] = (time.time(), creds)
+    return creds
+
+
+def modele_role_creds(role: str):
+    """Le modèle du registre LIÉ à ce rôle, ou None (rôle non lié, ou modèle illisible)."""
+    try:
+        mid = str(get_cassandra_config().get("modele_role_" + role) or "").strip()
+    except Exception:
+        return None
+    return modele_creds(mid) if mid else None
+
+
+def _modeles_roles_lies() -> dict:
+    try:
+        cfg = get_cassandra_config()
+    except Exception:
+        return {}
+    return {r: str(cfg.get("modele_role_" + r) or "").strip() for r in _MODELES_ROLES
+            if str(cfg.get("modele_role_" + r) or "").strip()}
+
+
+def modeles_lister() -> dict:
+    conn = _modeles_conn()
+    try:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM modeles_registre ORDER BY ts, id")]
+    finally:
+        conn.close()
+    liens = _modeles_roles_lies()
+    par_modele = {}
+    for role, mid in liens.items():
+        par_modele.setdefault(mid, []).append(role)
+    for r in rows:
+        r["roles"] = par_modele.get(r["id"], [])
+        r["en_ligne"] = r["fournisseur"] != "ollama" and not (r["fournisseur"] == "personnalise" and
+                                                                 re.match(r"https?://(127\.|localhost|\[::1\])", r["base_url"] or ""))
+    try:
+        locaux = ollama_list() if ollama_available() else []
+    except Exception:
+        locaux = []
+    cfg = get_cassandra_config()
+    en_clair = []
+    for role in _MODELES_ROLES:
+        leg = _modeles_legacy(cfg, role)
+        if leg["cle"] and leg["cle"] != "ollama" and role not in liens:
+            en_clair.append({"role": role, "nom": _MODELES_ROLES[role], "migrable": bool(leg["nom"]),
+                             "modele": leg["nom"], "fournisseur": leg["prov"]})
+    return {"ok": True, "modeles": rows, "roles": liens, "locaux": locaux,
+            "ollama": bool(locaux) or ollama_available(), "pull": ollama_pull_status(),
+            "fournisseurs": [{"id": k, "nom": v["nom"], "defaut": v["defaut"], "cle": v["cle"],
+                              "raisonneur": v["raisonneur"]} for k, v in FOURNISSEURS.items()],
+            "roles_branches": list(_MODELES_ROLES), "en_clair": en_clair,
+            "coffre": bool(vault_available())}
+
+
+def modele_ajouter(d: dict, acteur: str = "") -> dict:
+    prov = str(d.get("fournisseur") or "").strip()
+    if prov not in FOURNISSEURS:
+        return {"ok": False, "error": "fournisseur inconnu"}
+    nom = str(d.get("nom") or "").strip().rstrip(".,;:!?»« ").strip()
+    if not nom:
+        return {"ok": False, "error": "nom de modèle requis"}
+    if re.match(r"https?://", nom, re.I):
+        return {"ok": False, "error": "le modèle est un nom, pas une adresse"}
+    if not _MODELES_NOM_RE.fullmatch(nom) or nom.endswith(":"):
+        return {"ok": False, "error": "nom de modèle invalide : « %s »" % nom[:80]}
+    base = str(d.get("base_url") or "").strip()
+    if prov == "personnalise":
+        if not base:
+            return {"ok": False, "error": "adresse du serveur manquante"}
+        if not re.fullmatch(r"https?://[^\s]+", base):
+            return {"ok": False, "error": "adresse du serveur invalide"}
+    else:
+        base = ""                       # l'adresse vient de la table des fournisseurs, une seule fois
+    cle = str(d.get("cle") or "").strip()
+    besoin = FOURNISSEURS[prov]["cle"]
+    if besoin == "requise" and not cle:
+        return {"ok": False, "error": "clé manquante"}
+    slug = re.sub(r"[^a-z0-9]+", "-", nom.lower()).strip("-")[:28] or "modele"
+    mid = "%s-%s" % (slug, secrets.token_hex(2))
+    a_cle = 0
+    if cle and prov != "ollama":
+        r = vault_set(_modele_secret_nom(mid), cle)
+        if not r.get("ok"):
+            return {"ok": False, "error": _MODELES_COFFRE_AIDE + " (%s)" % str(r.get("error") or "")[:80]}
+        a_cle = 1
+    conn = _modeles_conn()
+    try:
+        conn.execute("INSERT INTO modeles_registre (id, fournisseur, nom, base_url, a_cle, ajoute_par) VALUES (?,?,?,?,?,?)",
+                     (mid, prov, nom, base, a_cle, acteur or ""))
+        conn.commit()
+    finally:
+        conn.close()
+    _MODELES_CREDS_CACHE.pop(mid, None)
+    return {"ok": True, "id": mid}
+
+
+def modele_essayer(mid: str) -> dict:
+    creds = modele_creds(mid)
+    if not creds:
+        return {"ok": False, "error": "modèle introuvable, ou clé illisible dans le coffre"}
+    _ITARE_AGENT_LAST_ERROR[0] = ""
+    t0 = time.time()
+    txt = _itare_agent_text([{"role": "user", "content": "Réponds par le seul mot : prêt."}],
+                            max_tokens=300, timeout=60.0, reflexion=False, creds=creds)
+    dt = round(time.time() - t0, 1)
+    ok = bool((txt or "").strip())
+    msg = (txt or "").strip()[:120] if ok else (_ITARE_AGENT_LAST_ERROR[0][:200] or "aucune réponse")
+    conn = _modeles_conn()
+    try:
+        conn.execute("UPDATE modeles_registre SET essai_ts = datetime('now','localtime'), essai_ok = ?, essai_s = ?, essai_msg = ? WHERE id = ?",
+                     (1 if ok else 0, dt, msg, mid))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": ok, "secondes": dt, "reponse": msg if ok else "", "erreur": "" if ok else msg}
+
+
+def modele_retirer(mid: str) -> dict:
+    mid = str(mid or "").strip()
+    lies = [r for r, m in _modeles_roles_lies().items() if m == mid]
+    if lies:
+        return {"ok": False, "error": "ce modèle sert un rôle (%s) : change le rôle d'abord" %
+                ", ".join(_MODELES_ROLES[r] for r in lies)}
+    conn = _modeles_conn()
+    try:
+        row = conn.execute("SELECT a_cle FROM modeles_registre WHERE id = ?", (mid,)).fetchone()
+        if not row:
+            return {"ok": False, "error": "modèle introuvable"}
+        if row["a_cle"]:
+            r = vault_delete(_modele_secret_nom(mid))
+            if not r.get("ok"):
+                return {"ok": False, "error": "la clé n'a pas pu être retirée du coffre : %s" % str(r.get("error") or "")[:80]}
+        conn.execute("DELETE FROM modeles_registre WHERE id = ?", (mid,))
+        conn.commit()
+    finally:
+        conn.close()
+    _MODELES_CREDS_CACHE.pop(mid, None)
+    return {"ok": True}
+
+
+def modeles_role_set(role: str, mid: str, acteur: str = "") -> dict:
+    if role not in _MODELES_ROLES:
+        return {"ok": False, "error": "ce rôle n'est pas encore branché au registre"}
+    mid = str(mid or "").strip()
+    cfg = get_cassandra_config()
+    if mid:
+        if not modele_creds(mid):
+            return {"ok": False, "error": "modèle introuvable, ou clé illisible dans le coffre"}
+        cfg["modele_role_" + role] = mid
+    else:
+        cfg.pop("modele_role_" + role, None)
+        # Un rôle dont la clé a été migrée n'a plus de clé dans son ancien réglage : le laisser pointer
+        # là donnerait un agent sans clé. Il retombe donc sur son défaut d'avant lui (Itare Citadelle :
+        # le fournisseur principal ; Vision : le premier modèle local ; relecteur : l'agent secondaire).
+        if cfg.get("modele_migre_" + role):
+            for champ in _MODELES_LEGACY[role][2]:
+                cfg.pop(champ, None)
+            cfg.pop("modele_migre_" + role, None)
+    ok = save_cassandra_config(cfg)
+    try:
+        log_user_activity(acteur, acteur, "modeles_role", "%s -> %s" % (role, mid or "ancien réglage"))
+    except Exception:
+        pass
+    return {"ok": bool(ok)}
+
+
+_MODELES_LEGACY = {
+    # rôle: (préfixes lus dans l'ordre, champs-clés à effacer, champs à effacer au déliement d'un rôle migré)
+    "itare_citadelle": (("itare_citadelle_", "itare_"), ("itare_citadelle_api_key", "itare_api_key"),
+                        ("itare_citadelle_provider", "itare_citadelle_base_url", "itare_citadelle_model",
+                         "itare_provider", "itare_base_url", "itare_model")),
+    "vision": (("itare_vision_",), ("itare_vision_api_key",),
+               ("itare_vision_provider", "itare_vision_base_url", "itare_vision_model")),
+    "relecteur": (("evolution_relecteur_",), ("evolution_relecteur_api_key",),
+                  ("evolution_relecteur_provider", "evolution_relecteur_base_url", "evolution_relecteur_model")),
+}
+
+
+def _modeles_legacy(cfg: dict, role: str) -> dict:
+    """L'ancien réglage d'un rôle, lu comme le moteur le lit (le nom neuf d'abord, l'ancien en repli)."""
+    prefixes, _cles, _tout = _MODELES_LEGACY[role]
+    def lire(champ):
+        for pre in prefixes:
+            v = str(cfg.get(pre + champ) or "").strip()
+            if v:
+                return v
+        return ""
+    prov = lire("provider")
+    prov = "personnalise" if prov == "custom" else prov
+    return {"prov": prov, "nom": lire("model").rstrip(".,;:!?»« ").strip(), "base": lire("base_url"), "cle": lire("api_key")}
+
+
+def modeles_migrer(role: str, acteur: str = "") -> dict:
+    """La clé d'un rôle quitte config.json pour le coffre de service ; le rôle est lié au registre."""
+    if role not in _MODELES_ROLES:
+        return {"ok": False, "error": "rôle inconnu"}
+    cfg = get_cassandra_config()
+    leg = _modeles_legacy(cfg, role)
+    if not leg["cle"] or leg["cle"] == "ollama":
+        return {"ok": False, "error": "rien à migrer : pas de clé en clair pour ce rôle"}
+    if not leg["nom"] or not leg["prov"]:
+        return {"ok": False, "error": "ce rôle n'a ni fournisseur ni modèle réglés : rien à déclarer"}
+    if leg["prov"] not in FOURNISSEURS:
+        return {"ok": False, "error": "fournisseur inconnu : %s" % leg["prov"][:40]}
+    r = modele_ajouter({"fournisseur": leg["prov"], "nom": leg["nom"], "cle": leg["cle"],
+                        "base_url": leg["base"] if leg["prov"] == "personnalise" else ""}, acteur)
+    if not r.get("ok"):
+        return r
+    mid = r["id"]
+    relu = modele_creds(mid)
+    if not relu or relu[0] != leg["cle"]:
+        modele_retirer(mid)
+        return {"ok": False, "error": "relecture de la clé dans le coffre impossible : rien n'a été changé"}
+    cfg = get_cassandra_config()
+    cfg["modele_role_" + role] = mid
+    cfg["modele_migre_" + role] = True
+    for champ in _MODELES_LEGACY[role][1]:
+        cfg.pop(champ, None)
+    if not save_cassandra_config(cfg):
+        return {"ok": False, "error": "configuration non enregistrée"}
+    try:
+        log_user_activity(acteur, acteur, "modeles_migrer", "%s -> coffre (%s)" % (role, mid))
+    except Exception:
+        pass
+    return {"ok": True, "id": mid}
+
+
+def modeles_ollama_supprimer(nom: str) -> dict:
+    nom = str(nom or "").strip()
+    if not nom:
+        return {"ok": False, "error": "modèle requis"}
+    conn = _modeles_conn()
+    try:
+        ids = [r["id"] for r in conn.execute("SELECT id FROM modeles_registre WHERE fournisseur = 'ollama' AND nom = ?", (nom,))]
+    finally:
+        conn.close()
+    lies = _modeles_roles_lies()
+    if any(m in ids for m in lies.values()):
+        return {"ok": False, "error": "ce modèle sert un rôle : change le rôle d'abord"}
+    r = ollama_delete(nom)
+    if r.get("ok"):
+        for i in ids:
+            modele_retirer(i)
+    return r
+
+
 def _evo_relecteur_creds():
     """LE RELECTEUR DE L'ÉVOLUTION, s'il a son réglage propre (`evolution_relecteur_*`) :
     (clé, modèle, base, fournisseur). Sans modèle réglé : None — l'agent secondaire relit, comme
     avant. Un petit modèle local doute de tout et refuse tout (18-09 : 4 refus sur 4) ; ce rôle
     permet d'envoyer la seule relecture vers un modèle en ligne, Itare restant en local."""
+    _lie = modele_role_creds("relecteur")        # registre de modèles (10-10) : un rôle lié prime
+    if _lie:
+        return _lie
     try:
         cfg = get_cassandra_config()
     except Exception:
@@ -26350,9 +26673,25 @@ def lab_status() -> dict:
         if v:
             c["vit_mesuree"] = v.get("tps")
             c["mesures"] = v.get("n")
+    # LE REGISTRE (10-10) : un rôle lié montre le modèle du registre, pas son ancien réglage. Aucune clé ne voyage.
+    registre = {}
+    try:
+        _reg = modeles_lister()
+        registre = {"modeles": [{k: m.get(k) for k in ("id", "nom", "fournisseur", "base_url", "a_cle", "en_ligne", "roles",
+                                                         "essai_ts", "essai_ok", "essai_s", "essai_msg")} for m in _reg["modeles"]],
+                    "liens": _reg["roles"], "en_clair": _reg["en_clair"], "coffre": _reg["coffre"],
+                    "fournisseurs": _reg["fournisseurs"]}
+        _par_id = {m["id"]: m for m in _reg["modeles"]}
+        for _r, _d in (("itare_citadelle", secondary), ("vision", vision), ("relecteur", relecteur)):
+            _m = _par_id.get(_reg["roles"].get(_r, ""))
+            if _m:
+                _d.update({"provider": _m["fournisseur"], "model": _m["nom"], "registre": _m["id"], "cle": True})
+    except Exception as _e:
+        logging.info("[MODÈLES] registre pour l'écran : %s", _e)
     return {"available": ollama_available(), "base": _ollama_base(), "resources": res,
             "installed": installed, "catalog": catalog, "current": cur, "current_installed": (cur in inst_names) if cur else None,
-            "primary": primary, "secondary": secondary, "vision": vision, "relecteur": relecteur, "mesures": mes}
+            "primary": primary, "secondary": secondary, "vision": vision, "relecteur": relecteur, "mesures": mes,
+            "registre": registre}
 
 
 def lab_set_model(model: str) -> dict:
@@ -26379,16 +26718,19 @@ def lab_assign_agent(model: str, role: str) -> dict:
             cfg["itare_model"] = model; cfg["itare_api_key"] = "ollama"
             cfg["itare_citadelle_provider"] = "ollama"; cfg["itare_citadelle_base_url"] = base
             cfg["itare_citadelle_model"] = model; cfg["itare_citadelle_api_key"] = "ollama"
+            cfg.pop("modele_role_itare_citadelle", None); cfg.pop("modele_migre_itare_citadelle", None)
             save_cassandra_config(cfg)
             return {"ok": True, "role": "secondary", "model": model}
         if role == "relecteur":
             cfg["evolution_relecteur_provider"] = "ollama"; cfg["evolution_relecteur_base_url"] = base
             cfg["evolution_relecteur_model"] = model; cfg["evolution_relecteur_api_key"] = "ollama"
+            cfg.pop("modele_role_relecteur", None); cfg.pop("modele_migre_relecteur", None)
             save_cassandra_config(cfg)
             return {"ok": True, "role": "relecteur", "model": model}
         if role == "vision":
             cfg["itare_vision_provider"] = "ollama"; cfg["itare_vision_base_url"] = base
             cfg["itare_vision_model"] = model; cfg["itare_vision_api_key"] = "ollama"
+            cfg.pop("modele_role_vision", None); cfg.pop("modele_migre_vision", None)
             save_cassandra_config(cfg)
             return {"ok": True, "role": "vision", "model": model}
         if role == "local":
@@ -95876,6 +96218,43 @@ class CassandraHandler(BaseHTTPRequestHandler):
                 return
             log_admin_action(_g[0], "system_wipe", "LAUNCHED", "user=%s" % _g[1])
             self.send_json(wipe_for_prod("EFFACER")); return
+        # LE REGISTRE DE MODÈLES (10-10) : tout est réservé à l'administrateur ; aucune clé ne sort jamais, ni en clair ni masquée.
+        if path == "/api/modeles" or path.startswith("/api/modeles/"):
+            _sid = self.headers.get("X-Session-Token", "") or str(data.get("session", "") or "")
+            if not validate_session(_sid):
+                self.send_json({"ok": False, "error": "Non autorisé"}, 401); return
+            _qui = get_session_user(_sid) or ""
+            if not is_admin(_qui):
+                self.send_json({"ok": False, "error": "Réservé à l'administrateur"}, 403); return
+            _sub = path[len("/api/modeles"):].strip("/")
+            _r = None
+            if _sub == "":
+                _r = modeles_lister()
+            elif _sub == "ajouter":
+                _r = modele_ajouter(data, _qui)
+                log_admin_action(_sid, "modeles_ajouter", "OK" if _r.get("ok") else "FAIL", ("%s / %s" % (data.get("fournisseur"), data.get("nom")))[:200])
+            elif _sub == "essai":
+                _r = modele_essayer(str(data.get("id") or ""))
+            elif _sub == "retirer":
+                _r = modele_retirer(str(data.get("id") or ""))
+                log_admin_action(_sid, "modeles_retirer", "OK" if _r.get("ok") else "FAIL", str(data.get("id") or "")[:80])
+            elif _sub == "role":
+                _r = modeles_role_set(str(data.get("role") or ""), str(data.get("id") or ""), _qui)
+                log_admin_action(_sid, "modeles_role", "OK" if _r.get("ok") else "FAIL", "%s -> %s" % (data.get("role"), data.get("id") or "ancien réglage"))
+            elif _sub == "migrer":
+                _r = modeles_migrer(str(data.get("role") or ""), _qui)
+                log_admin_action(_sid, "modeles_migrer", "OK" if _r.get("ok") else "FAIL", "%s -> coffre" % str(data.get("role") or "")[:40])
+            elif _sub == "ollama/installer":
+                _r = ollama_pull_async(str(data.get("nom") or ""))
+                log_admin_action(_sid, "modeles_ollama_installer", "OK" if _r.get("ok") else "FAIL", str(data.get("nom") or "")[:80])
+            elif _sub == "ollama/etat":
+                _r = dict(ok=True, **ollama_pull_status())
+            elif _sub == "ollama/supprimer":
+                _r = modeles_ollama_supprimer(str(data.get("nom") or ""))
+                log_admin_action(_sid, "modeles_ollama_supprimer", "OK" if _r.get("ok") else "FAIL", str(data.get("nom") or "")[:80])
+            if _r is None:
+                self.send_json({"ok": False, "error": "route inconnue"}, 404); return
+            self.send_json(_r, 200 if _r.get("ok") else 400); return
         # L'ONGLET SÉCURITÉ (24-09) : lire est réservé à l'administrateur ; agir passe par la garde des gestes.
         if path in ("/api/securite", "/api/securite/journal", "/api/securite/audits", "/api/securite/audit/rediger",
                     "/api/securite/parefeu/trancher", "/api/securite/images"):
@@ -96688,6 +97067,9 @@ class CassandraHandler(BaseHTTPRequestHandler):
             itare_model     = data.get("itare_model", "").strip()
             vision_key       = data.get("itare_api_key", "").strip()
             cfg = get_cassandra_config()
+            if any((itare_provider, itare_base_url, itare_model, vision_key)):
+                _rl = "vision" if _cible == "itare_vision" else "itare_citadelle"
+                cfg.pop("modele_role_" + _rl, None); cfg.pop("modele_migre_" + _rl, None)
             for _c, _v in (("provider", itare_provider),
                            ("base_url", itare_base_url),
                            ("model", itare_model), ("api_key", vision_key)):
@@ -96729,6 +97111,7 @@ class CassandraHandler(BaseHTTPRequestHandler):
             if data.get("retirer"):
                 for _c in ("provider", "base_url", "model", "api_key"):
                     cfg.pop("evolution_relecteur_" + _c, None)
+                cfg.pop("modele_role_relecteur", None); cfg.pop("modele_migre_relecteur", None)
                 ok = save_cassandra_config(cfg)
                 log_admin_action(sid, "settings_relecteur", "SUCCESS" if ok else "FAILED", "retiré : l'agent secondaire relit")
                 self.send_json({"ok": bool(ok)}); return
@@ -96744,6 +97127,7 @@ class CassandraHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": "nom de modèle invalide : « %s »" % _model[:80]}); return
             if _prov == "custom" and not _base:
                 self.send_json({"ok": False, "error": "une URL de base est requise pour un fournisseur personnalisé"}); return
+            cfg.pop("modele_role_relecteur", None); cfg.pop("modele_migre_relecteur", None)
             cfg["evolution_relecteur_provider"] = _prov
             cfg["evolution_relecteur_model"] = _model
             cfg["evolution_relecteur_base_url"] = _base if _prov == "custom" else _SECONDARY_PROVIDERS.get(_prov, "")
@@ -109177,6 +109561,40 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
         <div class="mx-eyebrow">Installés sur la machine</div>
         <div id="lab-installes"></div>
         <div class="mx-foot"><span>Une seule vérité par rôle : la carte lit la clé que le moteur lit. Un changement passe par la feuille de confirmation et s'écrit au journal d'administration. <b>Chaque compte choisit ensuite le sien</b> dans <a href="#" onclick="setFam('moi-itare');return false">Mon compte → Mon Itare</a>.</span><a href="#" onclick="loadLab();return false">↻ Relire</a></div>
+      </div>
+
+      <!-- LE REGISTRE DE MODÈLES (10-10) : un modèle en ligne se déclare ICI, une fois ; sa clé part dans le coffre
+           de service ; les rôles ci-dessus le choisissent sur leur carte. Les anciens formulaires par rôle restent. -->
+      <div class="settings-section" data-fam="agents" id="set-registre">
+        <div class="settings-section-title">Registre de modèles en ligne<span class="mx-meta" style="font-weight:400;text-transform:none;letter-spacing:0">une déclaration, les rôles y puisent</span></div>
+        <div id="mdl-clair" class="mx-foot" hidden></div>
+        <div id="mdl-liste"></div>
+        <div class="mx-eyebrow">Ajouter un modèle</div>
+        <div class="rel-champs">
+          <div class="s-field">
+            <label class="s-label" for="mdl-prov">Fournisseur</label>
+            <select class="s-select" id="mdl-prov" onchange="modelesFournisseur()"></select>
+          </div>
+          <div class="s-field">
+            <label class="s-label" for="mdl-nom">Modèle</label>
+            <input class="s-input mono" id="mdl-nom" type="text" placeholder="google/gemini-2.5-flash" autocomplete="off">
+            <div class="s-hint">Un nom, pas une adresse.</div>
+          </div>
+          <div class="s-field" id="mdl-cle-field">
+            <label class="s-label" for="mdl-cle">Clé API</label>
+            <input class="s-input mono" id="mdl-cle" type="password" placeholder="sk-••••••••" autocomplete="new-password">
+            <div class="s-hint">Rangée dans le coffre de service. Jamais réaffichée.</div>
+          </div>
+        </div>
+        <div class="s-field" id="mdl-url-field" style="display:none">
+          <label class="s-label" for="mdl-url">URL de base (compatible OpenAI)</label>
+          <input class="s-input mono" id="mdl-url" type="text" placeholder="https://mon-endpoint/v1" autocomplete="off">
+        </div>
+        <div class="rel-gestes">
+          <button class="mx-btn primary" onclick="modelesAjouter()">Ajouter et essayer</button>
+          <span class="s-hint" id="mdl-msg" style="margin:0"></span>
+        </div>
+        <div class="mx-foot"><span>Les modèles locaux se gèrent plus haut. Choisir un modèle du registre sur la carte d'un rôle <b>prime</b> sur l'ancien réglage ; en changer à l'ancienne délie le rôle. Branchés au registre : Itare Citadelle, Vision, Relecteur. Le principal et le second avis suivent.</span></div>
       </div>
 
       <!-- LE COMPTE D'ITARE. Regle UNE FOIS pour toute la machine : sa
@@ -128456,6 +128874,8 @@ async function loadLab(){
     const p=d.primary||{}, s=d.secondary||{}, v=d.vision||{}, rl=d.relecteur||{};
     relRemplir(rl);
     const local = function(prov){ return (prov||'')==='ollama'; };
+    ETAT.itare._reg = d.registre || {};
+    try{ modelesRendre(); }catch(e){}
     const roles=document.getElementById('lab-roles');
     if(roles){
         const carte = function(role, titre, prov, model, quoi, ouvert){
@@ -128465,7 +128885,7 @@ async function loadLab(){
             return '<div class="set-role' + (ouvert ? ' on' : '') + '"><div class="h"><b>' + escapeHtml(titre) + '</b>' + pill + '</div>'
                  + '<div class="m">' + escapeHtml(model || '—') + '</div><div class="v">' + escapeHtml((prov ? prov + ' · ' : '') + quoi) + '</div>'
                  + '<div class="mx-gest" style="justify-content:flex-start"><button class="mx-btn" onclick="labChoisir(\'' + role + '\')">' + (model ? 'Changer' : 'Choisir') + '</button>'
-                 + (role==='relecteur' && model ? '<button class="mx-btn" onclick="relEssai()">Essayer</button>' : '') + '</div></div>';
+                 + (role==='relecteur' && model ? '<button class="mx-btn" onclick="relEssai()">Essayer</button>' : '') + '</div>' + modelesSelect(role) + '</div>';
         };
         roles.innerHTML = carte('primary', LAB_ROLES.primary, p.provider, p.model, 'le cerveau de Cassandra', ETAT.itare._labRole==='primary')
                         + carte('secondary', LAB_ROLES.secondary, s.provider, s.model, 'garde-fou et réponses aux comptes', ETAT.itare._labRole==='secondary')
@@ -128563,6 +128983,100 @@ async function labAffecter(model, role){
         if(d&&d.ok){ if(typeof showToast==='function') showToast(model+' → '+lbl, 'success', 2600); ETAT.itare._labRole=''; const b=document.getElementById('lab-choix'); if(b){ b.hidden=true; b.innerHTML=''; } loadLab(); loadSettings(); if(ETAT.reglages._setFam) setVerdict(ETAT.reglages._setFam); }
         else if(typeof showToast==='function') showToast('Refus : '+((d&&d.error)||'?'), 'error', 4000); }
     catch(e){ if(typeof showToast==='function') showToast('Erreur réseau', 'error', 3000); }
+}
+// ── LE REGISTRE DE MODÈLES (10-10) ──────────────────────────────────────────────
+// Lu avec le statut du laboratoire (une seule requête) ; les gestes passent par /api/modeles/*.
+const MDL_ROLE_DE = {secondary: 'itare_citadelle', vision: 'vision', relecteur: 'relecteur'};
+function modelesSelect(role){
+    const br = MDL_ROLE_DE[role]; if(!br) return '';
+    const R = ETAT.itare._reg || {}; const m = R.modeles || []; const cur = (R.liens || {})[br] || '';
+    if(!m.length && !cur) return '';
+    return '<div class="s-field" style="margin-top:8px"><label class="s-label">Modèle du registre</label>'
+         + '<select class="s-select" onchange="modelesLier(\'' + br + '\', this.value)">'
+         + '<option value="">' + (cur ? 'Revenir à l\u2019ancien réglage' : 'Ancien réglage, inchangé') + '</option>'
+         + m.map(function(x){ return '<option value="' + escapeHtml(x.id) + '"' + (x.id === cur ? ' selected' : '') + '>' + escapeHtml(x.nom + ' · ' + x.fournisseur) + '</option>'; }).join('')
+         + '</select></div>';
+}
+function modelesFournisseur(){
+    const R = ETAT.itare._reg || {}; const sel = document.getElementById('mdl-prov'); if(!sel) return;
+    const f = (R.fournisseurs || []).find(function(x){ return x.id === sel.value; }) || {};
+    const u = document.getElementById('mdl-url-field'); if(u) u.style.display = sel.value === 'personnalise' ? '' : 'none';
+    const c = document.getElementById('mdl-cle-field'); if(c) c.style.display = f.cle === 'aucune' ? 'none' : '';
+    const n = document.getElementById('mdl-nom'); if(n && f.defaut) n.placeholder = f.defaut;
+}
+function modelesRendre(){
+    const R = ETAT.itare._reg || {}; const L = document.getElementById('mdl-liste'); if(!L) return;
+    const sel = document.getElementById('mdl-prov');
+    if(sel && !sel.options.length && (R.fournisseurs || []).length){
+        sel.innerHTML = R.fournisseurs.map(function(f){ return '<option value="' + escapeHtml(f.id) + '">' + escapeHtml(f.nom) + '</option>'; }).join('');
+        modelesFournisseur();
+    }
+    const cl = document.getElementById('mdl-clair');
+    if(cl){
+        const ec = R.en_clair || []; const mig = ec.filter(function(x){ return x.migrable; });
+        cl.hidden = !ec.length;
+        cl.innerHTML = ec.length ? '<span><b>Clé en clair dans la configuration :</b> ' + escapeHtml(ec.map(function(x){ return x.nom; }).join(', ')) + '. '
+            + mig.map(function(x){ return '<button class="mx-btn primary" onclick="modelesMigrer(\'' + escapeHtml(x.role) + '\')">Migrer ' + escapeHtml(x.nom) + ' dans le coffre</button> '; }).join('')
+            + '</span>' : '';
+    }
+    const m = R.modeles || [];
+    const nomRole = {itare_citadelle: 'Itare Citadelle', vision: 'Vision', relecteur: 'Relecteur'};
+    const coffre = R.coffre === false ? '<div class="mx-foot"><span><b>Coffre de service indisponible :</b> un modèle avec clé ne peut pas être ajouté tant qu\u2019il ne répond pas.</span></div>' : '';
+    L.innerHTML = coffre + (m.length ? '<div class="mx-tbl"><table><thead><tr><th>Modèle</th><th>Fournisseur</th><th>État</th><th>Rôles</th><th></th></tr></thead><tbody>'
+        + m.map(function(x){
+            const etat = x.essai_ok === 1 ? '<span class="mx-pill stable">PRÊT · ' + escapeHtml(String(x.essai_s)) + ' s</span>'
+                       : (x.essai_ok === 0 ? '<span class="mx-pill panne" title="' + escapeHtml(x.essai_msg || '') + '">ÉCHEC</span>' : '<span class="mx-pill regarder">PAS ESSAYÉ</span>');
+            const roles = (x.roles || []).map(function(r){ return nomRole[r] || r; }).join(', ') || '—';
+            return '<tr><td class="mono">' + escapeHtml(x.nom) + '</td><td>' + escapeHtml(x.fournisseur) + (x.a_cle ? ' · clé au coffre' : '') + '</td><td>' + etat + '</td><td>' + escapeHtml(roles) + '</td>'
+                 + '<td><div class="mx-gest"><button class="mx-btn" onclick="modelesEssai(\'' + escapeHtml(x.id) + '\')">Essayer</button>'
+                 + '<button class="mx-btn" style="border-color:var(--danger);color:var(--danger)" onclick="modelesRetirer(\'' + escapeHtml(x.id) + '\')">Retirer</button></div></td></tr>';
+        }).join('') + '</tbody></table></div>'
+        : '<div class="mx-empty"><span class="mx-pill">VIDE</span><div><b>Aucun modèle déclaré</b><p>Ajoute un modèle en ligne ci-dessous : sa clé ira dans le coffre, et chaque rôle pourra le choisir.</p></div></div>');
+}
+async function modelesAjouter(){
+    const g = function(i){ const e = document.getElementById(i); return e ? String(e.value || '').trim() : ''; };
+    const dire = function(m, ok){ _sfb('mdl-msg', m, ok ? 'ok' : 'err'); };
+    try{
+        const d = await apiPost('/api/modeles/ajouter', {fournisseur: g('mdl-prov'), nom: g('mdl-nom'), base_url: g('mdl-url'), cle: g('mdl-cle')});
+        if(!(d && d.ok)){ dire((d && d.error) || 'refusé', false); return; }
+        const k = document.getElementById('mdl-cle'); if(k) k.value = '';
+        const n = document.getElementById('mdl-nom'); if(n) n.value = '';
+        dire('Ajouté. Essai en cours…', true); await loadLab();
+        const e = await apiPost('/api/modeles/essai', {id: d.id});
+        dire(e && e.ok ? 'Prêt : réponse en ' + e.secondes + ' s.' : 'Ajouté, mais l\u2019essai échoue : ' + ((e && (e.erreur || e.error)) || 'aucune réponse'), !!(e && e.ok));
+        await loadLab();
+    }catch(e){ dire('Erreur réseau', false); }
+}
+async function modelesEssai(id){
+    if(typeof showToast === 'function') showToast('Question envoyée au modèle…', 'info', 2500);
+    try{
+        const e = await apiPost('/api/modeles/essai', {id: id});
+        if(typeof showToast === 'function') showToast(e && e.ok ? 'Prêt : réponse en ' + e.secondes + ' s.' : 'Le modèle ne répond pas : ' + ((e && (e.erreur || e.error)) || 'aucune réponse'), e && e.ok ? 'success' : 'error', e && e.ok ? 4000 : 9000);
+        await loadLab();
+    }catch(x){ if(typeof showToast === 'function') showToast('Erreur réseau', 'error', 6000); }
+}
+async function modelesRetirer(id){
+    if(!await fp2Confirm('Ce modèle est retiré du registre et sa clé est effacée du coffre.\n\nLe retirer ?', 'Retirer le modèle')) return;
+    try{
+        const d = await apiPost('/api/modeles/retirer', {id: id});
+        if(typeof showToast === 'function') showToast(d && d.ok ? 'Modèle retiré.' : ((d && d.error) || 'refusé'), d && d.ok ? 'success' : 'error', 6000);
+        await loadLab();
+    }catch(x){ if(typeof showToast === 'function') showToast('Erreur réseau', 'error', 6000); }
+}
+async function modelesLier(role, id){
+    try{
+        const d = await apiPost('/api/modeles/role', {role: role, id: id});
+        if(typeof showToast === 'function') showToast(d && d.ok ? (id ? 'Rôle lié au registre.' : 'Retour à l\u2019ancien réglage.') : ((d && d.error) || 'refusé'), d && d.ok ? 'success' : 'error', 5000);
+        await loadLab();
+    }catch(x){ if(typeof showToast === 'function') showToast('Erreur réseau', 'error', 6000); }
+}
+async function modelesMigrer(role){
+    if(!await fp2Confirm('La clé de ce rôle quitte config.json pour le coffre de service. Le rôle continue de fonctionner : il lit la clé au coffre. Si le coffre s\u2019arrête, le rôle garde le dernier état connu jusqu\u2019au prochain redémarrage.\n\nMigrer ?', 'Migrer la clé')) return;
+    try{
+        const d = await apiPost('/api/modeles/migrer', {role: role});
+        if(typeof showToast === 'function') showToast(d && d.ok ? 'Clé migrée dans le coffre.' : ((d && d.error) || 'refusé'), d && d.ok ? 'success' : 'error', 7000);
+        await loadLab();
+    }catch(x){ if(typeof showToast === 'function') showToast('Erreur réseau', 'error', 6000); }
 }
 async function labPull(model, role){
     ETAT.itare._labPullApres = role ? {model: model, role: role} : null;
