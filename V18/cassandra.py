@@ -72825,7 +72825,7 @@ def secure_execute(cmd: str) -> str:
 #   disque / SSL / sécurité = détection + investigation + action sur clic.
 # ============================================================
 _PROACTIVE_LAST = [0.0]
-_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir")   # seules actions auto-remédiables (réversibles)
+_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer")   # seules actions auto-remédiables (réversibles)
 
 
 def _detect_disk() -> list:
@@ -73179,7 +73179,8 @@ def _detect_sites_http() -> list:
                         "title": "Site %s injoignable" % dom,
                         "detail": "%s ne répond pas correctement (code %s%s)."
                                   % (dom, p.get("code"), (", " + p["err"]) if p.get("err") else ""),
-                        "suggested_action": "", "action_kind": "diagnostic"})
+                        # 10-10 : la relance du service qui sert les sites, puis la preuve (le site répond de nouveau).
+                        "suggested_action": "relancer-site %s" % dom, "action_kind": "site.relancer"})
         elif p.get("ms", 0) > 5000:
             out.append({"fkey": "site_slow_%s" % dom, "category": "site_http", "severity": "warning",
                         "title": "Site %s lent (%.1fs)" % (dom, p["ms"] / 1000.0),
@@ -73188,9 +73189,64 @@ def _detect_sites_http() -> list:
     return out
 
 
-def _detect_backups() -> list:
-    """Sauvegardes FastPanel manquantes ou trop anciennes (best-effort via mogwai JSON)."""
+def _detect_sauvegardes_echec() -> list:
+    """Un plan de sauvegarde de Cassandra dont la dernière exécution a échoué n'est retenté qu'à sa période suivante :
+    c'est parfois une semaine. Le constat porte la relance (règle « Hébergement › Relancer une sauvegarde en échec »)."""
     out = []
+    try:
+        for p in (sauv_plans(inclure_fp=False).get("plans") or []):
+            if not int(p.get("actif") or 0) or str(p.get("moteur") or "") == "fastpanel":
+                continue
+            if str(p.get("dernier_res") or "").startswith("échec"):
+                out.append({"fkey": "sauv_echec_%s" % p["id"], "category": "backup", "severity": "critical",
+                            "title": "Sauvegarde en échec : %s" % p.get("nom", p["id"]),
+                            "detail": "Dernière exécution : %s" % str(p.get("dernier_res"))[:200],
+                            "suggested_action": "relancer-sauvegarde %s" % p["id"], "action_kind": "sauvegarde.relancer"})
+    except Exception as e:
+        logging.info("[PROACTIF] sauvegardes en échec : %s", e)
+    return out
+
+
+def _aut_relancer_site(domaine: str) -> tuple:
+    """Relance ce qui sert les sites, puis VÉRIFIE que le site répond de nouveau. (ok, détail).
+    nginx arrêté : on le relance ; sinon php-fpm. Une relance qui ne rend pas le site est un échec : le disjoncteur compte."""
+    quoi = "php-fpm"
+    try:
+        if (fp_service_state("nginx") or {}).get("active") != "active":
+            quoi = "nginx"
+    except Exception:
+        pass
+    r = fp_service_action(quoi, "restart", confirm=True) or {}
+    if not r.get("ok"):
+        return False, "%s : relance impossible (%s)" % (quoi, str(r.get("reason") or r.get("error") or "?")[:120])
+    time.sleep(4)
+    pr = _http_probe(domaine)
+    if pr.get("ok"):
+        return True, "%s relancé : %s répond de nouveau (code %s, %d ms)" % (quoi, domaine, pr.get("code"), pr.get("ms", 0))
+    return False, "%s relancé, mais %s ne répond toujours pas (code %s)" % (quoi, domaine, pr.get("code"))
+
+
+def _aut_sauvegarde_differee(pid, cle: str, eff: dict, sujet: str, titre: str) -> None:
+    """Une sauvegarde dure jusqu'à une demi-heure : elle ne bloque pas la boucle proactive. Le disjoncteur, le journal
+    et le récit sont écrits ICI, quand le résultat est connu."""
+    ok, detail = False, ""
+    try:
+        r = sauv_plan_run(pid, blanc=False, confirm=True, acteur="cassandra") or {}
+        ok, detail = bool(r.get("ok")), str(r.get("resultat") or r.get("reason") or "")[:240]
+    except Exception as e:
+        detail = "erreur : %s" % str(e)[:200]
+    try:
+        aut_disj_resultat(cle, sujet, ok, eff)
+        aut_journaliser(cle, sujet, ok, titre, detail, eff)
+        aut_raconter(cle, sujet, ok, titre, detail, eff)
+    except Exception as e:
+        logging.info("[AUTONOMIE] sauvegarde différée : %s", e)
+
+
+def _detect_backups() -> list:
+    """Sauvegardes FastPanel manquantes ou trop anciennes (best-effort via mogwai JSON), et plans de Cassandra
+    dont la dernière exécution a échoué (la relance est alors le geste proposé)."""
+    out = list(_detect_sauvegardes_echec())
     try:
         data = _mogwai_json("backups", "list")
     except Exception:
@@ -73547,8 +73603,8 @@ _AUT_CATALOGUE = [
    ('fermer-une-session-ssh', 'Fermer une session SSH', 'brancher', 'non', 'identifiant valide'),
  ]),
  ('hebergement', 'Hébergement', 'Sites, bases, sauvegardes, certificats, domaines (FastPanel).', [
-   ('relancer-un-site', 'Relancer un site', 'brancher', 'oui', 'réponse HTTP vérifiée'),
-   ('relancer-une-sauvegarde-en-echec', 'Relancer une sauvegarde en échec', 'brancher', 'oui', 'aucune'),
+   ('relancer-un-site', 'Relancer un site', 'ok', 'oui', 'réponse HTTP vérifiée'),
+   ('relancer-une-sauvegarde-en-echec', 'Relancer une sauvegarde en échec', 'ok', 'oui', 'une relance par échec, en arrière-plan'),
    ('renouveler-un-certificat', 'Renouveler un certificat', 'ok', 'oui', 'seuil de 30 jours'),
    ('creer-une-base-de-donnees', 'Créer une base de données', 'ecrire', 'oui', 'cloisonnement par compte'),
    ('creer-ou-modifier-un-plan-de-sauvegarde', 'Créer ou modifier un plan de sauvegarde', 'ecrire', 'oui', 'cloisonnement par compte'),
@@ -73654,7 +73710,9 @@ _AUT_CATALOGUE = [
 # Le geste du catalogue que sait déclencher chaque action_kind du moteur proactif. Les autres restent au
 # palier global, sans disjoncteur : l'ancien comportement.
 _AUT_GESTE_DE_KIND = {"service.restart": "machine/relancer-un-service",
-                      "securite.bannir": "reseau-et-acces/bannir-ou-debannir-une-adresse-ou-un-pays"}
+                      "securite.bannir": "reseau-et-acces/bannir-ou-debannir-une-adresse-ou-un-pays",
+                      "site.relancer": "hebergement/relancer-un-site",
+                      "sauvegarde.relancer": "hebergement/relancer-une-sauvegarde-en-echec"}
 # Un constat précis qui relève d'un geste plus fin que son action_kind (testé en premier).
 _AUT_GESTE_DE_FKEY = {"collector_stale": "machine/relancer-le-collecteur"}
 _AUT_STATUTS = {"ok": "en service", "brancher": "à brancher", "ecrire": "à écrire", "dur": "garde dure"}
@@ -75330,7 +75388,7 @@ def proactive_scan(auto_act: bool = None) -> dict:
                     continue
                 r = proactive_act(t["id"], auto=True)
                 acted.append({"id": t["id"], "ok": r.get("ok"), "gate": r.get("gate")})
-                if g.get("cle"):
+                if g.get("cle") and not r.get("differe"):
                     aut_disj_resultat(g["cle"], g.get("sujet") or "", bool(r.get("ok")), g.get("eff") or {})
                     aut_journaliser(g["cle"], g.get("sujet") or "", bool(r.get("ok")), t["title"],
                                     str(r.get("error") or r.get("gate") or "")[:300], g.get("eff") or {}, r.get("inverse"))
@@ -75753,6 +75811,41 @@ def proactive_act(fid, auto: bool = False, acteur: str = "") -> dict:
         except Exception:
             pass
         return {"ok": bool(_res.get("ok")), "output": str(out)[:2000], "gate": "", "inverse": _inv if _res.get("ok") else None}
+    # UN SITE qui ne répond pas : relance, puis preuve. UNE SAUVEGARDE en échec : relance en arrière-plan.
+    if kind == "site.relancer":
+        _m = re.match(r"^\s*relancer-site\s+([A-Za-z0-9.-]+)\s*$", cmd)
+        if not _m:
+            return {"ok": False, "error": "commande de relance de site illisible"}
+        _ok, out = _aut_relancer_site(_m.group(1))
+        try:
+            log_action("proactive", cmd, out, 0, True, False)
+        except Exception:
+            pass
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            conn.execute("UPDATE proactive_findings SET status='acted', acted_at=datetime('now'), action_result=? WHERE id=?",
+                         (("auto • " if auto else "") + str(out)[:1500], int(fid)))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+        return {"ok": bool(_ok), "output": str(out)[:2000], "gate": ""}
+    if kind == "sauvegarde.relancer":
+        _m = re.match(r"^\s*relancer-sauvegarde\s+(\d+)\s*$", cmd)
+        if not _m:
+            return {"ok": False, "error": "commande de relance de sauvegarde illisible"}
+        _cle = _AUT_GESTE_DE_KIND.get(kind)
+        threading.Thread(target=_aut_sauvegarde_differee,
+                         args=(int(_m.group(1)), _cle, aut_effectif(_cle), f.get("fkey") or "", f.get("title") or ""),
+                         daemon=True, name="aut-sauvegarde").start()
+        out = "relance lancée en arrière-plan : le résultat s'écrit au journal quand elle est finie"
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            conn.execute("UPDATE proactive_findings SET status='acted', acted_at=datetime('now'), action_result=? WHERE id=?",
+                         (("auto • " if auto else "") + out, int(fid)))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+        return {"ok": True, "output": out, "gate": "", "differe": True}
     # Plus de juge : la commande tourne en cage comme toute autre. Seul le veto
     # parle avant, pour NOMMER le geste au lieu de rendre un « permission denied ».
     _v = veto_root(cmd)
