@@ -24651,17 +24651,21 @@ def confinement_etat() -> dict:
             confinement_lever(acteur="échéance")
             return {"ok": True, "actif": False, "leve_auto": True}
         return {"ok": True, "actif": True, "niveau": d.get("niveau"),
-                "fin": d.get("fin"), "ip": d.get("ip"), "par": d.get("par"),
+                "fin": d.get("fin"), "ip": d.get("ip"), "par": d.get("par"), "motif": d.get("motif", ""),
                 "faites": d.get("faites", []), "confirme": bool(d.get("confirme"))}
     except Exception as e:
         return {"ok": True, "actif": False, "reason": str(e)}
 
 
 def confiner(niveau: int, ip: str, minutes: int = 30, mot: str = "",
-             acteur: str = "") -> dict:
-    """Applique le confinement, étape par étape, en vérifiant entre chacune."""
+             acteur: str = "", motif: str = "") -> dict:
+    """Applique le confinement, étape par étape, en vérifiant entre chacune.
+    Une crise déclenchée à la main se JUSTIFIE : le motif (10 caractères au moins) est gardé et consigné."""
     if str(mot or "").strip().upper() != "CONFINER":
         return {"ok": False, "reason": "confirmation attendue : tapez CONFINER"}
+    motif = " ".join(str(motif or "").split())[:400]
+    if len(motif) < 10:
+        return {"ok": False, "reason": "justification attendue : dis pourquoi tu estimes le serveur compromis (10 caractères au moins)"}
     try:
         niveau = int(niveau)
     except Exception:
@@ -24707,16 +24711,16 @@ def confiner(niveau: int, ip: str, minutes: int = 30, mot: str = "",
     try:
         os.makedirs(os.path.dirname(_URG_FLAG), exist_ok=True)
         with open(_URG_FLAG, "w", encoding="utf-8") as f:
-            json.dump({"niveau": niveau, "fin": fin, "ip": ip, "par": acteur,
+            json.dump({"niveau": niveau, "fin": fin, "ip": ip, "par": acteur, "motif": motif,
                        "faites": faites, "confirme": False}, f)
     except Exception as e:
         logging.warning("[URGENCE] sentinelle : %s", e)
     notif("Serveur confiné — niveau %d" % niveau,
-          "Par %s, depuis %s. %d geste(s) appliqué(s). Retour automatique le %s si "
-          "vous ne confirmez pas." % (acteur or "vous", ip, len(faites), fin),
+          "Par %s, depuis %s. Motif : %s. %d geste(s) appliqué(s). Retour automatique le %s si "
+          "vous ne confirmez pas." % (acteur or "vous", ip, motif, len(faites), fin),
           source="securite", niveau="critique", cle="urgence:confinement")
     try:
-        log_user_activity(acteur, acteur, "confinement", "niveau %d depuis %s" % (niveau, ip))
+        log_user_activity(acteur, acteur, "confinement", "niveau %d depuis %s — motif : %s" % (niveau, ip, motif))
     except Exception:
         pass
     return {"ok": True, "niveau": niveau, "fin": fin, "faites": faites, "ip": ip}
@@ -24741,6 +24745,207 @@ def _urg_defaire(faites: list, niveau: int, ip: str) -> list:
         except Exception as e:
             logging.warning("[URGENCE] défaire %s : %s", cle, e)
     return refaits
+
+
+# ── La crise déclenchée par Cassandra ───────────────────────────────────────────────────────────────────────
+# Deux cas, décidés par Drisse (10-10) : le serveur est PARALYSÉ (la moitié ou plus des services critiques, ou des sites,
+# en panne depuis plus de 5 minutes) ou il subit une ATTAQUE MAJEURE (un afflux d'adresses nouvelles d'un coup).
+# Le premier palier est volontairement mince : les envois sont coupés et tout geste autonome est retenu — sauf les
+# bannissements, qui sont la défense. Elle ne ferme ni accès ni clé. Se lève d'un geste, ou le dit quand c'est calme.
+_CRISE_FLAG = CASSANDRA_DATA_DIR + "/crise_auto.json"
+_CRISE_CLE = "crise/passer-en-lecture-seule"
+_CRISE_VU = {"paralysie": None, "calme": None, "refus": 0.0, "cache": (0.0, None)}
+_CRISE_DEFENSIFS = ("securite.bannir",)
+
+
+def crise_auto_etat() -> dict:
+    t, v = _CRISE_VU["cache"]
+    if time.time() - t < 5 and v is not None:
+        return v
+    d = {"actif": False}
+    try:
+        if os.path.exists(_CRISE_FLAG):
+            with open(_CRISE_FLAG, encoding="utf-8") as f:
+                d = dict(json.load(f), actif=True)
+    except Exception:
+        d = {"actif": False}
+    _CRISE_VU["cache"] = (time.time(), d)
+    return d
+
+
+def crise_lecture_seule(action_kind: str = "") -> bool:
+    """Vrai quand une crise automatique est en cours ET que ce geste n'est pas défensif."""
+    return bool(crise_auto_etat().get("actif")) and str(action_kind or "") not in _CRISE_DEFENSIFS
+
+
+def _crise_mesurer() -> dict:
+    """Les deux mesures, sans rien modifier. Une mesure qui échoue ne déclenche jamais rien : on ne crie pas au feu sur un doute."""
+    res = {"paralysie": False, "attaque": False, "detail": []}
+    part = float(_mem_cfg("crise_part_paralysie", 0.5) or 0.5)
+    # 1. les services critiques : ceux qui existent sur cette machine, et eux seuls
+    noms = [x.strip() for x in str(_mem_cfg("crise_services_critiques",
+            "nginx,mysql,php8.2-fpm,fastpanel2,cassandra-vault,ssh,tailscaled") or "").split(",") if x.strip()]
+    connus, tombes = 0, []
+    for n in noms:
+        try:
+            st = fp_service_state(n)
+        except Exception:
+            continue
+        if not st or not st.get("enabled") or st.get("enabled") in ("disabled", "masked", "not-found"):
+            continue
+        connus += 1
+        if st.get("active") != "active":
+            tombes.append(n)
+    if connus >= 4 and len(tombes) / float(connus) >= part:
+        res["paralysie"] = True
+        res["detail"].append("%d services critiques sur %d à l'arrêt (%s)" % (len(tombes), connus, ", ".join(tombes)))
+    # 2. les sites : un échantillon, sondé en parallèle
+    try:
+        doms = [str(d.get("domain") or "") for d in (get_fp_domains() or []) if isinstance(d, dict) and d.get("domain")][:12]
+    except Exception:
+        doms = []
+    if len(doms) >= 2:
+        from concurrent.futures import ThreadPoolExecutor
+        try:
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                rep = list(ex.map(lambda d: bool((_http_probe(d) or {}).get("ok")), doms))
+            bas = [d for d, ok in zip(doms, rep) if not ok]
+            if len(bas) / float(len(doms)) >= part:
+                res["paralysie"] = True
+                res["detail"].append("%d sites sur %d ne répondent plus" % (len(bas), len(doms)))
+        except Exception as e:
+            logging.info("[CRISE] sondes de sites : %s", e)
+    # 3. l'attaque : des adresses NOUVELLES d'un coup, très au-dessus de l'ordinaire (≈ 25 adresses par 6 h sur Orion)
+    try:
+        import shutil
+        if shutil.which("cscli"):
+            fen = max(2, int(_mem_cfg("crise_attaque_fenetre_min", 10) or 10))
+            seuil = int(_mem_cfg("crise_attaque_adresses", 40) or 40)
+            ok, brut = _sec_cscli(["alerts", "list", "--since", "%dm" % fen, "--limit", "0", "-o", "json"])
+            if ok:
+                adr = set()
+                for a in (json.loads(brut or "null") or []):
+                    v = str(((a.get("source") or {}).get("value")) or "")
+                    if v and not _sec_de_confiance(v):
+                        adr.add(v)
+                if len(adr) >= seuil:
+                    res["attaque"] = True
+                    res["detail"].append("%d adresses différentes repoussées en %d minutes (seuil %d)" % (len(adr), fen, seuil))
+    except Exception as e:
+        logging.info("[CRISE] mesure de l'attaque : %s", e)
+    return res
+
+
+def crise_auto_lever(acteur: str = "", motif: str = "") -> dict:
+    if not crise_auto_etat().get("actif"):
+        return {"ok": False, "reason": "aucune crise automatique en cours"}
+    try:
+        os.remove(_CRISE_FLAG)
+    except Exception:
+        pass
+    _CRISE_VU["cache"] = (0.0, None)
+    try:
+        notif_envois(False, acteur or "vous")
+    except Exception as e:
+        logging.warning("[CRISE] réouverture des envois : %s", e)
+    try:
+        notif_resoudre_cle("crise:auto", par=acteur or "vous", detail="crise levée")
+        log_user_activity(acteur, acteur, "crise_levee", " ".join(str(motif or "").split())[:200] or "levée")
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+def crise_veille() -> dict:
+    """Appelée chaque minute. Déclenche la crise si une mesure tient assez longtemps, et DIT quand tout est redevenu calme."""
+    if not _mem_cfg("crise_auto_enabled", True):
+        return {"ok": True, "disabled": True}
+    now = time.time()
+    m = _crise_mesurer()
+    etat = crise_auto_etat()
+    duree = max(60, int(_mem_cfg("crise_duree_s", 300) or 300))
+    if etat.get("actif"):
+        if m["paralysie"] or m["attaque"]:
+            _CRISE_VU["calme"] = None
+        else:
+            _CRISE_VU["calme"] = _CRISE_VU["calme"] or now
+            if now - _CRISE_VU["calme"] >= 900 and not etat.get("calme_dit"):
+                try:
+                    notif("La situation est revenue à la normale", "Depuis 15 minutes, plus de service critique à l'arrêt ni d'afflux d'adresses. "
+                          "La crise reste en place tant que tu ne l'as pas levée (Sécurité › Confiner Cassandra › Lever la crise).",
+                          source="securite", niveau="avoir", cle="crise:retour")
+                    d = dict(etat); d.pop("actif", None); d["calme_dit"] = True
+                    with open(_CRISE_FLAG, "w", encoding="utf-8") as f:
+                        json.dump(d, f)
+                    _CRISE_VU["cache"] = (0.0, None)
+                except Exception as e:
+                    logging.info("[CRISE] avis de retour au calme : %s", e)
+        return {"ok": True, "en_cours": True}
+    # la paralysie doit TENIR plus de cinq minutes ; l'attaque est déjà mesurée sur une fenêtre
+    if m["paralysie"]:
+        _CRISE_VU["paralysie"] = _CRISE_VU["paralysie"] or now
+    else:
+        _CRISE_VU["paralysie"] = None
+    tient = bool(_CRISE_VU["paralysie"] and now - _CRISE_VU["paralysie"] >= duree)
+    if not (tient or m["attaque"]):
+        return {"ok": True, "calme": True}
+    if now - _CRISE_VU["refus"] < 900:
+        return {"ok": True, "retenue": True}           # déjà retenue par une règle il y a moins de 15 minutes
+    raison = " · ".join(m["detail"]) or "mesure inconnue"
+    porte = aut_porte(_CRISE_CLE, "crise", "Crise : %s" % raison)
+    if not porte.get("ok"):
+        _CRISE_VU["refus"] = now
+        try:
+            notif("Crise détectée, non déclenchée", "%s. Retenue par la règle (%s). Tu peux la déclencher toi-même dans Sécurité › Confiner Cassandra."
+                  % (raison, porte.get("motif", "?")), source="securite", niveau="critique", cle="crise:retenue")
+        except Exception:
+            pass
+        return {"ok": True, "retenue": True}
+    ok_envois = True
+    try:
+        notif_envois(True, "cassandra")
+    except Exception as e:
+        ok_envois = False
+        logging.warning("[CRISE] coupure des envois : %s", e)
+    try:
+        os.makedirs(os.path.dirname(_CRISE_FLAG), exist_ok=True)
+        with open(_CRISE_FLAG, "w", encoding="utf-8") as f:
+            json.dump({"depuis": now, "raison": raison, "par": "cassandra",
+                       "types": [k for k in ("paralysie", "attaque") if m[k]], "envois": ok_envois}, f)
+    except Exception as e:
+        logging.warning("[CRISE] drapeau : %s", e)
+        aut_fin(porte, False, raison, "drapeau non écrit : %s" % str(e)[:80])
+        return {"ok": False, "reason": str(e)}
+    _CRISE_VU["cache"] = (0.0, None)
+    _CRISE_VU["paralysie"] = None
+    aut_fin(porte, True, raison, "envois coupés, gestes autonomes retenus (sauf les bannissements)")
+    try:
+        notif("Crise déclenchée par Cassandra", "%s. Les envois sont coupés et ses gestes autonomes sont retenus, sauf les bannissements. "
+              "Elle ne ferme aucun accès. Lève la crise quand c'est réglé : Sécurité › Confiner Cassandra." % raison,
+              source="securite", niveau="critique", nature="etat", sujet="crise", cle="crise:auto")
+    except Exception as e:
+        logging.warning("[CRISE] notification : %s", e)
+    return {"ok": True, "declenchee": True, "raison": raison}
+
+
+_CRISE_BOUCLE = [False]
+
+
+def _crise_boucle():
+    time.sleep(60)
+    while True:
+        try:
+            crise_veille()
+        except Exception as e:
+            logging.warning("[CRISE] veille : %s", e)
+        time.sleep(60)
+
+
+def _crise_demarrer() -> None:
+    if _CRISE_BOUCLE[0]:
+        return
+    _CRISE_BOUCLE[0] = True
+    threading.Thread(target=_crise_boucle, daemon=True, name="crise-veille").start()
 
 
 def confinement_lever(acteur: str = "") -> dict:
@@ -24812,7 +25017,7 @@ def notif_urgence_etat() -> dict:
     c = confinement_etat()
     return {"gel": autonomie_gelee(),
             "envois_coupes": bool(_urg_cfg("envois_coupes", False)),
-            "confine": bool(c.get("actif")), "confinement": c,
+            "confine": bool(c.get("actif")), "confinement": c, "crise": crise_auto_etat(),
             "usages": _nt_urgence_usages()}
 
 
@@ -73850,10 +74055,10 @@ _AUT_CATALOGUE = [
  ]),
  ('crise', 'Crise', "Procédure préparée à l'avance, déclenchée d'un geste.", [
    ('couper-l-acces-public-garder-le-tailnet', "Couper l'accès public, garder le tailnet", 'ecrire', 'oui', 'retour en un geste'),
-   ('geler-tous-les-envois-mandats', 'Geler tous les envois (mandats)', 'brancher', 'oui', 'les alertes vont à la cloche'),
+   ('geler-tous-les-envois-mandats', 'Geler tous les envois (mandats)', 'ok', 'oui', 'les alertes vont à la cloche'),
    ('isoler-une-machine-du-parc', 'Isoler une machine du parc', 'ecrire', 'oui', 'SSH par le tailnet conservé'),
    ('faire-tourner-toutes-les-cles-et-jetons', 'Faire tourner toutes les clés et jetons', 'ecrire', 'part', 'ancienne clé valide 24 h'),
-   ('passer-en-lecture-seule', 'Passer en lecture seule', 'ecrire', 'oui', 'retour en un geste'),
+   ('passer-en-lecture-seule', 'Passer en lecture seule', 'ok', 'oui', 'retour en un geste'),
    ('rediger-le-rapport-d-incident', "Rédiger le rapport d'incident", 'brancher', 'oui', 'écrit au journal'),
  ]),
  ('sauvegardes-preuve-et-hors-site', 'Sauvegardes : preuve et hors site', 'Restaurer pour de vrai, envoyer ailleurs, purger.', [
@@ -74463,6 +74668,8 @@ def aut_porte(cle: str, sujet: str = "", titre: str = "") -> dict:
         return {"ok": False, "motif": motif, "eff": eff, "cle": cle, "sujet": sujet}
     if autonomie_gelee():
         return _non("l'autonomie de Cassandra est gelée")
+    if cle != _CRISE_CLE and crise_lecture_seule():
+        return _non("crise en cours : lecture seule")
     if eff.get("origine") != "global" and eff.get("palier") in ("observer", "proposer"):
         return _non("palier « %s » sur « %s » : elle ne le fait pas seule" % (eff["palier"], eff.get("libelle", cle)))
     if not _aut_fenetre_ok(eff):
@@ -74576,6 +74783,8 @@ def pf_autorise(signature: str, action_kind: str, cmd: str, fkey: str = "",
         return {"ok": False, "motif": motif, "palier": palier}
     if autonomie_gelee():
         return _non("l'autonomie de Cassandra est gelée")
+    if crise_lecture_seule(action_kind):
+        return _non("crise en cours : lecture seule, seul le bannissement reste permis")
     if palier == "observer":
         return _non("palier « observer » : elle ne fait rien seule")
     if palier == "proposer":
@@ -98870,7 +99079,7 @@ class CassandraHandler(BaseHTTPRequestHandler):
                     "/api/pf/ombre", "/api/pf/ombre/avis",
                     "/api/notif/agir", "/api/notif/essai",
                     "/api/urgence/etat", "/api/urgence/geler", "/api/urgence/envois",
-                    "/api/urgence/sessions", "/api/urgence/confiner", "/api/urgence/lever",
+                    "/api/urgence/sessions", "/api/urgence/confiner", "/api/urgence/lever", "/api/urgence/crise-lever",
                     "/api/urgence/confirmer",
                     "/api/snapshots", "/api/rollback", "/api/crons",
                     # Rappel : liste blanche. Une route absente d'ici répond 404
@@ -99407,7 +99616,10 @@ class CassandraHandler(BaseHTTPRequestHandler):
             # dehors en s'autorisant quelqu'un d'autre.
             _ip = self.client_address[0] if self.client_address else ""
             r = confiner(data.get("niveau"), _ip, int(data.get("minutes", 30) or 30),
-                         str(data.get("mot", "")), get_session_user(_sid) or "")
+                         str(data.get("mot", "")), get_session_user(_sid) or "", str(data.get("motif", "")))
+            self.send_json(r, 200 if r.get("ok") else 400); return
+        if path == "/api/urgence/crise-lever":
+            r = crise_auto_lever(get_session_user(_sid) or "", str(data.get("motif", "")))
             self.send_json(r, 200 if r.get("ok") else 400); return
         if path == "/api/urgence/lever":
             r = confinement_lever(get_session_user(_sid) or "")
@@ -108069,6 +108281,10 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
           rend le geste sûr : dans le pire des cas — vous vous êtes enfermé dehors — la
           machine vous rouvre la porte toute seule.</div></div>
 
+        <div><label class="bu-fld" style="display:block"><span>Pourquoi ? Obligatoire,
+          consigné au journal (10 caractères au moins)</span>
+          <textarea class="bu-inp" id="nt-motif" rows="2" oninput="confMaj()"
+            placeholder="ex. connexion inconnue à 03:12, fichiers modifiés dans /var/www"></textarea></label></div>
         <div><label class="bu-fld" style="display:block"><span>Pour confirmer, tapez
           CONFINER</span>
           <input class="bu-inp mono" id="nt-mot" placeholder="CONFINER"
@@ -108425,6 +108641,7 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
             <div class="mx-gest" style="justify-content:flex-start;align-items:center">
               <button class="mx-btn sc-danger" type="button" onclick="urgConfiner()">Confiner</button>
               <button class="mx-btn" type="button" onclick="urgLever()">Lever le confinement</button>
+              <button class="mx-btn sc-danger" type="button" id="urg-crise-b" hidden onclick="urgCriseLever()">Lever la crise</button>
               <span class="s-hint" id="urg-msg" style="margin:0"></span>
             </div>
           </section>
@@ -115888,10 +116105,12 @@ function confNiv(r){
 }
 function confMaj(){
     const m=document.getElementById('nt-mot'), g=document.getElementById('nt-go');
-    if(g) g.disabled=((m?m.value:'').trim().toUpperCase()!=='CONFINER');
+    const mo=document.getElementById('nt-motif');
+    if(g) g.disabled=((m?m.value:'').trim().toUpperCase()!=='CONFINER')||((mo?mo.value:'').trim().length<10);
 }
 async function confOuvrir(){
     const m=document.getElementById('nt-mot'); if(m) m.value='';
+    const mo=document.getElementById('nt-motif'); if(mo) mo.value='';
     confMaj();
     try{
         const d=await apiPost('/api/urgence/etat',{});
@@ -115907,11 +116126,12 @@ async function confiner(){
     const n=(document.querySelector('[name="nt-niv"]:checked')||{}).value||'1';
     const min=(document.getElementById('nt-min')||{}).value||'30';
     const mot=(document.getElementById('nt-mot')||{}).value||'';
+    const motif=((document.getElementById('nt-motif')||{}).value||'').trim();
     confFermer();
     if(typeof showToast==='function') showToast('Confinement en cours…','info',4000);
     try{
         const d=await apiPost('/api/urgence/confiner',
-            {niveau:parseInt(n,10), minutes:parseInt(min,10), mot:mot});
+            {niveau:parseInt(n,10), minutes:parseInt(min,10), mot:mot, motif:motif});
         if(d&&d.ok){
             ntFeuille({titre:'Confinement appliqué — niveau '+d.niveau, danger:true, annuler:'Fermer',
                        sous:'Votre adresse '+d.ip+' est restée joignable à chaque étape. Retour automatique le '+d.fin+' si vous ne confirmez pas.',
@@ -145519,13 +145739,24 @@ async function notifMachineEnregistrer(){
 }
 // Confinement : vit dans Sécurité › Défenses depuis le 24-09 (il était dans Réglages › Danger)
 async function urgCharger(){
-    try { const d = await apiPost('/api/urgence/etat', {}); const e = document.getElementById('urg-etat'); if (e) e.textContent = (d && (d.actif || d.confine)) ? ('confinée · niveau ' + (d.niveau || '?') + (d.fin ? ' · jusqu\u2019à ' + String(d.fin).slice(11, 16) : '')) : 'libre'; } catch(e) {}
+    try {
+        const d = await apiPost('/api/urgence/etat', {}); const et = (d && d.etat) || {}, cf = et.confinement || {}, cr = et.crise || {};
+        const e = document.getElementById('urg-etat'), b = document.getElementById('urg-crise-b');
+        let t = (et.confine || cf.actif) ? ('confinée · niveau ' + (cf.niveau || '?') + (cf.fin ? ' · jusqu\u2019à ' + String(cf.fin).slice(11, 16) : '') + (cf.motif ? ' · ' + cf.motif : '')) : 'libre';
+        if (cr.actif) t = 'CRISE automatique · ' + (cr.raison || '?') + (cr.calme_dit ? ' · revenu au calme' : '') + (t === 'libre' ? '' : ' · ' + t);
+        if (e) e.textContent = t;
+        if (b) b.hidden = !cr.actif;
+    } catch(e) {}
+}
+async function urgCriseLever(){
+    if (!await fp2Confirm('Les envois reprennent et Cassandra recommence à agir seule.\n\nLever la crise ?', 'Lever la crise')) return;
+    try { const d = await apiPost('/api/urgence/crise-lever', {}); _sfb('urg-msg', d && d.ok ? 'Crise levée' : ('Refus : ' + ((d && d.reason) || '?')), d && d.ok ? 'ok' : 'err'); urgCharger(); } catch(e) {}
 }
 async function urgConfiner(){
     const niv = (document.getElementById('urg-niveau') || {}).value || '2', min = parseInt((document.getElementById('urg-minutes') || {}).value || '30', 10);
-    const r = await fp2Demander('Niveau ' + niv + ' pendant ' + min + ' min : les sorties sont coupées, les agents gelés ; retour automatique ensuite, « Lever » avant si vous voulez.\n\nConfiner Cassandra ?', 'Confiner Cassandra', {mot: 'CONFINER', danger: true, ok: 'Confiner'});
+    const r = await fp2Demander('Niveau ' + niv + ' pendant ' + min + ' min : les sorties sont coupées, les agents gelés ; retour automatique ensuite, « Lever » avant si vous voulez.\n\nConfiner Cassandra ?', 'Confiner Cassandra', {mot: 'CONFINER', motif: true, danger: true, ok: 'Confiner'});
     if (!r.ok) return;
-    try { const d = await apiPost('/api/urgence/confiner', {niveau: parseInt(niv, 10), minutes: min, mot: r.mot}); _sfb('urg-msg', d && d.ok ? 'Confinée' : ('Refus : ' + ((d && d.reason) || '?')), d && d.ok ? 'ok' : 'err'); urgCharger(); }
+    try { const d = await apiPost('/api/urgence/confiner', {niveau: parseInt(niv, 10), minutes: min, mot: r.mot, motif: r.motif}); _sfb('urg-msg', d && d.ok ? 'Confinée' : ('Refus : ' + ((d && d.reason) || '?')), d && d.ok ? 'ok' : 'err'); urgCharger(); }
     catch(e) { _sfb('urg-msg', 'Erreur réseau', 'err'); }
 }
 async function urgLever(){
@@ -149225,11 +149456,16 @@ function fp2Demander(message, titre, opts){
         fe.innerHTML = `<h4>${escapeHtml(titre || 'Confirmer le geste')}</h4><p>${escapeHtml(lignes.join('\n'))}</p>`
           + (opts.mdp ? `<div class="s-field" style="margin-top:8px"><label class="s-label">Mot de passe administrateur</label><input class="s-input" type="password" id="fp2-mdp" autocomplete="current-password" placeholder="••••••••"></div>` : '')
           + (opts.mot ? `<div class="s-field" style="margin-top:8px"><label class="s-label">Tapez « ${escapeHtml(opts.mot)} »</label><input class="s-input mono" id="fp2-mot" autocomplete="off" placeholder="${escapeHtml(opts.mot)}"></div>` : '')
+          + (opts.motif ? `<div class="s-field" style="margin-top:8px"><label class="s-label">Pourquoi ? (obligatoire, consigné au journal)</label><textarea class="s-input" id="fp2-motif" rows="2" placeholder="ex. connexion inconnue à 03:12, fichiers modifiés dans /var/www"></textarea></div>` : '')
           + `<div class="apercu">journal → <b>${escapeHtml(question.replace(/\s*\?$/, ''))}</b> · acteur ${escapeHtml(acteur)} · ${fp2Heure()}</div>`
           + (opts.garde ? `<div class="s-hint" id="fp2-garde" style="margin:6px 0 0">Garde de ${opts.garde} s après « ${escapeHtml(opts.ok || 'Confirmer')} » : « Annuler » arrête tout.</div>` : '')
-          + `<div class="actions"><button class="fp-btn" onclick="fp2Fermer(false)">Annuler</button><button class="fp-btn primaire${opts.danger ? ' danger' : ''}" id="fp2-oui" ${opts.mot ? 'disabled' : ''} onclick="fp2Fermer(true)">${escapeHtml(opts.ok || 'Confirmer')}</button></div>`;
+          + `<div class="actions"><button class="fp-btn" onclick="fp2Fermer(false)">Annuler</button><button class="fp-btn primaire${opts.danger ? ' danger' : ''}" id="fp2-oui" ${(opts.mot || opts.motif) ? 'disabled' : ''} onclick="fp2Fermer(true)">${escapeHtml(opts.ok || 'Confirmer')}</button></div>`;
         vo.classList.add('on');
-        if (opts.mot) { const im = document.getElementById('fp2-mot'); im.oninput = () => { document.getElementById('fp2-oui').disabled = im.value.trim() !== opts.mot; }; }
+        if (opts.mot || opts.motif) {
+            const im = document.getElementById('fp2-mot'), mo = document.getElementById('fp2-motif');
+            const maj = () => { document.getElementById('fp2-oui').disabled = !!((im && im.value.trim() !== opts.mot) || (mo && mo.value.trim().length < 10)); };
+            if (im) im.oninput = maj; if (mo) mo.oninput = maj;
+        }
         _fp2Demande = { resolve, q: question, opts };
         _fp2Confirm = null;
     });
@@ -149239,6 +149475,7 @@ function fp2Fermer(ok){
         const d = _fp2Demande;
         const mdp = (document.getElementById('fp2-mdp') || {}).value || '';
         const mot = (document.getElementById('fp2-mot') || {}).value || '';
+        const motif = (document.getElementById('fp2-motif') || {}).value || '';
         if (ok && d.opts.mdp && !mdp) { const i = document.getElementById('fp2-mdp'); if (i) { i.focus(); i.style.borderColor = 'var(--danger)'; } return; }
         if (ok && d.opts.garde && !d.lance) {
             // le délai de garde : le geste part à la fin, « Annuler » l'arrête avant
@@ -149252,7 +149489,7 @@ function fp2Fermer(ok){
         const vo = document.getElementById('fp2-voile'); if (vo) vo.classList.remove('on');
         _fp2Demande = null;
         if (ok) _fp2Journal.push({ t: fp2Heure(), q: d.q.replace(/\s*\?$/, '') });
-        d.resolve({ ok: !!ok, mdp: mdp, mot: mot });
+        d.resolve({ ok: !!ok, mdp: mdp, mot: mot, motif: motif.trim() });
         return;
     }
     const vo = document.getElementById('fp2-voile'); if (vo) vo.classList.remove('on');
@@ -152103,6 +152340,7 @@ if __name__ == "__main__":
         _start_ws_broadcaster()  # [EVO5] push WebSocket 1s
         try:
             _nt_demarrer()           # la passe du centre : sondes, expirations, enveloppe du matin, battement
+            _crise_demarrer()        # la veille de crise : services critiques, sites, afflux d'adresses (chaque minute)
             _courrier_demarrer()     # LOT 3 : la passe du courrier gardé, une boîte après l'autre
             _rap_demarrer()          # LOT 4 : la passe des rappels, hors de la boucle des seuils
             threading.Thread(target=_menage_lot8_demarrage, daemon=True,
