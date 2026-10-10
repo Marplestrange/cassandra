@@ -109185,7 +109185,8 @@ select,select.bu-inp,select.s-select,.s-select,select.mx-select{padding:6px 28px
     <div class="pf-view" id="pf-v-auto" style="flex:1;overflow-y:auto;min-height:0;
          padding:16px 20px">
       <div class="card bu-flush" style="margin-bottom:15px">
-        <div class="bu-ct">Jusqu'où elle peut aller seule</div>
+        <div class="bu-ct">Par défaut, jusqu'où elle peut aller seule</div>
+        <p class="bu-note" id="aut-ecarts">Chaque domaine et chaque geste peut s'en écarter (onglet Règles).</p>
         <div id="pf-paliers" style="padding:14px 16px;display:grid;gap:9px"></div>
       </div>
       <div id="aut-alerte"></div>
@@ -114823,6 +114824,14 @@ function autRendre(){
     if(!d){ dom.innerHTML='<div class="empty-state" style="padding:22px">Les règles ne répondent pas.</div>'; return; }
     const ouv=ETAT.proactivite._autOuv||(ETAT.proactivite._autOuv={}); const gouv=ETAT.proactivite._autGeste||(ETAT.proactivite._autGeste={});
     const def=d.defaut||{}, ch=d.choix||{};
+    const ec=document.getElementById('aut-ecarts');
+    if(ec){
+        const nd=d.domaines.filter(function(x){ return (x.reglages||{}).lv; }).length;
+        const ng=d.domaines.reduce(function(s,x){ return s+x.gestes.filter(function(g){ return (g.reglages||{}).lv; }).length; },0);
+        ec.textContent='Chaque domaine et chaque geste peut s’en écarter (onglet Règles). Aujourd’hui : '+
+            (nd?nd+' domaine'+(nd>1?'s ont':' a')+' son propre palier':'aucun domaine n’a son propre palier')+
+            ', '+(ng?ng+' geste'+(ng>1?'s':'')+' en particulier.':'aucun geste en particulier.');
+    }
     let nOk=0, nBr=0, nEc=0, nDur=0; const decl=[];
     dom.innerHTML=d.domaines.map(function(dm){
         const dl=dm.reglages||{};
