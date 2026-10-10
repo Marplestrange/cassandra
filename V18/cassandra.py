@@ -73466,38 +73466,527 @@ def _pf_en_pause() -> bool:
     return (d <= h < f) if d < f else (h >= d or h < f)
 
 
+# ════════════════════════════════════════════════════════
+#  L'AUTONOMIE PAR DOMAINE ET PAR GESTE (10-10)
+#
+#  Un seul curseur pour tout (le palier global) ne disait pas « sur ce sujet agis seule, sur celui-là
+#  demande ». Ici : un catalogue de domaines et de gestes (la liste validée sur maquette), un réglage par
+#  domaine et par geste (SQLite, pas config.json : « la sauvegarde remplace TOUT le fichier »), des
+#  DISJONCTEURS à la place du plafond par jour, et chaque action autonome inscrite au journal avec la règle
+#  qui l'a permise.
+#
+#  Rien ne change tant qu'on ne règle rien : un geste sans réglage retombe sur le palier global, comme avant.
+#  Les gestes « à brancher » ou « à écrire » ne SAVENT pas encore agir : leur palier est borné à « proposer ».
+#  Un geste « garde dure » reste à « proposer », quoi qu'on écrive.
+# ════════════════════════════════════════════════════════
+_AUT_CATALOGUE = [
+ ('machine', 'Machine', 'Services, paquets, correctifs, disque, redémarrages.', [
+   ('relancer-un-service', 'Relancer un service', 'ok', 'oui', 'santé vérifiée après coup'),
+   ('relancer-le-collecteur', 'Relancer le collecteur', 'brancher', 'oui', 'même garde que les services'),
+   ('purger-journaux-et-caches', 'Purger journaux et caches', 'brancher', 'part', 'liste de caches inoffensifs'),
+   ('appliquer-les-correctifs-de-securite', 'Appliquer les correctifs de sécurité', 'brancher', 'part', 'aucune'),
+   ('installer-ou-retirer-un-paquet-precis', 'Installer ou retirer un paquet précis', 'brancher', 'part', 'un paquet nommé'),
+   ('redemarrer-la-machine', 'Redémarrer la machine', 'brancher', 'non', 'après mise à jour du noyau, hors heures ouvrées'),
+   ('verrouiller-ssh-arreter-les-services-inutiles', 'Verrouiller SSH, arrêter les services inutiles', 'brancher', 'part', 'clé SSH présente, unités listées'),
+ ]),
+ ('reseau-et-acces', 'Réseau et accès', 'Adresses, robots, chemins, pare-feu, interfaces.', [
+   ('bannir-ou-debannir-une-adresse-ou-un-pays', 'Bannir ou débannir une adresse ou un pays', 'brancher', 'oui', 'exclut maison, tailnet, confiance'),
+   ('freiner-bloquer-ou-liberer-un-robot', 'Freiner, bloquer ou libérer un robot', 'brancher', 'oui', "fichier d'ajouts du site"),
+   ('fermer-ou-rouvrir-un-chemin', 'Fermer ou rouvrir un chemin', 'brancher', 'oui', 'refus sur « / » ou si des humains y passent'),
+   ('poser-ou-retirer-une-regle-de-pare-feu', 'Poser ou retirer une règle de pare-feu', 'brancher', 'oui', "à l'essai, retour automatique"),
+   ('couper-ou-retablir-une-interface', 'Couper ou rétablir une interface', 'brancher', 'oui', 'interfaces réservées'),
+   ('fermer-une-session-ssh', 'Fermer une session SSH', 'brancher', 'non', 'identifiant valide'),
+ ]),
+ ('hebergement', 'Hébergement', 'Sites, bases, sauvegardes, certificats, domaines (FastPanel).', [
+   ('relancer-un-site', 'Relancer un site', 'brancher', 'oui', 'réponse HTTP vérifiée'),
+   ('relancer-une-sauvegarde-en-echec', 'Relancer une sauvegarde en échec', 'brancher', 'oui', 'aucune'),
+   ('renouveler-un-certificat', 'Renouveler un certificat', 'brancher', 'oui', 'seuil de 30 jours'),
+   ('creer-une-base-de-donnees', 'Créer une base de données', 'ecrire', 'oui', 'cloisonnement par compte'),
+   ('creer-ou-modifier-un-plan-de-sauvegarde', 'Créer ou modifier un plan de sauvegarde', 'ecrire', 'oui', 'cloisonnement par compte'),
+   ('ajouter-un-site-ou-un-domaine', 'Ajouter un site ou un domaine', 'ecrire', 'oui', 'cloisonnement par compte'),
+   ('supprimer-une-base-ou-un-site', 'Supprimer une base ou un site', 'dur', 'non', 'confirmation humaine'),
+ ]),
+ ('conteneurs', 'Conteneurs', 'Docker et Compose.', [
+   ('relancer-un-conteneur', 'Relancer un conteneur', 'brancher', 'oui', 'dossiers connus'),
+   ('mettre-une-image-a-jour', 'Mettre une image à jour', 'brancher', 'part', 'retour automatique si « unhealthy »'),
+ ]),
+ ('comptes', 'Comptes', 'Utilisateurs, droits, clés de sécurité.', [
+   ('creer-un-compte', 'Créer un compte', 'ecrire', 'oui', "cloisonnement : l'admin ne voit pas les autres"),
+   ('modifier-les-droits-d-un-compte', "Modifier les droits d'un compte", 'ecrire', 'oui', 'journal « qui a fait quoi »'),
+   ('revoquer-une-cle-ou-une-session-inutilisee', 'Révoquer une clé ou une session inutilisée', 'ecrire', 'oui', 'inactive depuis 90 jours'),
+   ('envoyer-un-lien-de-reinitialisation', 'Envoyer un lien de réinitialisation', 'ecrire', 'non', 'adresse prise sur le compte, jamais sur la demande'),
+ ]),
+ ('courrier-et-messages', 'Courrier et messages', "Rangement, mandats d'envoi, Telegram.", [
+   ('ranger-classer-archiver-le-courrier', 'Ranger, classer, archiver le courrier', 'ok', 'oui', 'corbeille'),
+   ('envoyer-un-message-sous-mandat', 'Envoyer un message sous mandat', 'ok', 'non', 'mandat + contexte non teinté'),
+   ('envoyer-sur-telegram', 'Envoyer sur Telegram', 'ecrire', 'non', "mandat rédigé à l'avance"),
+   ('suspendre-l-envoi-d-un-site-qui-part-en-spam', "Suspendre l'envoi d'un site qui part en spam", 'ecrire', 'oui', 'seuil de plaintes'),
+ ]),
+ ('flotte', 'Flotte', 'Machines du parc, agents, transferts.', [
+   ('relancer-l-agent-d-une-machine', "Relancer l'agent d'une machine", 'brancher', 'oui', 'SSH, clé dédiée'),
+   ('deposer-un-fichier-sur-une-machine', 'Déposer un fichier sur une machine', 'brancher', 'non', 'dépôt de travail seulement'),
+   ('ajouter-ou-retirer-une-machine', 'Ajouter ou retirer une machine', 'ecrire', 'oui', 'clé neuve à chaque ajout'),
+ ]),
+ ('coffre', 'Coffre', 'Secrets et clés.', [
+   ('se-servir-d-un-secret-pour-une-tache', "Se servir d'un secret pour une tâche", 'ok', 'oui', "jamais affiché, remplacé à l'exécution"),
+   ('creer-ou-versionner-un-secret', 'Créer ou versionner un secret', 'ecrire', 'oui', 'ancienne version gardée'),
+   ('supprimer-un-secret', 'Supprimer un secret', 'dur', 'non', 'confirmation humaine'),
+ ]),
+ ('travail-d-itare', "Travail d'Itare", 'Notes, projets, agenda, GED, pièces jointes, navigateur.', [
+   ('creer-et-modifier-notes-taches-rappels-agenda', 'Créer et modifier notes, tâches, rappels, agenda', 'ok', 'oui', "dans l'espace du compte"),
+   ('classer-dans-la-ged-et-indexer-les-pieces-jointe', 'Classer dans la GED et indexer les pièces jointes', 'ok', 'oui', 'corbeille'),
+   ('naviguer-sur-le-web-en-cage', 'Naviguer sur le web en cage', 'ok', 'oui', 'adresses internes refusées'),
+   ('creer-un-lien-de-partage-public', 'Créer un lien de partage public', 'ecrire', 'oui', 'durée limitée, expire seul'),
+   ('supprimer-un-projet-ou-une-tache', 'Supprimer un projet ou une tâche', 'dur', 'non', 'suppression définitive'),
+ ]),
+ ('son-propre-code', 'Son propre code', 'Évolution quotidienne, catalogue.', [
+   ('evoluer-chaque-nuit', 'Évoluer chaque nuit', 'ok', 'oui', 'copie avant, retour arrière, raison au journal'),
+   ('etendre-son-catalogue-de-gestes', 'Étendre son catalogue de gestes', 'ok', 'oui', 'tour sans lecture extérieure'),
+ ]),
+ ('domaines-et-dns', 'Domaines et DNS', 'Enregistrements, SPF, DKIM, DMARC, tunnels, expirations.', [
+   ('corriger-un-enregistrement-derive-de-la-referenc', 'Corriger un enregistrement dérivé de la référence (A, MX)', 'ecrire', 'oui', 'référence versionnée'),
+   ('publier-ou-reparer-spf-dkim-dmarc', 'Publier ou réparer SPF, DKIM, DMARC', 'ecrire', 'oui', 'valeurs validées avant publication'),
+   ('surveiller-les-expirations-de-domaines', 'Surveiller les expirations de domaines', 'ecrire', 'oui', 'lecture seule'),
+   ('gerer-les-tunnels-cloudflare', 'Gérer les tunnels Cloudflare', 'ecrire', 'oui', 'tailnet toujours joignable'),
+   ('modifier-les-serveurs-de-noms', 'Modifier les serveurs de noms', 'dur', 'non', 'peut couper un site entier'),
+   ('renouveler-ou-acheter-un-domaine', 'Renouveler ou acheter un domaine', 'dur', 'non', 'dépense : accord humain'),
+ ]),
+ ('crise', 'Crise', "Procédure préparée à l'avance, déclenchée d'un geste.", [
+   ('couper-l-acces-public-garder-le-tailnet', "Couper l'accès public, garder le tailnet", 'ecrire', 'oui', 'retour en un geste'),
+   ('geler-tous-les-envois-mandats', 'Geler tous les envois (mandats)', 'brancher', 'oui', 'les alertes vont à la cloche'),
+   ('isoler-une-machine-du-parc', 'Isoler une machine du parc', 'ecrire', 'oui', 'SSH par le tailnet conservé'),
+   ('faire-tourner-toutes-les-cles-et-jetons', 'Faire tourner toutes les clés et jetons', 'ecrire', 'part', 'ancienne clé valide 24 h'),
+   ('passer-en-lecture-seule', 'Passer en lecture seule', 'ecrire', 'oui', 'retour en un geste'),
+   ('rediger-le-rapport-d-incident', "Rédiger le rapport d'incident", 'brancher', 'oui', 'écrit au journal'),
+ ]),
+ ('sauvegardes-preuve-et-hors-site', 'Sauvegardes : preuve et hors site', 'Restaurer pour de vrai, envoyer ailleurs, purger.', [
+   ('tester-une-restauration-en-bac-a-sable', 'Tester une restauration en bac à sable', 'ecrire', 'oui', 'bac isolé, rien en production'),
+   ('verifier-les-empreintes-des-sauvegardes', 'Vérifier les empreintes des sauvegardes', 'ecrire', 'oui', 'lecture seule'),
+   ('envoyer-une-sauvegarde-hors-site', 'Envoyer une sauvegarde hors site', 'ecrire', 'oui', 'destination à décider'),
+   ('purger-les-sauvegardes-hors-retention', 'Purger les sauvegardes hors rétention', 'dur', 'non', 'suppression irréversible'),
+ ]),
+ ('rotation-des-secrets', 'Rotation des secrets', 'Clés SSH, jetons, mots de passe de service.', [
+   ('signaler-un-secret-trop-ancien', 'Signaler un secret trop ancien', 'ecrire', 'oui', 'lecture seule'),
+   ('faire-tourner-une-cle-ssh', 'Faire tourner une clé SSH', 'ecrire', 'part', 'ancienne clé valide 24 h'),
+   ('regenerer-un-jeton-d-api', "Régénérer un jeton d'API", 'ecrire', 'part', 'service vérifié après coup'),
+   ('remplacer-un-mot-de-passe-de-service', 'Remplacer un mot de passe de service', 'ecrire', 'part', 'écrit dans le coffre avant usage'),
+ ]),
+ ('defense-vue-de-l-exterieur', "Défense vue de l'extérieur", "Ce qui est vraiment exposé, comparé à ce qui devrait l'être.", [
+   ('scanner-sa-surface-depuis-l-exterieur', "Scanner sa surface depuis l'extérieur", 'ecrire', 'oui', 'ses propres adresses seulement'),
+   ('comparer-a-la-surface-attendue', 'Comparer à la surface attendue', 'ecrire', 'oui', 'lecture seule'),
+   ('refermer-ce-qui-n-aurait-pas-du-etre-ouvert', "Refermer ce qui n'aurait pas dû être ouvert", 'brancher', 'oui', "pare-feu à l'essai"),
+   ('lancer-clamav-lynis-trivy', 'Lancer ClamAV, Lynis, Trivy', 'brancher', 'oui', 'outils en liste blanche'),
+ ]),
+ ('modeles-et-quotas', 'Modèles et quotas', 'Fournisseurs, bascules, coûts.', [
+   ('basculer-sur-un-autre-fournisseur-quand-un-quota', 'Basculer sur un autre fournisseur quand un quota tombe', 'brancher', 'oui', 'secours déclarés seulement'),
+   ('choisir-le-modele-le-moins-cher-qui-suffit', 'Choisir le modèle le moins cher qui suffit', 'ecrire', 'oui', "combos cc-* gratuits d'abord"),
+   ('ajuster-les-combinaisons-omniroute', 'Ajuster les combinaisons OmniRoute', 'ecrire', 'oui', 'compression interdite'),
+   ('depasser-un-plafond-de-depense', 'Dépasser un plafond de dépense', 'dur', 'non', 'dépense : accord humain'),
+ ]),
+ ('automatismes', 'Automatismes', 'Ses propres tâches planifiées.', [
+   ('creer-ou-modifier-une-tache-planifiee', 'Créer ou modifier une tâche planifiée', 'ecrire', 'oui', 'journal « qui a fait quoi »'),
+   ('suspendre-une-tache-qui-boucle', 'Suspendre une tâche qui boucle', 'ecrire', 'oui', 'reprise en un geste'),
+   ('corriger-un-cron-silencieux', 'Corriger un cron silencieux', 'ecrire', 'oui', 'ancienne ligne gardée'),
+ ]),
+ ('coordination-des-agents', 'Coordination des agents', 'Salon, journal des agents, délégation.', [
+   ('ouvrir-un-fil-et-inviter-des-agents', 'Ouvrir un fil et inviter des agents', 'ok', 'oui', 'dans le salon'),
+   ('ecrire-au-journal-des-agents', 'Écrire au journal des agents', 'ok', 'oui', 'aucune'),
+   ('deleguer-une-lecture-lourde-a-l-agent-d-orion', "Déléguer une lecture lourde à l'agent d'Orion", 'brancher', 'oui', 'lecture seule, sans données personnelles'),
+   ('poser-une-question-aux-agents-invites-par-le-jou', 'Poser une question aux agents invités par le journal des agents', 'ok', 'oui', "ils répondent s'ils sont connectés, rien n'attend leur réponse"),
+ ]),
+ ('sites-wordpress', 'Sites WordPress', 'Cœur, plugins, cache, restauration.', [
+   ('vider-le-cache', 'Vider le cache', 'ecrire', 'oui', 'aucune'),
+   ('desactiver-un-plugin-fautif', 'Désactiver un plugin fautif', 'ecrire', 'oui', 'réactivable'),
+   ('mettre-a-jour-le-cur-et-les-plugins', 'Mettre à jour le cœur et les plugins', 'ecrire', 'part', 'point de restauration obligatoire'),
+   ('restaurer-le-site-depuis-une-sauvegarde', 'Restaurer le site depuis une sauvegarde', 'ecrire', 'part', 'état actuel gardé avant écrasement'),
+ ]),
+]
+
+# Le geste du catalogue que sait déclencher chaque action_kind du moteur proactif. Les autres restent au
+# palier global, sans disjoncteur : l'ancien comportement.
+_AUT_GESTE_DE_KIND = {"service.restart": "machine/relancer-un-service"}
+_AUT_STATUTS = {"ok": "en service", "brancher": "à brancher", "ecrire": "à écrire", "dur": "garde dure"}
+_AUT_DEFAUT = {"lv": None, "ombre": False, "decl": "Sur alerte", "per": "Hérite du domaine", "excl": "",
+               "fen": "Toujours", "fd": "02:00", "ff": "06:00", "ech": 2, "boucle": 3, "boucleh": "1 h",
+               "avis": None, "aviq": "Hérite de la gouvernance", "snap": None,
+               "ou": "Hérite (selon le geste)", "nuit": "Hérite de la gouvernance"}
+_AUT_CHOIX = {"decl": ("Sur alerte", "Planifié", "Sur demande seulement", "Sur alerte et planifié"),
+              "per": ("Hérite du domaine", "Orion seulement", "Les sites de la maison seulement", "Une sélection à choisir"),
+              "fen": ("Toujours", "Plage horaire", "Hors heures ouvrées"),
+              "boucleh": ("1 h", "6 h", "24 h"),
+              "aviq": ("Hérite de la gouvernance",),      # le reste vient du registre de modèles
+              "ou": ("Hérite (selon le geste)", "Info : la cloche", "À voir : cloche et e-mail à l'administrateur",
+                     "Critique : cloche, e-mail et Telegram"),
+              "nuit": ("Hérite de la gouvernance", "Oui, pour ce geste", "Non, jamais pour ce geste")}
+_AUT_INDEX = {}
+
+
+def _aut_index() -> dict:
+    """cle -> (domaine, geste) ; « d:<dom> » pour un domaine, « g:<dom>/<geste> » pour un geste."""
+    if not _AUT_INDEX:
+        for did, dnom, ddesc, gestes in _AUT_CATALOGUE:
+            _AUT_INDEX["d:" + did] = {"domaine": did, "nom": dnom, "desc": ddesc}
+            for gid, gnom, st, rev, garde in gestes:
+                _AUT_INDEX["g:%s/%s" % (did, gid)] = {"domaine": did, "geste": gid, "nom": gnom, "st": st,
+                                                       "rev": rev, "garde": garde, "dnom": dnom}
+    return _AUT_INDEX
+
+
+def aut_libelle(cle: str) -> str:
+    """« Machine › Relancer un service » pour « machine/relancer-un-service »."""
+    e = _aut_index().get("g:" + str(cle or ""))
+    return ("%s › %s" % (e["dnom"], e["nom"])) if e else str(cle or "")
+
+
+def _aut_conn():
+    conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE IF NOT EXISTS autonomie_reglages (cle TEXT PRIMARY KEY, reglages TEXT NOT NULL, "
+                 "ts TEXT DEFAULT (datetime('now','localtime')), par TEXT DEFAULT '')")
+    conn.execute("CREATE TABLE IF NOT EXISTS autonomie_disj (cle TEXT PRIMARY KEY, etat TEXT NOT NULL DEFAULT 'arme', "
+                 "raison TEXT DEFAULT '', depuis TEXT DEFAULT '', echecs_suite INTEGER DEFAULT 0)")
+    conn.execute("CREATE TABLE IF NOT EXISTS autonomie_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, "
+                 "cle TEXT NOT NULL, sujet TEXT DEFAULT '', ok INTEGER)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_aut_act ON autonomie_actions(cle, sujet, ts)")
+    return conn
+
+
+def aut_reglages_lire() -> dict:
+    try:
+        conn = _aut_conn()
+        try:
+            out = {}
+            for r in conn.execute("SELECT cle, reglages FROM autonomie_reglages"):
+                try:
+                    out[r["cle"]] = json.loads(r["reglages"] or "{}")
+                except Exception:
+                    out[r["cle"]] = {}
+            return out
+        finally:
+            conn.close()
+    except Exception as e:
+        logging.info("[AUTONOMIE] lecture des réglages : %s", e)
+        return {}
+
+
+def aut_regler(cle: str, reglages: dict, acteur: str = "") -> dict:
+    ent = _aut_index().get(str(cle or ""))
+    if not ent:
+        return {"ok": False, "error": "domaine ou geste inconnu"}
+    est_geste = "geste" in ent
+    propres = {}
+    for k, v in (reglages or {}).items():
+        if k not in _AUT_DEFAUT:
+            return {"ok": False, "error": "réglage inconnu : %s" % str(k)[:40]}
+        if not est_geste and k not in ("lv", "per"):
+            return {"ok": False, "error": "un domaine ne porte que le palier et le périmètre"}
+        if k == "lv":
+            if v in (None, ""):
+                propres[k] = None
+            elif v not in _PF_PALIERS:
+                return {"ok": False, "error": "palier inconnu"}
+            elif est_geste and ent["st"] in ("dur", "ecrire") and _PF_PALIERS.index(v) > _PF_PALIERS.index("proposer"):
+                return {"ok": False, "error": "ce geste %s : il ne peut pas dépasser « proposer »" %
+                        ("est en garde dure" if ent["st"] == "dur" else "n'existe pas encore")}
+            else:
+                propres[k] = v
+        elif k in ("ombre", "avis", "snap"):
+            propres[k] = None if v is None else bool(v)
+        elif k in ("ech", "boucle"):
+            try:
+                n = int(v)
+            except Exception:
+                return {"ok": False, "error": "%s : un nombre est attendu" % k}
+            borne = (1, 5) if k == "ech" else (1, 10)
+            if not borne[0] <= n <= borne[1]:
+                return {"ok": False, "error": "%s : entre %d et %d" % (k, borne[0], borne[1])}
+            propres[k] = n
+        elif k in ("fd", "ff"):
+            if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(v or "")):
+                return {"ok": False, "error": "%s : une heure HH:MM est attendue" % k}
+            propres[k] = str(v)
+        elif k == "excl":
+            propres[k] = str(v or "")[:300]
+        elif k == "aviq":
+            propres[k] = str(v or _AUT_DEFAUT["aviq"])[:120]
+        else:                                   # decl, per, fen, boucleh, ou, nuit : une liste fermée
+            if str(v) not in _AUT_CHOIX[k]:
+                return {"ok": False, "error": "%s : valeur inconnue" % k}
+            propres[k] = str(v)
+    try:
+        conn = _aut_conn()
+        try:
+            row = conn.execute("SELECT reglages FROM autonomie_reglages WHERE cle = ?", (cle,)).fetchone()
+            actuel = json.loads(row["reglages"]) if row else {}
+            actuel.update(propres)
+            actuel = {k: v for k, v in actuel.items() if v != _AUT_DEFAUT.get(k)}
+            if actuel:
+                conn.execute("INSERT INTO autonomie_reglages (cle, reglages, par) VALUES (?,?,?) "
+                             "ON CONFLICT(cle) DO UPDATE SET reglages = excluded.reglages, par = excluded.par, "
+                             "ts = datetime('now','localtime')", (cle, json.dumps(actuel, ensure_ascii=False), acteur or ""))
+            else:
+                conn.execute("DELETE FROM autonomie_reglages WHERE cle = ?", (cle,))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"ok": False, "error": "enregistrement impossible : %s" % str(e)[:120]}
+    try:
+        log_user_activity(acteur, acteur, "autonomie_regler", "%s %s" % (cle, json.dumps(propres, ensure_ascii=False)[:160]))
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+def aut_remettre(cle: str, acteur: str = "") -> dict:
+    if str(cle or "") not in _aut_index():
+        return {"ok": False, "error": "domaine ou geste inconnu"}
+    try:
+        conn = _aut_conn()
+        try:
+            conn.execute("DELETE FROM autonomie_reglages WHERE cle = ?", (cle,))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+    return {"ok": True}
+
+
+def aut_effectif(cle: str, reglages: dict = None) -> dict:
+    """Ce qui s'applique à ce geste : le sien, sinon celui de son domaine, sinon le palier global."""
+    ent = _aut_index().get("g:" + str(cle or ""))
+    if not ent:
+        return {}
+    regl = reglages if reglages is not None else aut_reglages_lire()
+    g = regl.get("g:" + cle, {})
+    d = regl.get("d:" + ent["domaine"], {})
+    eff = dict(_AUT_DEFAUT)
+    eff.update({k: v for k, v in g.items() if k in _AUT_DEFAUT})
+    lv = g.get("lv") or d.get("lv")
+    origine = "geste" if g.get("lv") else ("domaine" if d.get("lv") else "global")
+    if not lv:
+        try:
+            lv = pf_autonomie()["palier"]
+        except Exception:
+            lv = "proposer"
+    borne = lv
+    if ent["st"] in ("dur", "ecrire") and _PF_PALIERS.index(lv) > _PF_PALIERS.index("proposer"):
+        borne = "proposer"
+    if eff["per"] == _AUT_DEFAUT["per"] and d.get("per"):
+        eff["per"] = d["per"]
+    eff.update({"palier": borne, "palier_voulu": lv, "origine": origine, "st": ent["st"], "rev": ent["rev"],
+                "cle": cle, "libelle": aut_libelle(cle)})
+    return eff
+
+
+def _aut_fenetre_ok(eff: dict) -> bool:
+    f = eff.get("fen")
+    if f == "Toujours":
+        return True
+    h = datetime.now().strftime("%H:%M")
+    if f == "Plage horaire":
+        d, e = eff.get("fd", "02:00"), eff.get("ff", "06:00")
+        return (d <= h < e) if d < e else (h >= d or h < e)
+    if f == "Hors heures ouvrées":
+        return not (str(_mem_cfg("pf_pause_debut", "09:00")) <= h < str(_mem_cfg("pf_pause_fin", "18:00")))
+    return True
+
+
+def _aut_declenche(conn, cle: str, raison: str) -> None:
+    conn.execute("INSERT INTO autonomie_disj (cle, etat, raison, depuis, echecs_suite) VALUES (?, 'declenche', ?, "
+                 "datetime('now','localtime'), 0) ON CONFLICT(cle) DO UPDATE SET etat = 'declenche', raison = excluded.raison, "
+                 "depuis = excluded.depuis", (cle, raison[:240]))
+    conn.commit()
+    try:
+        notif("Disjoncteur déclenché : %s" % aut_libelle(cle),
+              "%s. Cette règle ne fait plus rien seule ; tu la débloques dans Proactivité › Règles quand la cause est réglée." % raison,
+              source="veille", niveau="avoir", cle="aut:disj:%s" % cle)
+    except Exception as e:
+        logging.info("[AUTONOMIE] notification du disjoncteur : %s", e)
+
+
+def aut_disj_verifier(cle: str, sujet: str, eff: dict):
+    """Un motif de refus si le disjoncteur est déclenché, ou s'il se déclenche à l'instant (boucle) ; sinon None."""
+    try:
+        conn = _aut_conn()
+        try:
+            r = conn.execute("SELECT etat, raison FROM autonomie_disj WHERE cle = ?", (cle,)).fetchone()
+            if r and r["etat"] == "declenche":
+                return "disjoncteur déclenché : %s" % (r["raison"] or "?")
+            heures = {"1 h": 1, "6 h": 6, "24 h": 24}.get(eff.get("boucleh"), 1)
+            n = conn.execute("SELECT COUNT(*) FROM autonomie_actions WHERE cle = ? AND sujet = ? AND ts > ?",
+                             (cle, sujet or "", time.time() - heures * 3600)).fetchone()[0]
+            if n >= int(eff.get("boucle") or 3):
+                raison = "boucle : %d actions sur « %s » en %s" % (n, (sujet or "?")[:60], eff.get("boucleh"))
+                _aut_declenche(conn, cle, raison)
+                return "disjoncteur déclenché : %s" % raison
+        finally:
+            conn.close()
+    except Exception as e:
+        logging.info("[AUTONOMIE] vérification du disjoncteur : %s", e)
+    return None
+
+
+def aut_disj_resultat(cle: str, sujet: str, ok: bool, eff: dict) -> None:
+    try:
+        conn = _aut_conn()
+        try:
+            conn.execute("INSERT INTO autonomie_actions (ts, cle, sujet, ok) VALUES (?,?,?,?)",
+                         (time.time(), cle, sujet or "", 1 if ok else 0))
+            conn.execute("DELETE FROM autonomie_actions WHERE ts < ?", (time.time() - 3 * 86400,))
+            r = conn.execute("SELECT echecs_suite FROM autonomie_disj WHERE cle = ?", (cle,)).fetchone()
+            suite = 0 if ok else ((r["echecs_suite"] if r else 0) or 0) + 1
+            conn.execute("INSERT INTO autonomie_disj (cle, etat, echecs_suite) VALUES (?, 'arme', ?) "
+                         "ON CONFLICT(cle) DO UPDATE SET echecs_suite = excluded.echecs_suite", (cle, suite))
+            conn.commit()
+            if not ok and suite >= int(eff.get("ech") or 2):
+                _aut_declenche(conn, cle, "%d échecs d'affilée (dernier sujet : %s)" % (suite, (sujet or "?")[:60]))
+        finally:
+            conn.close()
+    except Exception as e:
+        logging.info("[AUTONOMIE] résultat : %s", e)
+
+
+def aut_debloquer(cle: str, acteur: str = "") -> dict:
+    if "g:" + str(cle or "") not in _aut_index():
+        return {"ok": False, "error": "geste inconnu"}
+    try:
+        conn = _aut_conn()
+        try:
+            conn.execute("UPDATE autonomie_disj SET etat = 'arme', raison = '', echecs_suite = 0 WHERE cle = ?", (cle,))
+            conn.execute("DELETE FROM autonomie_actions WHERE cle = ?", (cle,))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+    try:
+        notif_resoudre_cle("aut:disj:%s" % cle, par=acteur or "vous", detail="disjoncteur débloqué")
+    except Exception:
+        pass
+    try:
+        conn = _sec_gestes_conn()
+        try:
+            conn.execute("INSERT INTO gestes_humains (qui, geste, cible, detail, ok, resultat, defaire) VALUES (?,?,?,?,?,?,?)",
+                         (acteur or "?", "aut:debloquer", aut_libelle(cle), "disjoncteur débloqué", 1, "", ""))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return {"ok": True}
+
+
+def aut_journaliser(cle: str, sujet: str, ok: bool, detail: str, resultat: str, eff: dict) -> None:
+    """Une action autonome entre au journal « Qui a fait quoi », avec la règle qui l'a permise."""
+    try:
+        conn = _sec_gestes_conn()
+        try:
+            conn.execute("INSERT INTO gestes_humains (qui, geste, cible, detail, ok, resultat, defaire) VALUES (?,?,?,?,?,?,?)",
+                         ("cassandra", "aut:" + cle, (sujet or "")[:120],
+                          ("règle %s · palier %s%s" % (eff.get("libelle", cle), eff.get("palier", "?"),
+                                                       (" · " + detail) if detail else ""))[:400],
+                          1 if ok else 0, (resultat or "")[:400], ""))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logging.info("[AUTONOMIE] journal : %s", e)
+
+
+def autonomie_etat() -> dict:
+    """Tout ce que l'écran des règles montre : le catalogue, les réglages, l'effet de chacun, les disjoncteurs."""
+    regl = aut_reglages_lire()
+    disj = {}
+    try:
+        conn = _aut_conn()
+        try:
+            disj = {r["cle"]: dict(r) for r in conn.execute("SELECT * FROM autonomie_disj")}
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    domaines = []
+    for did, dnom, ddesc, gestes in _AUT_CATALOGUE:
+        gl = []
+        for gid, gnom, st, rev, garde in gestes:
+            cle = "%s/%s" % (did, gid)
+            eff = aut_effectif(cle, regl)
+            dj = disj.get(cle) or {}
+            gl.append({"id": gid, "cle": cle, "nom": gnom, "st": st, "statut": _AUT_STATUTS[st], "rev": rev, "garde": garde,
+                       "reglages": regl.get("g:" + cle, {}), "palier": eff["palier"], "origine": eff["origine"],
+                       "disjoncteur": {"etat": dj.get("etat") or "arme", "raison": dj.get("raison") or "",
+                                       "depuis": dj.get("depuis") or "", "echecs_suite": dj.get("echecs_suite") or 0}})
+        domaines.append({"id": did, "nom": dnom, "desc": ddesc, "reglages": regl.get("d:" + did, {}), "gestes": gl})
+    try:
+        glob = pf_autonomie()
+        glob = {"palier": glob["palier"], "palier_nom": glob["palier_nom"], "gelee": bool(autonomie_gelee())}
+    except Exception:
+        glob = {}
+    actions = []
+    try:
+        conn = _sec_gestes_conn()
+        try:
+            actions = [dict(r) for r in conn.execute(
+                "SELECT id, ts, qui, geste, cible, detail, ok, resultat, defait FROM gestes_humains "
+                "WHERE geste LIKE 'aut:%' ORDER BY id DESC LIMIT 20")]
+        finally:
+            conn.close()
+        for a in actions:
+            a["libelle"] = aut_libelle(a["geste"][4:]) if a["geste"] != "aut:debloquer" else "Disjoncteur débloqué"
+    except Exception:
+        pass
+    return {"ok": True, "global": glob, "paliers": list(_PF_PALIERS), "domaines": domaines, "actions": actions,
+            "choix": {k: list(v) for k, v in _AUT_CHOIX.items()}, "defaut": _AUT_DEFAUT,
+            "declenches": [aut_libelle(k) for k, v in disj.items() if v.get("etat") == "declenche"]}
+
+
 def pf_autorise(signature: str, action_kind: str, cmd: str, fkey: str = "",
                 titre: str = "") -> dict:
     """Le geste peut-il partir seul ?
 
     Rend toujours un motif. Un refus n'est pas un silence : il devient une
-    ligne dans l'ombre, qui servira à décider plus tard s'il fallait autoriser."""
+    ligne dans l'ombre, qui servira à décider plus tard s'il fallait autoriser.
+
+    10-10 : le palier se lit PAR GESTE (réglage du geste, sinon du domaine, sinon le palier global) et un
+    disjoncteur remplace le plafond par jour. Un action_kind que le catalogue ne connaît pas garde l'ancien
+    comportement : le palier global, sans disjoncteur."""
     _pf_migrate()
     a = pf_autonomie()
     sav = pf_savoir(signature)
+    cle = _AUT_GESTE_DE_KIND.get(str(action_kind or ""))
+    eff = aut_effectif(cle) if cle else {}
+    palier = eff.get("palier") or a["palier"]
     def _non(motif):
         pf_ombre_ajouter(fkey, signature, action_kind, cmd, titre, motif)
-        return {"ok": False, "motif": motif, "palier": a["palier"]}
+        return {"ok": False, "motif": motif, "palier": palier}
     if autonomie_gelee():
         return _non("l'autonomie de Cassandra est gelée")
-    if a["palier"] == "observer":
+    if palier == "observer":
         return _non("palier « observer » : elle ne fait rien seule")
-    if a["palier"] == "proposer":
+    if palier == "proposer":
         return _non("palier « proposer » : elle attend un appui")
+    if eff.get("ombre"):
+        return _non("mode ombre sur « %s » : elle dit ce qu'elle aurait fait" % eff.get("libelle", cle))
     if a["reversible"] and not (sav or {}).get("reversible", 1):
         return _non("ce geste n'est pas réversible")
-    if a["palier"] == "maitrise":
+    if palier == "maitrise":
         if not sav or sav.get("etat") != "auto":
             return _non("« %s » n'est pas encore un savoir-faire éprouvé (%d/%d réussites)"
                         % (signature, (sav or {}).get("successes", 0), _PF_SEUIL_PROMO))
+    if eff and not _aut_fenetre_ok(eff):
+        return _non("hors de la fenêtre réglée pour « %s » (%s)" % (eff.get("libelle", cle), eff.get("fen")))
     if _pf_en_pause():
         return _non("heures où vous êtes là (%s–%s) : elle propose au lieu d'agir"
                     % (a["pause_debut"], a["pause_fin"]))
-    u = a["utilise"]["jour"]
-    if a["budget_jour"] and u >= a["budget_jour"]:
-        return _non("budget du jour épuisé (%d/%d) — elle continue de proposer"
-                    % (u, a["budget_jour"]))
-    return {"ok": True, "palier": a["palier"], "savoir": sav}
+    if eff:
+        motif = aut_disj_verifier(cle, fkey or titre, eff)
+        if motif:
+            return _non(motif)
+    # Plus de plafond par jour (décision du 10-10) : le disjoncteur, qui mesure des erreurs et des boucles,
+    # a pris sa place. Le compteur du jour ne sert plus qu'à l'affichage.
+    return {"ok": True, "palier": palier, "savoir": sav, "cle": cle, "eff": eff, "sujet": fkey or titre}
 
 
 def pf_ombre_ajouter(fkey, signature, action_kind, cmd, titre, motif) -> None:
@@ -74483,6 +74972,10 @@ def proactive_scan(auto_act: bool = None) -> dict:
                     continue
                 r = proactive_act(t["id"], auto=True)
                 acted.append({"id": t["id"], "ok": r.get("ok"), "gate": r.get("gate")})
+                if g.get("cle"):
+                    aut_disj_resultat(g["cle"], g.get("sujet") or "", bool(r.get("ok")), g.get("eff") or {})
+                    aut_journaliser(g["cle"], g.get("sujet") or "", bool(r.get("ok")), t["title"],
+                                    str(r.get("error") or r.get("gate") or "")[:300], g.get("eff") or {})
         except Exception as e:
             logging.warning("[PROACTIVE] auto-act: %s", e)
         return acted
@@ -89758,7 +90251,8 @@ def securite_journal(limite: int = 120) -> dict:
             for r in conn.execute("SELECT * FROM gestes_humains ORDER BY id DESC LIMIT 80"):
                 ev.append({"ts": str(r["ts"] or "")[:16], "src": "geste", "niveau": "" if r["ok"] else "panne",
                            "acteur": r["qui"] or "?", "classe": _sec_classe_acteur(r["qui"]),
-                           "texte": "%s %s · %s%s" % (_SEC_GESTES_LIB.get(r["geste"], r["geste"]), r["cible"] or "",
+                           "texte": "%s %s · %s%s" % ((aut_libelle(r["geste"][4:]) if str(r["geste"]).startswith("aut:") and r["geste"] != "aut:debloquer"
+                                                        else ("Disjoncteur débloqué" if r["geste"] == "aut:debloquer" else _SEC_GESTES_LIB.get(r["geste"], r["geste"]))), r["cible"] or "",
                                                        (r["detail"] or "fait") if r["ok"] else ("échec : " + (r["resultat"] or "")),
                                                        " · défait ensuite" if r["defait"] else "")})
         except Exception:
@@ -96252,6 +96746,30 @@ class CassandraHandler(BaseHTTPRequestHandler):
             elif _sub == "ollama/supprimer":
                 _r = modeles_ollama_supprimer(str(data.get("nom") or ""))
                 log_admin_action(_sid, "modeles_ollama_supprimer", "OK" if _r.get("ok") else "FAIL", str(data.get("nom") or "")[:80])
+            if _r is None:
+                self.send_json({"ok": False, "error": "route inconnue"}, 404); return
+            self.send_json(_r, 200 if _r.get("ok") else 400); return
+        # L'AUTONOMIE PAR GESTE (10-10) : réservée à l'administrateur.
+        if path == "/api/autonomie" or path.startswith("/api/autonomie/"):
+            _sid = self.headers.get("X-Session-Token", "") or str(data.get("session", "") or "")
+            if not validate_session(_sid):
+                self.send_json({"ok": False, "error": "Non autorisé"}, 401); return
+            _qui = get_session_user(_sid) or ""
+            if not is_admin(_qui):
+                self.send_json({"ok": False, "error": "Réservé à l'administrateur"}, 403); return
+            _sub = path[len("/api/autonomie"):].strip("/")
+            _r = None
+            if _sub == "":
+                _r = autonomie_etat()
+            elif _sub == "regler":
+                _r = aut_regler(str(data.get("cle") or ""), data.get("reglages") if isinstance(data.get("reglages"), dict) else {}, _qui)
+                log_admin_action(_sid, "autonomie_regler", "OK" if _r.get("ok") else "FAIL", ("%s %s" % (data.get("cle"), json.dumps(data.get("reglages"), ensure_ascii=False)))[:200])
+            elif _sub == "remettre":
+                _r = aut_remettre(str(data.get("cle") or ""), _qui)
+                log_admin_action(_sid, "autonomie_remettre", "OK" if _r.get("ok") else "FAIL", str(data.get("cle") or "")[:120])
+            elif _sub == "debloquer":
+                _r = aut_debloquer(str(data.get("cle") or ""), _qui)
+                log_admin_action(_sid, "autonomie_debloquer", "OK" if _r.get("ok") else "FAIL", str(data.get("cle") or "")[:120])
             if _r is None:
                 self.send_json({"ok": False, "error": "route inconnue"}, 404); return
             self.send_json(_r, 200 if _r.get("ok") else 400); return
