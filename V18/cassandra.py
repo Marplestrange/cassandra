@@ -89459,7 +89459,7 @@ def securite_journal(limite: int = 120) -> dict:
         ev.append({"ts": (m.group(1) + " " + m.group(2)) if m else "", "src": "auth",
                    "niveau": "" if "Accepted " in l else "regarder",
                    "texte": re.sub(r"^.*?sshd(-session)?\[\d+\]:\s*", "", l)[:180]})
-    ev.sort(key=lambda e: e["ts"], reverse=True)
+    ev.sort(key=lambda e: str(e["ts"]).replace("T", " "), reverse=True)
     return {"ok": True, "evenements": ev[:max(1, min(300, int(limite or 120)))]}
 
 
