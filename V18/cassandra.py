@@ -75474,14 +75474,17 @@ def vault_native_totp(username: str, name: str) -> dict:
 
 
 def vault_native_get_pour_agent(username: str, name: str):
-    """Ce qu'un AGENT peut lire du coffre d'une personne : un secret marqué « utilisable par Cassandra », rien
+    """[QUARANTAINE jusqu'au 2027-01-08] Aucun usage trouvé le 2026-10-10 : ni lecture de son nom,
+    ni chaîne qui le porte, ni décorateur, ni trace au journal sur trente jours. Le corps est mis de
+    côté, pas supprimé : s'il est appelé, le fil se tire — alerte critique, quarantaine annulée,
+    version d'avant restaurée. Une fonction ne se retire qu'après avoir crié sans être entendue.
+
+    Ce que la fonction disait d'elle-même :
+    Ce qu'un AGENT peut lire du coffre d'une personne : un secret marqué « utilisable par Cassandra », rien
     d'autre — et l'usage s'inscrit au journal sous ce nom. C'est la porte que la fiche décrit ; aucun outil ne
-    la franchit encore de lui-même : les secrets de service passent par leurs clés fixes."""
-    d = vault_native_get(username, name)
-    if not d or not d.get("agent"):
-        return None
-    _vault_audit(username, "agent:lecture", name)
-    return d
+    la franchit encore de lui-même : les secrets de service passent par leurs clés fixes.
+    """
+    return evolution_fil_tire('vault_native_get_pour_agent')
 
 
 def vault_native_set(username: str, name: str, value: str) -> dict:
