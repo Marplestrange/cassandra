@@ -9319,6 +9319,101 @@ def _fp_query_impl(args: dict) -> tuple:
             "%s (%d) :\n%s" % (sujet, len(rows), "\n".join(lignes)), "#7c5cfc")
 
 
+def _compte_act_impl(args: dict) -> tuple:
+    """Les gestes sur les PERSONNES : créer un compte, changer ses domaines, révoquer une session, envoyer un lien de réinitialisation.
+    Choix de Drisse (10-11) : l'agent PRÉPARE et PROPOSE, l'humain valide. Aucune règle d'autonomie ne donne cet accord, et un tour qui a
+    lu du contenu venu du dehors n'agit pas du tout. Jamais de rôle administrateur, jamais sur un compte administrateur."""
+    action = str(args.get("action", "")).strip()
+    cible = str(args.get("arg", "")).strip().lower()
+    arg2 = str(args.get("arg2", "")).strip()
+    confirm = bool(args.get("confirm"))
+
+    def _journal(res, detail):
+        try:
+            log_admin_action("agent", "compte_%s" % action[:20], res, detail[:200])
+        except Exception as e:
+            logging.debug("[AUDIT] %s", e)
+
+    if action == "lister":
+        us = load_users()
+        lignes = ["%s · %s · %d site(s)" % (u, _user_record(v)["role"], len(_user_record(v)["sites"])) for u, v in sorted(us.items())]
+        return ({"ok": True}, "Comptes :\n" + "\n".join(lignes), "#27c168")
+    if action == "sessions":
+        if cible not in load_users():
+            return ({"ok": False}, "Échec : compte inconnu", "#e0564a")
+        ss = list_user_sessions(cible)
+        return ({"ok": True}, "Sessions de %s :\n%s" % (cible, "\n".join("%s · créée %s · vue %s · %s %s" % (x["id"], x["created"], x["last_used"], x["ip"], x["nature"]) for x in ss) or "aucune"), "#27c168")
+    if action not in ("creer", "droits", "revoquer", "lien_reinit"):
+        return ({"ok": False}, "Échec : action inconnue (lister, sessions, creer, droits, revoquer, lien_reinit)", "#e0564a")
+    try:
+        _qui = get_current_user()
+        if _qui and not is_admin(_qui):               # un compte ordinaire ne passe pas par ici, même si l'outil lui était montré
+            return ({"ok": False}, "Refusé : les gestes sur les comptes sont réservés à l'administrateur.", "#e0564a")
+    except Exception:
+        pass
+    if not _EMAIL_RE.match(cible):
+        return ({"ok": False}, "Échec : adresse e-mail du compte illisible", "#e0564a")
+    try:
+        if origine_courante().get("teintes") or []:
+            _journal("REFUS", cible)
+            return ({"ok": False}, "Refusé : ce tour a lu du contenu venu du dehors, un geste sur les comptes ne part pas d'ici. Il partira d'un tour neuf.", "#e0564a")
+    except Exception:
+        pass
+    users = load_users()
+    existant = users.get(cible)
+    if action == "creer":
+        if existant is not None:
+            return ({"ok": False}, "Échec : ce compte existe déjà", "#e0564a")
+        sites = [x.strip() for x in arg2.split(",") if x.strip()] if arg2 else []
+        phrase = "Créer le compte « %s » (rôle utilisateur%s), puis lui envoyer à sa propre adresse un lien de 24 h pour choisir son mot de passe." % (
+            cible, (", domaines : " + ", ".join(sites)) if sites else ", sans domaine")
+    else:
+        if existant is None:
+            return ({"ok": False}, "Échec : compte inconnu", "#e0564a")
+        if _user_record(existant)["role"] == "admin":
+            _journal("REFUS", cible)
+            return ({"ok": False}, "Refusé : un compte administrateur ne se touche pas par un agent. À faire depuis les paramètres.", "#e0564a")
+        if action == "droits":
+            sites = [x.strip() for x in arg2.split(",") if x.strip()]
+            phrase = "Donner au compte « %s » ces domaines : %s (le rôle ne change pas)." % (cible, ", ".join(sites) or "aucun")
+        elif action == "revoquer":
+            if not re.match(r"^[A-Za-z0-9]{6}$", arg2):
+                return ({"ok": False}, "Échec : arg2 doit être l'identifiant à 6 caractères d'une session (voir action « sessions »)", "#e0564a")
+            phrase = "Révoquer la session %s du compte « %s »." % (arg2, cible)
+        else:
+            phrase = "Envoyer à « %s », À SA PROPRE ADRESSE, un lien de 24 h pour choisir un nouveau mot de passe." % cible
+    if not confirm:
+        return ({"ok": False, "needs_confirm": True}, "Accord requis : %s\nPrésente-le à l'utilisateur et ne relance avec confirm=true QUE s'il approuve." % phrase, "#e8c660")
+    if action == "creer":
+        import secrets as _sc
+        mdp = ""
+        for _ in range(20):
+            mdp = _sc.token_urlsafe(12) + "aA1!"
+            if mdp_valider(mdp)["ok"]:
+                break
+        r = set_user(cible, mdp, role="user", sites=sites)
+        if not r.get("ok"):
+            _journal("FAIL", "%s : %s" % (cible, r.get("error")))
+            return ({"ok": False}, "Échec : %s" % r.get("error"), "#e0564a")
+        envoye = send_password_reset_email(cible)
+        _journal("OK", cible)
+        return ({"ok": True}, "Compte « %s » créé. %s" % (cible, "Lien de choix du mot de passe envoyé à son adresse (24 h)." if envoye else
+                "⚠️ Le lien n'a pas pu partir (messagerie ou adresse publique non réglées) : il faut le renvoyer depuis les paramètres."), "#27c168")
+    if action == "droits":
+        r = update_user_access(cible, role=None, sites=sites)
+        _journal("OK" if r.get("ok") else "FAIL", "%s -> %s" % (cible, ",".join(sites)))
+        return (r, ("Domaines de « %s » mis à jour." % cible) if r.get("ok") else "Échec : %s" % r.get("error"), "#27c168" if r.get("ok") else "#e0564a")
+    if action == "revoquer":
+        r = revoke_session(cible, arg2)
+        _journal("OK" if r.get("ok") else "FAIL", "%s %s" % (cible, arg2))
+        if r.get("ok") and not r.get("ferme"):
+            return ({"ok": False}, "Échec : aucune session ne correspond à %s pour ce compte" % arg2, "#e0564a")
+        return (r, ("Session %s révoquée." % arg2) if r.get("ok") else "Échec : %s" % (r.get("error") or r.get("reason") or "?"), "#27c168" if r.get("ok") else "#e0564a")
+    envoye = send_password_reset_email(cible)
+    _journal("OK" if envoye else "FAIL", cible)
+    return ({"ok": bool(envoye)}, "Lien envoyé à l'adresse du compte." if envoye else "Échec : le lien n'a pas pu partir (messagerie ou adresse publique non réglées).", "#27c168" if envoye else "#e0564a")
+
+
 def _fp_base_creer_impl(args: dict) -> tuple:
     nom = str(args.get("arg", "")).strip()
     r = fp_db_creer(nom, confirm=False, acteur="agent")
@@ -64408,6 +64503,28 @@ CASSANDRA_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "compte_act",
+            "description": (
+                "Gestes sur les COMPTES des personnes : lister, sessions (lecture) ; creer, droits, revoquer, lien_reinit (modifient). "
+                "Tu PRÉPARES et tu PROPOSES, l'humain valide : toute action qui modifie répond d'abord « accord requis » — présente-la à "
+                "l'utilisateur et ne relance avec confirm=true QUE s'il approuve. Jamais de compte administrateur, jamais sur un compte "
+                "administrateur ; le lien de réinitialisation part toujours à l'adresse du compte, jamais ailleurs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "lister, sessions, creer, droits, revoquer, lien_reinit"},
+                    "arg": {"type": "string", "description": "Adresse e-mail du compte (identifiant)."},
+                    "arg2": {"type": "string", "description": "creer/droits : domaines séparés par des virgules ; revoquer : identifiant à 6 caractères de la session."},
+                    "confirm": {"type": "boolean", "description": "true UNIQUEMENT après accord explicite de l'utilisateur.", "default": False}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "portier",
             "description": (
                 "Le portier Authentik posé devant les sites du panneau : la page de connexion "
@@ -70038,6 +70155,7 @@ _TOOL_HANDLERS = {
     "site_health": _site_health_impl,
     "panel_query": _fp_query_impl,
     "panel_act": _fp_act_impl,
+    "compte_act": _compte_act_impl,
     "portier": _portier_impl,
     "fastpanel_query": _fp_query_impl,   # anciens noms : alias du répartiteur, jamais exposés au modèle
     "fastpanel_act": _fp_act_impl,
@@ -73308,7 +73426,7 @@ def secure_execute(cmd: str) -> str:
 #   disque / SSL / sécurité = détection + investigation + action sur clic.
 # ============================================================
 _PROACTIVE_LAST = [0.0]
-_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer", "disque.purger", "wp.maj", "wp.plugin", "wp.restaurer")   # seules actions auto-remédiables (réversibles)
+_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer", "disque.purger", "wp.maj", "wp.plugin", "wp.restaurer", "secret.rotation")   # seules actions auto-remédiables (réversibles)
 
 
 def _detect_disk() -> list:
@@ -73961,6 +74079,74 @@ def _detect_vault() -> list:
 _SEC_PAS_UN_SECRET = ("/id", "/nom", "/pseudo", "/tel", "/qui", "/api_user", "/api_id")
 
 
+# ── Rotation d'un secret de service : un rotateur PAR secret (10-11) ───────────────────────────────────────────────
+# Chaque service se change à sa façon : il n'y a pas de rotation générique. Un rotateur écrit le NOUVEAU secret dans le coffre
+# AVANT de s'en servir (l'ancien reste sous « <nom>.precedent »), l'applique au service, PROUVE que le service répond, et remet
+# tout comme avant si ce n'est pas le cas. Seul SearXNG en a un : sa clé ne signe que des cookies et des liens d'images.
+# Le mot de passe de FastPanel n'en a pas, volontairement : c'est ton mot de passe de connexion au panneau, et l'API ne permet
+# pas de le changer (toutes les routes essayées répondent 405).
+_SEARXNG_RE = re.compile(r'^(\s*secret_key:\s*)"[^"\n]*"(.*)$', re.M)
+
+
+def _rot_searxng() -> tuple:
+    import secrets as _sc
+    chemin = str(_mem_cfg("searxng_settings", "/opt/searxng/settings.yml") or "/opt/searxng/settings.yml")
+    conteneur = str(_mem_cfg("searxng_conteneur", "searxng") or "searxng")
+    if not _CONT_NOM_RE.match(conteneur):
+        return False, "nom de conteneur illisible"
+    try:
+        with open(chemin, encoding="utf-8") as f:
+            avant = f.read()
+    except Exception as e:
+        return False, "réglages de SearXNG illisibles : %s" % str(e)[:100]
+    m = _SEARXNG_RE.search(avant)
+    if not m:
+        return False, "aucune ligne « secret_key » trouvée dans %s : rien n'est touché" % chemin
+    ancien = re.search(r'"([^"]*)"', m.group(0)).group(1)
+    neuf = _sc.token_hex(32)
+    # 1. le coffre D'ABORD : l'ancienne valeur est gardée, la nouvelle est écrite avant d'être appliquée
+    if not vault_set("searxng/secret_key.precedent", ancien).get("ok"):
+        return False, "le coffre refuse l'ancienne valeur : rien n'est touché"
+    if not vault_set("searxng/secret_key", neuf).get("ok"):
+        return False, "le coffre refuse la nouvelle valeur : rien n'est touché"
+    copie = "%s.avant-rotation-%s" % (chemin, datetime.utcnow().strftime("%Y%m%d-%H%M%S"))
+
+    def _remettre(raison: str) -> tuple:
+        try:
+            with open(chemin, "w", encoding="utf-8") as f:       # en place : le fichier est monté dans le conteneur par son inode
+                f.write(avant)
+            subprocess.run(["docker", "restart", conteneur], capture_output=True, timeout=90)
+        except Exception as e:
+            raison += " · ATTENTION, remise en état impossible : %s" % str(e)[:80]
+        vault_set("searxng/secret_key", ancien)
+        return False, raison + " · tout est remis comme avant"
+    try:
+        with open(copie, "w", encoding="utf-8") as f:
+            f.write(avant)
+        os.chmod(copie, 0o600)
+        with open(chemin, "w", encoding="utf-8") as f:
+            f.write(_SEARXNG_RE.sub(lambda mm: '%s"%s"%s' % (mm.group(1), neuf, mm.group(2)), avant, count=1))
+    except Exception as e:
+        return _remettre("écriture des réglages impossible : %s" % str(e)[:100])
+    p = subprocess.run(["docker", "restart", conteneur], capture_output=True, text=True, timeout=90)
+    if p.returncode != 0:
+        return _remettre("redémarrage refusé : %s" % " ".join(((p.stderr or "") + (p.stdout or "")).split())[:100])
+    base = str(_mem_cfg("searxng_url", "http://127.0.0.1:8080") or "http://127.0.0.1:8080").rstrip("/")
+    for _ in range(12):
+        time.sleep(5)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(base + "/", headers={"User-Agent": "Cassandra-Veille/1.0"}), timeout=8) as r:
+                if r.status == 200:
+                    return True, "clé de SearXNG remplacée, le service répond · l'ancienne est dans le coffre (searxng/secret_key.precedent), copie du fichier : %s" % copie
+        except Exception:
+            continue
+    return _remettre("SearXNG ne répond plus après le changement")
+
+
+_AUT_ROTATEURS = {"searxng/secret_key": _rot_searxng}
+_ROT_CLE_MDP = "rotation-des-secrets/remplacer-un-mot-de-passe-de-service"
+
+
 def _detect_secrets_anciens() -> list:
     """Règle « Rotation des secrets › Signaler un secret trop ancien » : lecture seule, les NOMS seulement, jamais une valeur.
     Un secret dont la dernière révision dépasse le seuil (180 jours par défaut) est signalé en un seul constat."""
@@ -73983,11 +74169,16 @@ def _detect_secrets_anciens() -> list:
     if not vieux:
         return []
     vieux.sort(reverse=True)
+    avec_action = [{"fkey": "secret_rot_%s" % n.replace("/", "_"), "category": "vault", "severity": "info",
+                    "title": "Le secret « %s » a %d jours : rotation possible" % (n, j),
+                    "detail": "Un rotateur existe pour ce secret : nouvelle valeur au coffre d'abord, service vérifié après, tout remis si ça ne répond pas.",
+                    "suggested_action": "rotation-secret %s" % n, "action_kind": "secret.rotation"}
+                   for j, n in vieux if n in _AUT_ROTATEURS]
     liste = ", ".join("%s (%d j)" % (n, j) for j, n in vieux[:12])
     return [{"fkey": "secrets_anciens", "category": "vault", "severity": "info",
              "title": "%d secret%s sans changement depuis plus de %d jours" % (len(vieux), "s" if len(vieux) > 1 else "", seuil),
              "detail": "Les plus anciens : %s. À faire tourner quand tu peux ; seuls les noms sont affichés." % liste,
-             "suggested_action": "", "action_kind": "diagnostic"}]
+             "suggested_action": "", "action_kind": "diagnostic"}] + avec_action
 
 
 # ── Échantillonnage de métriques (alimente la tendance disque + les sparklines) ──
@@ -74698,7 +74889,7 @@ _AUT_CATALOGUE = [
    ('signaler-un-secret-trop-ancien', 'Signaler un secret trop ancien', 'ok', 'oui', 'lecture seule'),
    ('faire-tourner-une-cle-ssh', 'Faire tourner une clé SSH', 'ok', 'part', 'ancienne clé valide 24 h'),
    ('regenerer-un-jeton-d-api', "Régénérer un jeton d'API", 'ecrire', 'part', 'service vérifié après coup'),
-   ('remplacer-un-mot-de-passe-de-service', 'Remplacer un mot de passe de service', 'ecrire', 'part', 'écrit dans le coffre avant usage'),
+   ('remplacer-un-mot-de-passe-de-service', 'Remplacer un mot de passe de service', 'ok', 'part', 'écrit dans le coffre avant usage'),
  ]),
  ('defense-vue-de-l-exterieur', "Défense vue de l'extérieur", "Ce qui est vraiment exposé, comparé à ce qui devrait l'être.", [
    ('scanner-sa-surface-depuis-l-exterieur', "Scanner sa surface depuis l'extérieur", 'ok', 'oui', 'ses propres adresses seulement'),
@@ -74734,6 +74925,7 @@ _AUT_CATALOGUE = [
 # Le geste du catalogue que sait déclencher chaque action_kind du moteur proactif. Les autres restent au
 # palier global, sans disjoncteur : l'ancien comportement.
 _AUT_GESTE_DE_KIND = {
+    "secret.rotation": "rotation-des-secrets/remplacer-un-mot-de-passe-de-service",
     "wp.maj": "sites-wordpress/mettre-a-jour-le-cur-et-les-plugins",
     "wp.plugin": "sites-wordpress/desactiver-un-plugin-fautif",
     "wp.restaurer": "sites-wordpress/restaurer-le-site-depuis-une-sauvegarde",
@@ -77011,6 +77203,23 @@ def proactive_act(fid, auto: bool = False, acteur: str = "") -> dict:
         if _ok and kind == "wp.maj" and aut_porte(_WP_CLE_CACHE, _m.group(1), "Vider le cache de %s" % _m.group(1)).get("ok"):
             _ok2, det2 = _aut_wp_cache(_m.group(1))
             out += " · cache : " + det2
+        try:
+            log_action("proactive", cmd, out, 0, True, False)
+        except Exception:
+            pass
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            conn.execute("UPDATE proactive_findings SET status='acted', acted_at=datetime('now'), action_result=? WHERE id=?",
+                         (("auto • " if auto else "") + str(out)[:1500], int(fid)))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+        return {"ok": bool(_ok), "output": str(out)[:2000], "gate": ""}
+    if kind == "secret.rotation":
+        _m = re.match(r"^\s*rotation-secret\s+([A-Za-z0-9/_.-]{1,80})\s*$", cmd)
+        if not _m or _m.group(1) not in _AUT_ROTATEURS:
+            return {"ok": False, "error": "aucun rotateur pour ce secret"}
+        _ok, out = _AUT_ROTATEURS[_m.group(1)]()
         try:
             log_action("proactive", cmd, out, 0, True, False)
         except Exception:
