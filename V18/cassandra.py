@@ -112657,6 +112657,9 @@ async function ntHistBasculer(){
 function ntFeuille(o){
     ntFeuilleFermer();
     const ov=document.createElement('div'); ov.className='nt-ov on'; ov.id='nt-fx';
+    // AU-DESSUS DE LA CLOCHE (10-10) : la feuille s'ouvre depuis le panneau des notifications (z 100000) et
+    // naissait dessous (z 80) — « Résoudre à la main ? » restait invisible, ses boutons cachés.
+    ov.style.zIndex = '100002';
     ov.addEventListener('click', function(e){ if(e.target===ov) ntFeuilleFermer(); });
     let h='<div class="nt-sh neutre'+(o.danger?' dgr':'')+'" role="dialog" aria-modal="true" aria-labelledby="nt-fx-t">'+
       '<div class="nt-shh"><div class="t" id="nt-fx-t">'+escapeHtml(o.titre||'')+'</div>'+
