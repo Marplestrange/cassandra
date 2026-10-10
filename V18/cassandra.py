@@ -11461,7 +11461,13 @@ def fp_ssl_autorenew_pass() -> dict:
         return etat
     faits, echecs = [], []
     for d in proches:
+        # La règle « Hébergement › Renouveler un certificat » (10-10) : palier, ombre, fenêtre, disjoncteur.
+        # Un renouvellement qui échoue en boucle ronge le quota de l'autorité : le disjoncteur l'arrête.
+        _porte = aut_porte("hebergement/renouveler-un-certificat", str(d["domain"]), "Renouveler le certificat de %s" % d["domain"])
+        if not _porte.get("ok"):
+            continue                       # retenu par la règle : ce n'est pas un échec, c'est dans l'ombre
         r = fp_ssl_issue(d["domain"], confirm=True)
+        aut_fin(_porte, bool(r.get("ok")), "%s jours restants" % d.get("days_left"), str(r.get("reason") or "")[:200])
         (faits if r.get("ok") else echecs).append(d["domain"])
         # JOURNAL (2026-09-05) : chaque renouvellement lancé d'ici sollicite
         # une autorité externe, avec quota ; il n'en restait aucune trace.
@@ -73269,8 +73275,11 @@ def _detect_collector() -> list:
                     "title": "Collecteur de connaissance silencieux",
                     "detail": "Aucune écriture depuis %d min — le Sensorium (état système) peut être périmé."
                               % int(age_min),
-                    "suggested_action": "systemctl status cassandra-collector ; journalctl -u cassandra-collector -n 40",
-                    "action_kind": "diagnose"})
+                    # 10-10 : une relance suffit presque toujours, et elle est réversible : le constat porte
+                    # désormais l'action (règle « Machine › Relancer le collecteur »). Le diagnostic reste lisible
+                    # dans le détail du constat.
+                    "suggested_action": "systemctl restart cassandra-collector",
+                    "action_kind": "service.restart"})
     return out
 
 
@@ -73482,7 +73491,7 @@ def _pf_en_pause() -> bool:
 _AUT_CATALOGUE = [
  ('machine', 'Machine', 'Services, paquets, correctifs, disque, redémarrages.', [
    ('relancer-un-service', 'Relancer un service', 'ok', 'oui', 'santé vérifiée après coup'),
-   ('relancer-le-collecteur', 'Relancer le collecteur', 'brancher', 'oui', 'même garde que les services'),
+   ('relancer-le-collecteur', 'Relancer le collecteur', 'ok', 'oui', 'même garde que les services'),
    ('purger-journaux-et-caches', 'Purger journaux et caches', 'brancher', 'part', 'liste de caches inoffensifs'),
    ('appliquer-les-correctifs-de-securite', 'Appliquer les correctifs de sécurité', 'brancher', 'part', 'aucune'),
    ('installer-ou-retirer-un-paquet-precis', 'Installer ou retirer un paquet précis', 'brancher', 'part', 'un paquet nommé'),
@@ -73500,7 +73509,7 @@ _AUT_CATALOGUE = [
  ('hebergement', 'Hébergement', 'Sites, bases, sauvegardes, certificats, domaines (FastPanel).', [
    ('relancer-un-site', 'Relancer un site', 'brancher', 'oui', 'réponse HTTP vérifiée'),
    ('relancer-une-sauvegarde-en-echec', 'Relancer une sauvegarde en échec', 'brancher', 'oui', 'aucune'),
-   ('renouveler-un-certificat', 'Renouveler un certificat', 'brancher', 'oui', 'seuil de 30 jours'),
+   ('renouveler-un-certificat', 'Renouveler un certificat', 'ok', 'oui', 'seuil de 30 jours'),
    ('creer-une-base-de-donnees', 'Créer une base de données', 'ecrire', 'oui', 'cloisonnement par compte'),
    ('creer-ou-modifier-un-plan-de-sauvegarde', 'Créer ou modifier un plan de sauvegarde', 'ecrire', 'oui', 'cloisonnement par compte'),
    ('ajouter-un-site-ou-un-domaine', 'Ajouter un site ou un domaine', 'ecrire', 'oui', 'cloisonnement par compte'),
@@ -73605,6 +73614,8 @@ _AUT_CATALOGUE = [
 # Le geste du catalogue que sait déclencher chaque action_kind du moteur proactif. Les autres restent au
 # palier global, sans disjoncteur : l'ancien comportement.
 _AUT_GESTE_DE_KIND = {"service.restart": "machine/relancer-un-service"}
+# Un constat précis qui relève d'un geste plus fin que son action_kind (testé en premier).
+_AUT_GESTE_DE_FKEY = {"collector_stale": "machine/relancer-le-collecteur"}
 _AUT_STATUTS = {"ok": "en service", "brancher": "à brancher", "ecrire": "à écrire", "dur": "garde dure"}
 _AUT_DEFAUT = {"lv": None, "ombre": False, "decl": "Sur alerte", "per": "Hérite du domaine", "excl": "",
                "fen": "Toujours", "fd": "02:00", "ff": "06:00", "ech": 2, "boucle": 3, "boucleh": "1 h",
@@ -73895,6 +73906,40 @@ def aut_journaliser(cle: str, sujet: str, ok: bool, detail: str, resultat: str, 
         logging.info("[AUTONOMIE] journal : %s", e)
 
 
+def aut_porte(cle: str, sujet: str = "", titre: str = "") -> dict:
+    """La porte des mécanismes autonomes qui ne passent PAS par le moteur proactif (renouvellement SSL…).
+
+    Un geste que le catalogue ne connaît pas ne bloque jamais. Un geste SANS réglage propre (palier hérité du
+    global) garde son comportement d'avant : seuls un réglage explicite de palier, le mode ombre, la fenêtre et le
+    disjoncteur le retiennent. Le disjoncteur, lui, s'applique toujours : c'est lui qui protège un quota externe."""
+    eff = aut_effectif(cle)
+    if not eff:
+        return {"ok": True, "eff": {}, "cle": None, "sujet": sujet}
+    def _non(motif):
+        pf_ombre_ajouter(sujet, cle, "mecanisme", titre or sujet, titre or eff.get("libelle", cle), motif)
+        return {"ok": False, "motif": motif, "eff": eff, "cle": cle, "sujet": sujet}
+    if autonomie_gelee():
+        return _non("l'autonomie de Cassandra est gelée")
+    if eff.get("origine") != "global" and eff.get("palier") in ("observer", "proposer"):
+        return _non("palier « %s » sur « %s » : elle ne le fait pas seule" % (eff["palier"], eff.get("libelle", cle)))
+    if eff.get("ombre"):
+        return _non("mode ombre sur « %s » : elle dit ce qu'elle aurait fait" % eff.get("libelle", cle))
+    if not _aut_fenetre_ok(eff):
+        return _non("hors de la fenêtre réglée pour « %s » (%s)" % (eff.get("libelle", cle), eff.get("fen")))
+    motif = aut_disj_verifier(cle, sujet, eff)
+    if motif:
+        return _non(motif)
+    return {"ok": True, "eff": eff, "cle": cle, "sujet": sujet}
+
+
+def aut_fin(porte: dict, ok: bool, detail: str = "", resultat: str = "") -> None:
+    """Après le geste : le disjoncteur compte, le journal inscrit la règle."""
+    if not porte or not porte.get("cle"):
+        return
+    aut_disj_resultat(porte["cle"], porte.get("sujet") or "", bool(ok), porte.get("eff") or {})
+    aut_journaliser(porte["cle"], porte.get("sujet") or "", bool(ok), detail, resultat, porte.get("eff") or {})
+
+
 def autonomie_etat() -> dict:
     """Tout ce que l'écran des règles montre : le catalogue, les réglages, l'effet de chacun, les disjoncteurs."""
     regl = aut_reglages_lire()
@@ -73955,7 +74000,7 @@ def pf_autorise(signature: str, action_kind: str, cmd: str, fkey: str = "",
     _pf_migrate()
     a = pf_autonomie()
     sav = pf_savoir(signature)
-    cle = _AUT_GESTE_DE_KIND.get(str(action_kind or ""))
+    cle = _AUT_GESTE_DE_FKEY.get(str(fkey or "")) or _AUT_GESTE_DE_KIND.get(str(action_kind or ""))
     eff = aut_effectif(cle) if cle else {}
     palier = eff.get("palier") or a["palier"]
     def _non(motif):
