@@ -22758,11 +22758,15 @@ def notif(titre: str, corps: str = "", source: str = "", niveau: str = "",
                 groupe = True
                 nid = int(ouverte["id"])
                 monte = _NT_RANG.get(niveau, 9) < _NT_RANG.get(ouverte["niveau"], 9)
+                # Un ÉTAT se dit au présent : son titre suit la dernière mesure (10-10 — « Trivy : 11 critiques »
+                # restait affiché quand il n'y en avait plus que 8). Un événement garde son premier titre, le ×N compte.
                 conn.execute(
                     "UPDATE notifs SET n = n + 1, maj = datetime('now'), corps = ?, niveau = ?, lu = 0, "
+                    "titre = CASE WHEN ? = 'etat' AND ? <> '' THEN ? ELSE titre END, "
                     "expire_le = CASE WHEN ? <> '' THEN ? ELSE expire_le END, "
                     "sonde = CASE WHEN ? <> '' THEN ? ELSE sonde END WHERE id = ?",
-                    (str(corps or "")[:1500], niveau, expire, expire, sonde, sonde, nid))
+                    (str(corps or "")[:1500], niveau, nature, str(titre or ""), str(titre or "")[:200],
+                     expire, expire, sonde, sonde, nid))
                 if monte:
                     # Une montée en gravité efface le « vu » : ce n'est plus la même chose qu'on a lue.
                     conn.execute("UPDATE notif_dest SET vu_le = '', acquitte_le = '' WHERE notif = ?", (nid,))
