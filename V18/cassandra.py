@@ -104203,7 +104203,8 @@ select.bu-inp:focus{color:var(--txt)}
 .aut-grp{font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--txt-ghost);margin:2px 0 8px}
 .aut-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px 16px;margin-bottom:10px}
 .aut-f{display:flex;flex-direction:column;gap:4px;min-width:0}.aut-f.w{grid-column:1/-1}.aut-f label{font-size:12px;font-weight:600}
-.aut-tog{width:18px;height:18px;accent-color:var(--accent)}
+.aut-tog{width:18px;height:18px;accent-color:var(--accent);align-self:flex-start}
+.aut-r{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.aut-r .bu-inp{width:auto;min-width:0;max-width:100%}.aut-r .t{font-size:12px;color:var(--txt-faint)}
 @media(max-width:820px){.aut-g{grid-template-columns:1fr}.aut-dr{justify-content:flex-start}}
 .pf-om:last-child{border-bottom:0}
 .pf-om .q{font-family:'JetBrains Mono',monospace;font-size:9.5px;color:var(--txt-faint);
@@ -114306,13 +114307,13 @@ function autRendre(){
                 const k='g:'+g.cle;
                 pan='<div class="aut-pan"><div class="aut-grp">Appliqués par la porte</div><div class="aut-grid">'
                  +autChamp('Mode ombre', autTog(k,'ombre',v('ombre')), 'Elle dit ce qu\u2019elle aurait fait, sans le faire.')
-                 +autChamp('Fenêtre horaire', autSel(k,'fen',ch.fen||[],v('fen'))+' '+autTps(k,'fd',v('fd'))+' à '+autTps(k,'ff',v('ff')), 'La plage ne compte que si « Plage horaire » est choisie.', true)
-                 +autChamp('Disjoncteur', autNum(k,'ech',v('ech'),1,5)+' échecs d\u2019affilée, ou '+autNum(k,'boucle',v('boucle'),1,10)+' actions sur le même sujet en '+autSel(k,'boucleh',ch.boucleh||[],v('boucleh')), 'Il arrête le geste seul. Toi seul le débloques.', true)
+                 +autChamp('Fenêtre horaire', '<div class="aut-r">'+autSel(k,'fen',ch.fen||[],v('fen'))+autTps(k,'fd',v('fd'))+'<span class="t">à</span>'+autTps(k,'ff',v('ff'))+'</div>', 'La plage ne compte que si « Plage horaire » est choisie.', true)
+                 +autChamp('Disjoncteur', '<div class="aut-r">'+autNum(k,'ech',v('ech'),1,5)+'<span class="t"> échecs d\u2019affilée, ou</span>'+autNum(k,'boucle',v('boucle'),1,10)+'<span class="t"> actions sur le même sujet en</span>'+autSel(k,'boucleh',ch.boucleh||[],v('boucleh'))+'</div>', 'Il arrête le geste seul. Toi seul le débloques.', true)
                  +'</div><div class="aut-grp">Enregistrés, appliqués au fil du câblage</div><div class="aut-grid">'
                  +autChamp('Déclencheur', autSel(k,'decl',ch.decl||[],v('decl')))
                  +autChamp('Périmètre', autSel(k,'per',ch.per||[],v('per')))
                  +autChamp('Exclusions', '<input class="bu-inp mono" type="text" value="'+escapeAttr(v('excl')||'')+'" placeholder="ex. boheme-shop, 10.0.0.0/24" aria-label="excl" onchange="autSet(\''+k+'\',\'excl\',this)">','Ce qu\u2019elle ne touche jamais avec ce geste.')
-                 +autChamp('Second avis', autTog(k,'avis',v('avis')===null?g.rev!=='oui':v('avis'))+' '+autSel(k,'aviq',[def.aviq].concat(ETAT.proactivite._autModeles||[]),v('aviq')), 'Un modèle du registre relit le geste avant l\u2019action.', true)
+                 +autChamp('Second avis', '<div class="aut-r">'+autTog(k,'avis',v('avis')===null?g.rev!=='oui':v('avis'))+autSel(k,'aviq',[def.aviq].concat(ETAT.proactivite._autModeles||[]),v('aviq'))+'</div>', 'Un modèle du registre relit le geste avant l\u2019action.', true)
                  +autChamp('Point de restauration', autTog(k,'snap',v('snap')===null?g.rev==='part':v('snap')))
                  +autChamp('Gravité du récit', autSel(k,'ou',ch.ou||[],v('ou')), 'Les canaux viennent du Centre de notifications.')
                  +autChamp('Réveil nocturne', autSel(k,'nuit',ch.nuit||[],v('nuit')))
