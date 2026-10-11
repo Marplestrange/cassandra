@@ -74120,8 +74120,13 @@ def _dns_protege(nom: str) -> str:
     if nom in listes:
         return "« %s » est réservé (il ne pointe pas sur Orion)" % nom
     etiquette = nom.split(".")[0]
+    # Le courrier de cassandra.center est LIBRE (Drisse, 10-11 : « j'ai plus de MX, on peut exploiter le mail ») ; celui des autres domaines
+    # (maisonboheme.org : OVH) reste intouchable. Réglage : dns_courrier_libre.
+    libres = {x.strip().lower() for x in str(_mem_cfg("dns_courrier_libre", "cassandra.center") or "").split(",") if x.strip()}
+    if _dom_enregistre(nom) in libres:
+        return ""
     if etiquette in ("mail", "smtp", "imap", "pop", "pop3", "mx", "webmail", "autodiscover") or etiquette.startswith("_dmarc") or "._domainkey." in nom:
-        return "« %s » relève du courrier (routé par Cloudflare vers OVH) : jamais touché" % nom
+        return "« %s » relève du courrier (géré ailleurs, chez OVH) : jamais touché" % nom
     return ""
 
 
