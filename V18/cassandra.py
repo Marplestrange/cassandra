@@ -74207,7 +74207,11 @@ def _ip_publique_orion() -> str:
 def _detect_dns() -> list:
     """Règles « Domaines et DNS ». (1) Dérive par rapport à la référence ; (2) l'IP publique d'Orion a changé : les enregistrements qui la portaient
     sont à corriger (c'est le cas d'un domaine qui suit une adresse de box). Relevé toutes les 6 h ; première version = l'état d'aujourd'hui."""
-    if time.time() - _DNS_CACHE["t"] < 6 * 3600 and _DNS_CACHE["v"] is not None:
+    try:
+        _ids = tuple(_dns_reference(d)[1] for d in _dns_domaines())
+    except Exception:
+        _ids = ()
+    if time.time() - _DNS_CACHE["t"] < 6 * 3600 and _DNS_CACHE["v"] is not None and _DNS_CACHE.get("ids") == _ids:
         return _DNS_CACHE["v"]
     out = []
     try:
@@ -74260,7 +74264,7 @@ def _detect_dns() -> list:
                         "detail": "Référence : %s · observé : %s. Si c'est voulu, accepte le changement (il devient la nouvelle référence) ; sinon, c'est à rétablir." % (
                             ", ".join(att or []) or "absent", ", ".join(obs or []) or "absent"),
                         "suggested_action": "accepter-dns %s" % dom, "action_kind": "dns.accepter"})
-    _DNS_CACHE["t"], _DNS_CACHE["v"] = time.time(), out
+    _DNS_CACHE["t"], _DNS_CACHE["v"], _DNS_CACHE["ids"] = time.time(), out, _ids
     return out
 
 
