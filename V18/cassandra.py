@@ -23554,12 +23554,15 @@ def notif_acquitter(nid, compte: str) -> dict:
 
 
 def notif_lues(ids=None) -> dict:
-    """Compat : l'ancien « Tout lire » — devient « vu » pour le compte courant."""
-    try:
-        compte = get_current_user() or ""
-    except Exception:
-        compte = ""
-    return notif_vu(ids, compte)
+    """[QUARANTAINE jusqu'au 2027-01-09] Aucun usage trouvé le 2026-10-11 : ni lecture de son nom,
+    ni chaîne qui le porte, ni décorateur, ni trace au journal sur trente jours. Le corps est mis de
+    côté, pas supprimé : s'il est appelé, le fil se tire — alerte critique, quarantaine annulée,
+    version d'avant restaurée. Une fonction ne se retire qu'après avoir crié sans être entendue.
+
+    Ce que la fonction disait d'elle-même :
+    Compat : l'ancien « Tout lire » — devient « vu » pour le compte courant.
+    """
+    return evolution_fil_tire('notif_lues')
 
 
 def notif_supprimer(ids=None, reglees: bool = False) -> dict:
