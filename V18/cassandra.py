@@ -74133,7 +74133,7 @@ def _dns_releve(dom: str, hotes: list) -> dict:
     for nom, t in dict.fromkeys(noms):
         v = _dns_dig(nom, t, ns)
         if v:
-            rel["%s|%s" % (nom, t)] = sorted(_dns_norm(t, x) for x in v)
+            rel["%s|%s" % (nom, t)] = sorted({_dns_norm(t, x) for x in v})
     return rel
 
 
@@ -74168,7 +74168,7 @@ def _ip_publique_orion() -> str:
     """L'adresse IPv4 publique vue de l'extérieur : deux services doivent s'accorder, sinon on ne dit rien."""
     import ipaddress
     vues = []
-    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+    for url in ("https://api.ipify.org", "https://ipv4.icanhazip.com"):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "curl/8"}), timeout=8) as r:
                 v = r.read(64).decode().strip()
