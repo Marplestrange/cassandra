@@ -74050,6 +74050,11 @@ def _aut_envoyer_hors_site() -> tuple:
             # le ménage côté NAS : les copies de plus de 30 jours, dans NOTRE dossier seulement
             _ms_ssh_exec(srv, "find %s -type f -mtime +30 -delete; find %s -mindepth 1 -type d -empty -delete" % (_sh_quote(dist), _sh_quote(dist)), timeout=120)
         _preuve_ecrire("horssite")
+        try:
+            with open("/var/lib/cassandra/horssite.ok", "w", encoding="utf-8") as f:
+                json.dump({"ts": time.time(), "destination": "%s:%s" % (machine, racine)}, f)
+        except Exception as e:
+            logging.info("[HORS-SITE] marqueur : %s", e)
         return True, "envoyé et vérifié sur %s:%s (%s ; %.1f Mo transférés)" % (machine, racine, ", ".join(notes), octets / 1048576.0)
     except subprocess.TimeoutExpired:
         return False, "rsync trop long (plus d'une heure) : interrompu"
@@ -80415,20 +80420,19 @@ def site_pass() -> dict:
 
     # Lenteur : ce n'est pas une panne, donc pas de transition — mais un site
     # qui met plus de trois secondes mérite d'être signalé une fois par jour.
-    for l in lents:
-        cle = "site-lent:%s@%s" % (l["domain"], maintenant[:10])
-        if _cron_seen(cle):
-            continue
-        try:
-            _itare_proactive_add(
-                "Site lent : %s" % l["domain"],
-                "Répond en %d ms (seuil %d ms). Le code HTTP est bon, mais pour un "
-                "visiteur c'est déjà une panne." % (l["ms"], _SITE_LENT_MS),
-                source="site", nature="evenement", niveau="info", sujet=str(l["domain"]),
-                cle="site:lent:%s" % l["domain"], sonde="lent:%s" % l["domain"])
-            alertes += 1
-        except Exception as e:
-            logging.info("[SITES] alerte lenteur : %s", e)
+    if lents:
+        cle = "site-lent@%s" % maintenant[:10]
+        if not _cron_seen(cle):
+            try:
+                _itare_proactive_add(
+                    "%d site%s lent%s aujourd'hui" % (len(lents), "s" if len(lents) > 1 else "", "s" if len(lents) > 1 else ""),
+                    "Plus de %d ms : %s. Le code HTTP est bon, mais pour un visiteur c'est déjà lent." % (
+                        _SITE_LENT_MS, " · ".join("%s (%d ms)" % (l["domain"], l["ms"]) for l in lents[:12])),
+                    source="site", nature="evenement", niveau="info", sujet="sites lents",
+                    cle="site:lent:jour", sonde="lent")
+                alertes += 1
+            except Exception as e:
+                logging.info("[SITES] alerte lenteur : %s", e)
 
     return {"ok": True, "sites": len(sites), "transitions": len(transitions),
             "alerts": alertes, "tasks": taches, "mails": mails, "slow": len(lents),
@@ -82311,7 +82315,11 @@ def _sensorium_alertes_passe() -> dict:
                 conn.execute("UPDATE sensorium_alertes SET ok_depuis = NULL WHERE wkey = ?", (wk,))
             age = (now - datetime.strptime(e["depuis"], fmt)).total_seconds()
             delai = 0 if wk.startswith(_SENSORIUM_IMMEDIAT) else SENSORIUM_NOTIF_APRES_S
-            if age >= delai and (not e.get("nid") or e.get("valeur") != val):
+            if wk.startswith("health."):
+                continue                                     # un total de santé n'est pas une panne : ses composantes parlent d'elles-mêmes
+            _critique = wk.startswith(_SENSORIUM_CRITIQUES) or wk.startswith(_SENSORIUM_IMMEDIAT)
+            # Un chiffre qui bouge ne renotifie que pour une panne ou une alerte de sécurité : le reste dit UNE fois (11-10, trop de bruit).
+            if age >= delai and (not e.get("nid") or (e.get("valeur") != val and _critique)):
                 causes = []
                 try:
                     causes = (json.loads(r.get("detail") or "{}") or {}).get("causes_probables") or []
@@ -82331,7 +82339,7 @@ def _sensorium_alertes_passe() -> dict:
         conn.close()
     faits, effaces = [], []
     for wk, val, age, causes, deja in a_envoyer:
-        niveau = "critique" if wk.startswith(_SENSORIUM_CRITIQUES) else "avoir"
+        niveau = "critique" if wk.startswith(_SENSORIUM_CRITIQUES) else ("avoir" if wk.startswith(_SENSORIUM_IMMEDIAT) else "info")
         n = notif("%s : %s" % (_sensorium_libelle(wk), val[:140]),
                   corps=("En alerte depuis %d min." % (age // 60)) + (("\nCause probable : %s" % causes[0]) if causes else ""),
                   source="sensorium", niveau=niveau, sujet=wk[:120], cle="sensorium:" + wk, nature="etat")

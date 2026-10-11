@@ -3756,7 +3756,7 @@ def _fs_de(chemin: str):
 
 
 def _dernier_fichier(dossier: str):
-    """Les deux fichiers les plus récents (profondeur 3), en ignorant les fichiers en cours d'écriture."""
+    """Les deux fichiers les plus récents (profondeur 6), en ignorant les fichiers en cours d'écriture."""
     fichiers = []
     base = Path(dossier)
     try:
@@ -3764,7 +3764,7 @@ def _dernier_fichier(dossier: str):
             if i > 20000:          # un dépôt de sauvegarde de millions de fichiers ne bloque pas le collecteur
                 break
             try:
-                if len(f.relative_to(base).parts) > 3 or not f.is_file() or f.name.endswith((".tmp", ".part", ".lock")):
+                if len(f.relative_to(base).parts) > 6 or not f.is_file() or f.name.endswith((".tmp", ".part", ".lock")):
                     continue
                 st = f.stat()
                 fichiers.append((st.st_mtime, st.st_size, str(f)))
@@ -5830,6 +5830,14 @@ def build_world_model():
                     morceaux.append(r["detail"])
                 U("sauvegarde.%s" % r["source"], "sauvegarde", " · ".join(morceaux), vus,
                   "info" if r["etat"] in ("ok", "configuré") else "warning")
+            # La copie hors site que CASSANDRA fait elle-même (rsync vers le NAS, vérifiée) laisse un marqueur : s'il a moins de 48 h, c'est une copie hors machine.
+            try:
+                with open("/var/lib/cassandra/horssite.ok", encoding="utf-8") as _f:
+                    _m = json.load(_f)
+                if time.time() - float(_m.get("ts") or 0) < 48 * 3600:
+                    hors = True
+            except Exception:
+                pass
             U("sauvegarde.hors_machine", "sauvegarde",
               "oui" if hors else "AUCUNE copie hors de cette machine : un disque mort emporte tout", vus,
               "info" if hors else "warning")
