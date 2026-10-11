@@ -39492,6 +39492,24 @@ def itare_proactive_unseen_count() -> int:
         return 0
 
 def itare_proactive_pass(force=False) -> dict:
+    """La veille proactive d'Itare. Elle est celle de l'ADMINISTRATEUR : ses projets, ses rappels, rien des autres comptes.
+    (11-10 : lancée sans compte, elle lisait les projets et les rappels de TOUS et fabriquait un « point personnel » qui mêlait la vie
+    de Sandrine à celle de Drisse, rangé dans un fil que l'administrateur lit : une fuite entre comptes.)"""
+    try:
+        _adm = next((u for u, v in (load_users() or {}).items() if _user_record(v)["role"] == "admin"), "")
+    except Exception:
+        _adm = ""
+    if not _adm:
+        return {"ok": False, "reason": "aucun compte administrateur : pas de veille"}
+    _avant = get_current_user()
+    set_current_user(_adm)
+    try:
+        return _itare_proactive_pass_corps(force)
+    finally:
+        set_current_user(_avant)
+
+
+def _itare_proactive_pass_corps(force=False) -> dict:
     """Passe proactive : projets actifs + rappels échus (+ veille web éventuelle) → petit point
     rédigé par Itare, rangé dans le fil de veille. Volumineux mais gratuit (local possible)."""
     # Les échéances proches sont signalées AVANT toute autre chose, et sans dépendre
@@ -76598,18 +76616,31 @@ def pf_fil(heures: int = 24, limit: int = 80) -> dict:
                 _add(r["ferme_le"], "INCIDENT", "ok", "Incident clos : " + str(r["cause"]),
                      str(r["preuve"] or ""), 0, 1)
         for r in conn.execute("SELECT ts, etat, objet, destinataire FROM mandat_envois "
-                              "WHERE ts >= ?", (depuis,)).fetchall():
+                              "WHERE ts >= ? AND (compte = '' OR compte = ?)", (depuis, get_current_user() or "")).fetchall():
             _add(r["ts"], "MANDAT",
                  {"envoye": "ok", "refuse": "danger", "echec": "danger"}.get(r["etat"], "warn"),
                  "%s — %s" % (r["etat"], str(r["objet"])[:70]),
                  str(r["destinataire"] or "")[:70])
+        _moi = ""
+        try:
+            _moi = get_current_user() or ""
+        except Exception:
+            pass
         for r in conn.execute("SELECT ts, title, body FROM itare_proactive_feed "
                               "WHERE ts >= ?", (depuis,)).fetchall():
+            if str(r["title"] or "").startswith("Veille —"):
+                continue           # un point PERSONNEL : il ne se lit pas dans le fil de tous
             _add(r["ts"], "VEILLE", "info", r["title"], r["body"])
-        for r in conn.execute("SELECT ts, source, niveau, titre, corps FROM notifs "
+        for r in conn.execute("SELECT ts, source, niveau, titre, corps, destinataires FROM notifs "
                               "WHERE ts >= ?", (depuis,)).fetchall():
             if r["source"] in ("systeme", "site", "certificat"):
                 continue           # déjà présentes comme découvertes
+            try:
+                _d = json.loads(r["destinataires"] or "[]")
+            except Exception:
+                _d = ["admins"]
+            if not ("admins" in _d or (_moi and ("compte:%s" % _moi) in _d) or any(str(x).startswith("resident:") for x in _d)):
+                continue           # adressée à un autre compte : elle ne traverse pas
             _add(r["ts"], (r["source"] or "").upper(),
                  {"critique": "danger", "avoir": "warn"}.get(r["niveau"], "info"),
                  r["titre"], r["corps"])
