@@ -73426,7 +73426,7 @@ def secure_execute(cmd: str) -> str:
 #   disque / SSL / sécurité = détection + investigation + action sur clic.
 # ============================================================
 _PROACTIVE_LAST = [0.0]
-_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer", "disque.purger", "wp.maj", "wp.plugin", "wp.restaurer", "secret.rotation", "sauvegarde.plan", "sauvegarde.horssite")   # seules actions auto-remédiables (réversibles)
+_SAFE_ACTION_KINDS = ("service.restart", "securite.bannir", "site.relancer", "sauvegarde.relancer", "ssh.rotation", "conteneur.relancer", "disque.purger", "wp.maj", "wp.plugin", "wp.restaurer", "secret.rotation", "sauvegarde.plan", "sauvegarde.horssite", "dns.corriger")   # seules actions auto-remédiables (réversibles)
 
 
 def _detect_disk() -> list:
@@ -74064,6 +74064,254 @@ def _detect_hors_site() -> list:
              "detail": "Les sauvegardes sont sur le même disque que les sites. Cassandra peut les envoyer sur %s (%s), vérifiées après coup." % (
                  str(_mem_cfg("sauv_horssite_machine", "athena")), str(_mem_cfg("sauv_horssite_chemin", "/volume1/Sauvegarde/Orion"))),
              "suggested_action": "envoyer-hors-site", "action_kind": "sauvegarde.horssite"}]
+
+
+# ── DNS : une RÉFÉRENCE versionnée, la dérive détectée, et la correction (10-11) ─────────────────────────────────────────
+# Les zones sont chez Cloudflare. Lire ne demande rien (les serveurs de noms répondent à tout le monde) ; ÉCRIRE demande un jeton
+# d'API Cloudflare au coffre, sous « cloudflare/api_token » (permission Zone › DNS › Modifier, sur tes zones). Sans lui, Cassandra
+# détecte et dit ce qu'il faut changer ; elle ne touche à rien. Elle ne supprime jamais un enregistrement, ne touche jamais aux NS,
+# et ne change jamais le « proxifié » d'un enregistrement.
+_DNS_CLE = "domaines-et-dns/corriger-un-enregistrement-derive-de-la-referenc"
+_DNS_SELECTEURS = ("dkim", "default", "mail", "selector1", "selector2", "s1", "s2", "google", "k1")
+_DNS_CF = ("173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18",
+           "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+           "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22", "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
+           "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32")
+_DNS_NOM_RE = re.compile(r"^(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\.)+[a-z]{2,24}$")
+_DNS_CACHE = {"t": 0.0, "v": None}
+
+
+def _dns_dig(nom: str, typ: str, ns: str = "") -> list:
+    """Les valeurs d'un enregistrement, normalisées (sans guillemets, sans point final), triées. [] si rien ou si dig manque."""
+    import shutil
+    if not shutil.which("dig") or not _DNS_NOM_RE.match(nom or ""):
+        return []
+    cmd = ["dig", "+short", "+time=4", "+tries=1"] + (["@" + ns] if ns else []) + [nom, typ]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except Exception:
+        return []
+    out = []
+    for l in (p.stdout or "").splitlines():
+        l = l.strip()
+        if not l or l.startswith(";"):
+            continue
+        out.append(re.sub(r'"\s*"', "", l).strip('"').rstrip(".") if typ in ("TXT", "MX", "CNAME", "NS") else l)
+    return sorted(out)
+
+
+def _dns_norm(typ: str, val: str) -> str:
+    import ipaddress
+    if typ in ("A", "AAAA"):
+        try:
+            ip = ipaddress.ip_address(val)
+            if any(ip in ipaddress.ip_network(r) for r in _DNS_CF):
+                return "<cloudflare>"
+        except ValueError:
+            pass
+    return val.lower() if typ in ("MX", "CNAME", "NS") else val
+
+
+def _dns_domaines() -> list:
+    """Les domaines enregistrés suivis : ceux du panneau, plus dns_domaines (liste réglable)."""
+    doms = set()
+    try:
+        doms |= {_dom_enregistre(str(d.get("domain") or "")) for d in (get_fp_domains() or []) if isinstance(d, dict)}
+    except Exception:
+        pass
+    doms |= {_dom_enregistre(x.strip()) for x in str(_mem_cfg("dns_domaines", "") or "").split(",") if x.strip()}
+    return sorted(x for x in doms if x)
+
+
+def _dns_releve(dom: str, hotes: list) -> dict:
+    """{ "nom|TYPE": [valeurs] } pour la zone : l'apex, www, _dmarc, les sélecteurs DKIM, et chaque hôte du panneau."""
+    ns = (_dns_dig(dom, "NS") or [""])[0]               # on interroge le serveur de noms FAISANT FOI, pas un cache
+    rel = {}
+    noms = [(dom, t) for t in ("A", "AAAA", "MX", "TXT", "CAA")] + [("www." + dom, "A"), ("_dmarc." + dom, "TXT")]
+    noms += [("%s._domainkey.%s" % (sel, dom), "TXT") for sel in _DNS_SELECTEURS]
+    noms += [(h, t) for h in hotes for t in ("A", "AAAA", "CNAME")]
+    for nom, t in dict.fromkeys(noms):
+        v = _dns_dig(nom, t, ns)
+        if v:
+            rel["%s|%s" % (nom, t)] = sorted(_dns_norm(t, x) for x in v)
+    return rel
+
+
+def _dns_conn():
+    conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10); conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE IF NOT EXISTS dns_reference (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, domaine TEXT, contenu TEXT, auteur TEXT)")
+    return conn
+
+
+def _dns_reference(dom: str):
+    conn = _dns_conn()
+    try:
+        r = conn.execute("SELECT * FROM dns_reference WHERE domaine=? ORDER BY id DESC LIMIT 1", (dom,)).fetchone()
+        return (json.loads(r["contenu"]), r["id"]) if r else (None, 0)
+    finally:
+        conn.close()
+
+
+def dns_reference_poser(dom: str, contenu: dict, auteur: str) -> int:
+    """Une NOUVELLE version de la référence : les anciennes restent, rien n'est écrasé."""
+    conn = _dns_conn()
+    try:
+        cur = conn.execute("INSERT INTO dns_reference (ts, domaine, contenu, auteur) VALUES (?,?,?,?)",
+                           (time.time(), dom, json.dumps(contenu, ensure_ascii=False, sort_keys=True), auteur[:60]))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def _ip_publique_orion() -> str:
+    """L'adresse IPv4 publique vue de l'extérieur : deux services doivent s'accorder, sinon on ne dit rien."""
+    import ipaddress
+    vues = []
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "curl/8"}), timeout=8) as r:
+                v = r.read(64).decode().strip()
+            if ipaddress.ip_address(v).version == 4:
+                vues.append(v)
+        except Exception:
+            continue
+    return vues[0] if len(vues) == 2 and vues[0] == vues[1] else ""
+
+
+def _detect_dns() -> list:
+    """Règles « Domaines et DNS ». (1) Dérive par rapport à la référence ; (2) l'IP publique d'Orion a changé : les enregistrements qui la portaient
+    sont à corriger (c'est le cas d'un domaine qui suit une adresse de box). Relevé toutes les 6 h ; première version = l'état d'aujourd'hui."""
+    if time.time() - _DNS_CACHE["t"] < 6 * 3600 and _DNS_CACHE["v"] is not None:
+        return _DNS_CACHE["v"]
+    out = []
+    try:
+        hotes_panneau = [str(d.get("domain") or "").lower() for d in (get_fp_domains() or []) if isinstance(d, dict)]
+    except Exception:
+        hotes_panneau = []
+    ip_now = _ip_publique_orion()
+    ip_ref = str(_mem_cfg("dns_ip_orion_ref", "") or "")
+    if ip_now and not ip_ref:
+        try:
+            cfg = get_cassandra_config() or {}
+            cfg["dns_ip_orion_ref"] = ip_now
+            save_cassandra_config(cfg)
+            ip_ref = ip_now
+        except Exception:
+            pass
+    token = bool(vault_get("cloudflare/api_token")) if callable(globals().get("vault_get")) else False
+    for dom in _dns_domaines():
+        hotes = [h for h in hotes_panneau if h == dom or h.endswith("." + dom)]
+        rel = _dns_releve(dom, hotes)
+        if not rel:
+            continue
+        ref, vid = _dns_reference(dom)
+        if ref is None:
+            dns_reference_poser(dom, rel, "premier relevé")
+            continue
+        for cle in sorted(set(ref) | set(rel)):
+            att, obs = ref.get(cle), rel.get(cle)
+            nom, typ = cle.split("|")
+            ip_derivee = (typ == "A" and ip_now and ip_ref and ip_now != ip_ref and att == [ip_ref] and obs == [ip_ref])
+            if att == obs and not ip_derivee:
+                continue
+            if ip_derivee:
+                if token:
+                    out.append({"fkey": "dns_ip_%s" % nom.replace(".", "_"), "category": "dns", "severity": "critical",
+                                "title": "%s pointe encore sur l'ancienne adresse d'Orion" % nom,
+                                "detail": "L'adresse publique d'Orion est passée de %s à %s ; %s (A) porte toujours %s." % (ip_ref, ip_now, nom, ip_ref),
+                                "suggested_action": "corriger-dns %s A %s" % (nom, ip_now), "action_kind": "dns.corriger"})
+                else:
+                    out.append({"fkey": "dns_ip_%s" % nom.replace(".", "_"), "category": "dns", "severity": "critical",
+                                "title": "%s pointe encore sur l'ancienne adresse d'Orion" % nom,
+                                "detail": "L'adresse publique d'Orion est passée de %s à %s ; %s (A) porte toujours %s. Cassandra n'a pas de jeton Cloudflare "
+                                          "(coffre : cloudflare/api_token) : à corriger dans le tableau de bord." % (ip_ref, ip_now, nom, ip_ref),
+                                "suggested_action": "", "action_kind": "diagnostic"})
+                continue
+            out.append({"fkey": "dns_derive_%s" % cle.replace(".", "_").replace("|", "_"), "category": "dns", "severity": "warning",
+                        "title": "DNS : %s (%s) a changé" % (nom, typ),
+                        "detail": "Référence : %s · observé : %s. Si c'est voulu, accepte le changement (il devient la nouvelle référence) ; sinon, c'est à rétablir." % (
+                            ", ".join(att or []) or "absent", ", ".join(obs or []) or "absent"),
+                        "suggested_action": "accepter-dns %s" % dom, "action_kind": "dns.accepter"})
+    _DNS_CACHE["t"], _DNS_CACHE["v"] = time.time(), out
+    return out
+
+
+def _aut_dns_accepter(dom: str) -> tuple:
+    """L'état observé devient la nouvelle version de la référence (les anciennes restent). Geste HUMAIN : jamais lancé seul."""
+    if dom not in _dns_domaines():
+        return False, "domaine non suivi : %s" % dom
+    hotes = [str(d.get("domain") or "").lower() for d in (get_fp_domains() or []) if isinstance(d, dict)]
+    rel = _dns_releve(dom, [h for h in hotes if h == dom or h.endswith("." + dom)])
+    if not rel:
+        return False, "relevé vide : rien n'est accepté"
+    vid = dns_reference_poser(dom, rel, "accepté")
+    _DNS_CACHE["t"] = 0.0
+    return True, "nouvelle référence pour %s (version %d)" % (dom, vid)
+
+
+def _cf_api(methode: str, chemin: str, corps=None) -> dict:
+    tok = vault_get("cloudflare/api_token")
+    if not tok:
+        return {"ok": False, "reason": "pas de jeton Cloudflare au coffre (cloudflare/api_token)"}
+    req = urllib.request.Request("https://api.cloudflare.com/client/v4" + chemin, method=methode,
+                                 data=(json.dumps(corps).encode() if corps is not None else None),
+                                 headers={"Authorization": "Bearer " + str(tok).strip(), "Content-Type": "application/json", "User-Agent": "Cassandra/18"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read(500000).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            d = json.loads(e.read(20000).decode("utf-8", "replace"))
+        except Exception:
+            d = {}
+        return {"ok": False, "reason": "Cloudflare a refusé (%s) : %s" % (e.code, str((d.get("errors") or [{}])[0].get("message") or "")[:120])}
+    except Exception as e:
+        return {"ok": False, "reason": "Cloudflare injoignable : %s" % str(e)[:100]}
+    return {"ok": bool(d.get("success")), "data": d.get("result"), "reason": "" if d.get("success") else str(d.get("errors"))[:150]}
+
+
+def _aut_dns_corriger(nom: str, typ: str, valeur: str) -> tuple:
+    """Corrige UN enregistrement A existant, d'une zone suivie, vers l'IP publique d'Orion. Puis PROUVE : le serveur de noms doit rendre la
+    nouvelle valeur. Ne crée rien, ne supprime rien, ne change pas le « proxifié »."""
+    import ipaddress
+    nom = str(nom or "").lower().strip(".")
+    dom = _dom_enregistre(nom)
+    if typ != "A" or dom not in _dns_domaines() or not _DNS_NOM_RE.match(nom):
+        return False, "enregistrement refusé : seuls les A des zones suivies se corrigent"
+    try:
+        ip = ipaddress.ip_address(valeur)
+    except ValueError:
+        return False, "adresse illisible"
+    if ip.version != 4 or ip != ipaddress.ip_address(_ip_publique_orion() or "0.0.0.0"):
+        return False, "la valeur n'est pas l'adresse publique actuelle d'Orion : rien n'est écrit"
+    z = _cf_api("GET", "/zones?name=%s" % dom)
+    if not z.get("ok") or not z.get("data"):
+        return False, "zone introuvable chez Cloudflare : %s" % (z.get("reason") or dom)
+    zid = z["data"][0]["id"]
+    r = _cf_api("GET", "/zones/%s/dns_records?type=A&name=%s" % (zid, nom))
+    if not r.get("ok") or not r.get("data"):
+        return False, "aucun enregistrement A « %s » à corriger : %s" % (nom, r.get("reason") or "absent")
+    rec = r["data"][0]
+    if rec.get("proxied"):
+        return False, "« %s » est proxifié : son adresse n'est pas celle d'Orion, rien à corriger" % nom
+    ancien = rec.get("content")
+    u = _cf_api("PUT", "/zones/%s/dns_records/%s" % (zid, rec["id"]),
+                {"type": "A", "name": nom, "content": str(ip), "ttl": rec.get("ttl", 1), "proxied": False})
+    if not u.get("ok"):
+        return False, "mise à jour refusée : %s" % u.get("reason")
+    ns = (_dns_dig(dom, "NS") or [""])[0]
+    for _ in range(6):
+        if _dns_dig(nom, "A", ns) == [str(ip)]:
+            hotes = [str(d.get("domain") or "").lower() for d in (get_fp_domains() or []) if isinstance(d, dict)]
+            dns_reference_poser(dom, _dns_releve(dom, [h for h in hotes if h == dom or h.endswith("." + dom)]), "correction automatique %s" % nom)
+            cfg = get_cassandra_config() or {}
+            cfg["dns_ip_orion_ref"] = str(ip)
+            save_cassandra_config(cfg)
+            _DNS_CACHE["t"] = 0.0
+            return True, "%s : %s -> %s, vérifié sur le serveur de noms" % (nom, ancien, ip)
+        time.sleep(5)
+    return False, "%s mis à jour chez Cloudflare (%s -> %s) mais le serveur de noms ne le rend pas encore" % (nom, ancien, ip)
 
 
 def _detect_pieces() -> list:
@@ -74802,6 +75050,7 @@ _PF_DETECTEURS = (
     ("surface", "Surface exposée", "proactive_watch_surface", "_detect_surface"),
     ("plan_sauvegarde", "Plan de sauvegarde", "proactive_watch_plan", "_detect_sauvegardes_absentes"),
     ("hors_site", "Copie hors site", "proactive_watch_horssite", "_detect_hors_site"),
+    ("dns", "DNS", "proactive_watch_dns", "_detect_dns"),
 )
 
 
@@ -75055,7 +75304,7 @@ _AUT_CATALOGUE = [
    ('etendre-son-catalogue-de-gestes', 'Étendre son catalogue de gestes', 'ok', 'oui', 'tour sans lecture extérieure'),
  ]),
  ('domaines-et-dns', 'Domaines et DNS', 'Enregistrements, SPF, DKIM, DMARC, tunnels, expirations.', [
-   ('corriger-un-enregistrement-derive-de-la-referenc', 'Corriger un enregistrement dérivé de la référence (A, MX)', 'ecrire', 'oui', 'référence versionnée'),
+   ('corriger-un-enregistrement-derive-de-la-referenc', 'Corriger un enregistrement dérivé de la référence (A, MX)', 'ok', 'oui', 'référence versionnée'),
    ('publier-ou-reparer-spf-dkim-dmarc', 'Publier ou réparer SPF, DKIM, DMARC', 'ecrire', 'oui', 'valeurs validées avant publication'),
    ('surveiller-les-expirations-de-domaines', 'Surveiller les expirations de domaines', 'ok', 'oui', 'lecture seule'),
    ('gerer-les-tunnels-cloudflare', 'Gérer les tunnels Cloudflare', 'ecrire', 'oui', 'tailnet toujours joignable'),
@@ -75116,6 +75365,7 @@ _AUT_CATALOGUE = [
 # Le geste du catalogue que sait déclencher chaque action_kind du moteur proactif. Les autres restent au
 # palier global, sans disjoncteur : l'ancien comportement.
 _AUT_GESTE_DE_KIND = {
+    "dns.corriger": "domaines-et-dns/corriger-un-enregistrement-derive-de-la-referenc",
     "sauvegarde.horssite": "sauvegardes-preuve-et-hors-site/envoyer-une-sauvegarde-hors-site",
     "sauvegarde.plan": "hebergement/creer-ou-modifier-un-plan-de-sauvegarde",
     "secret.rotation": "rotation-des-secrets/remplacer-un-mot-de-passe-de-service",
@@ -77404,6 +77654,26 @@ def proactive_act(fid, auto: bool = False, acteur: str = "") -> dict:
             conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
             conn.execute("UPDATE proactive_findings SET status='acted', acted_at=datetime('now'), action_result=? WHERE id=?",
                          (("auto • " if auto else "") + str(out)[:1500], int(fid)))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+        return {"ok": bool(_ok), "output": str(out)[:2000], "gate": ""}
+    if kind in ("dns.corriger", "dns.accepter"):
+        _m = (re.match(r"^\s*corriger-dns\s+([a-z0-9._-]+(?:\.[a-z]{2,24})+)\s+A\s+([0-9.]{7,15})\s*$", cmd) if kind == "dns.corriger"
+              else re.match(r"^\s*accepter-dns\s+([a-z0-9.-]+\.[a-z]{2,24})\s*$", cmd))
+        if not _m:
+            return {"ok": False, "error": "commande DNS illisible"}
+        if kind == "dns.accepter" and auto:
+            return {"ok": False, "error": "accepter un changement de DNS est un geste humain"}
+        _ok, out = _aut_dns_corriger(_m.group(1), "A", _m.group(2)) if kind == "dns.corriger" else _aut_dns_accepter(_m.group(1))
+        try:
+            log_action("proactive", cmd, out, 0, True, False)
+        except Exception:
+            pass
+        try:
+            conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10)
+            conn.execute("UPDATE proactive_findings SET status=?, acted_at=datetime('now'), action_result=? WHERE id=?",
+                         ("acted" if _ok else "open", ("auto • " if auto else "") + str(out)[:1500], int(fid)))
             conn.commit(); conn.close()
         except Exception:
             pass
