@@ -77206,6 +77206,11 @@ def proactive_scan(auto_act: bool = None) -> dict:
                 _pt = aut_point_restauration(g, t["suggested_action"])
                 r = proactive_act(t["id"], auto=True)
                 acted.append({"id": t["id"], "ok": r.get("ok"), "gate": r.get("gate")})
+                if r.get("ok"):
+                    try:
+                        notif_resoudre_cle("pf:%s" % t["fkey"], par="cassandra", detail="fait seule")   # le constat est réglé : sa ligne ne reste pas à l'écran
+                    except Exception:
+                        pass
                 if g.get("cle") and not r.get("differe"):
                     aut_disj_resultat(g["cle"], g.get("sujet") or "", bool(r.get("ok")), g.get("eff") or {})
                     aut_journaliser(g["cle"], g.get("sujet") or "", bool(r.get("ok")), t["title"] + ((" — " + _pt) if _pt else ""),
