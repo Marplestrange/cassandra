@@ -45164,13 +45164,17 @@ def _bj_decisions():
     try:
         conn = sqlite3.connect(MEMORY_DB_PATH, timeout=10); conn.row_factory = sqlite3.Row
         rows = [dict(r) for r in conn.execute(
-            "SELECT id, titre, source, ts, destinataires FROM notifs WHERE resolue = 0 "
+            "SELECT id, titre, source, niveau, ts, destinataires FROM notifs WHERE resolue = 0 "
             "AND nature = 'decision' ORDER BY id DESC LIMIT 60")]
         conn.close()
     except Exception as e:
         logging.info("[BUREAU] décisions : %s", e)
         return out
     for r in rows:
+        # CE QUE LES AGENTS FONT SEULS ne brûle pas sur le bureau de l'humain (11-10, Drisse : « c'est le boulot des agents »).
+        # Les constats de la Proactivité et les tâches qu'elle se donne restent dans leur onglet et dans la cloche ; seul un critique remonte ici.
+        if r.get("source") in ("proactivite", "autotache") and r.get("niveau") != "critique":
+            continue
         try:
             dests = json.loads(r.get("destinataires") or "[]")
         except Exception:
@@ -73845,7 +73849,10 @@ def _surface_ecoute() -> dict:
                         or ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"):
                     continue
             proc = re.search(r'\(\("([^"]+)"', ligne)
-            sortie.setdefault("%s/%s" % (proto, port), proc.group(1) if proc else "?")
+            nom_proc = proc.group(1) if proc else "?"
+            if nom_proc in ("tailscaled", "avahi-daemon") or (proto == "udp" and int(port) >= 1024 and nom_proc != "wg"):
+                continue                                   # ports UDP éphémères : ils changent à chaque redémarrage
+            sortie.setdefault("%s/%s" % (proto, port), nom_proc)
     return sortie
 
 
@@ -74402,7 +74409,7 @@ def _detect_services() -> list:
     try:
         for u in (get_failed_units() or [])[:30]:
             unit = (u.get("unit") or "").strip()
-            if not unit or unit in UNIT_BULLETS or unit == "?":
+            if not unit or unit in UNIT_BULLETS or unit == "?" or re.match(r"^session-[\w.-]+\.scope$", unit):
                 continue
             # Des unités dont l'échec ne dit rien de la santé de la machine (le crochet d'ARRÊT d'unattended-upgrades :
             # les mises à jour, elles, passent par le minuteur apt-daily-upgrade). Réglable.
@@ -76047,7 +76054,7 @@ def aut_raconter(cle: str, sujet: str, ok: bool, detail: str, resultat: str, eff
     try:
         notif(("Fait seule : %s" if ok else "Échec seule : %s") % lib,
               ("%s · %s%s" % ((sujet or "?")[:100], detail or "", (" · " + resultat) if (resultat and not ok) else ""))[:400],
-              source="veille", niveau=niveau, sujet=(sujet or "")[:100], cle="aut:fait:%s:%s" % (cle, (sujet or "")[:60]),
+              source="veille", niveau=niveau, cle="aut:fait:%s:%s:%s" % (cle, "ok" if ok else "ko", datetime.now().strftime("%Y%m%d")),
               nature="evenement")
     except Exception as e:
         logging.info("[AUTONOMIE] récit : %s", e)
@@ -76190,7 +76197,7 @@ def pf_autorise(signature: str, action_kind: str, cmd: str, fkey: str = "",
         return _non("palier « proposer » : elle attend un appui")
     if a["reversible"] and not (sav or {}).get("reversible", 1):
         return _non("ce geste n'est pas réversible")
-    if palier == "maitrise":
+    if palier == "maitrise" and not (eff or {}).get("rev") == "oui":      # entièrement réversible : éprouvé d'office (11-10)
         if not sav or sav.get("etat") != "auto":
             return _non("« %s » n'est pas encore un savoir-faire éprouvé (%d/%d réussites)"
                         % (signature, (sav or {}).get("successes", 0), _PF_SEUIL_PROMO))
@@ -116768,7 +116775,7 @@ function autRendre(){
             const nReg=Object.keys(R).length;
             const lib=(AUT_LV.filter(function(l){ return l[0]===g.palier; })[0]||['',''])[1];
             const effet=g.st==='dur'?'jamais seule':(g.st==='ecrire'?'propose seulement : geste à écrire':
-                (g.st==='brancher'?'à brancher : '+lib:(g.palier==='maitrise'?'agit seule après 10 réussites':(g.palier==='raconter'?'agit seule':lib.toLowerCase()))));
+                (g.st==='brancher'?'à brancher : '+lib:(g.palier==='maitrise'?(g.rev==='oui'?'agit seule':'agit seule après 10 réussites'):(g.palier==='raconter'?'agit seule':lib.toLowerCase()))));
             let pan='';
             if(gouv[g.cle]){
                 const k='g:'+g.cle;
