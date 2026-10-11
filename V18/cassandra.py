@@ -74112,6 +74112,19 @@ def _dns_norm(typ: str, val: str) -> str:
     return val.lower() if typ in ("MX", "CNAME", "NS") else val
 
 
+def _dns_protege(nom: str) -> str:
+    """Pourquoi Cassandra ne touche JAMAIS à ce nom ('' si elle peut). Décision de Drisse (10-11) : www.cassandra.center renvoie vers Athena
+    (Dolibarr), pas vers Orion ; le courrier de app.cassandra.center et de administration@maisonboheme.org est routé par Cloudflare vers OVH."""
+    nom = str(nom or "").lower().strip(".")
+    listes = {x.strip().lower() for x in str(_mem_cfg("dns_ne_pas_toucher", "www.cassandra.center") or "").split(",") if x.strip()}
+    if nom in listes:
+        return "« %s » est réservé (il ne pointe pas sur Orion)" % nom
+    etiquette = nom.split(".")[0]
+    if etiquette in ("mail", "smtp", "imap", "pop", "pop3", "mx", "webmail", "autodiscover") or etiquette.startswith("_dmarc") or "._domainkey." in nom:
+        return "« %s » relève du courrier (routé par Cloudflare vers OVH) : jamais touché" % nom
+    return ""
+
+
 def _dns_domaines() -> list:
     """Les domaines enregistrés suivis : ceux du panneau, plus dns_domaines (liste réglable)."""
     doms = set()
@@ -74215,6 +74228,8 @@ def _detect_dns() -> list:
             ip_derivee = (typ == "A" and ip_now and ip_ref and ip_now != ip_ref and att == [ip_ref] and obs == [ip_ref])
             if att == obs and not ip_derivee:
                 continue
+            if ip_derivee and _dns_protege(nom):
+                continue                                  # ce nom n'est pas à Orion : on ne propose rien dessus
             if ip_derivee:
                 if token:
                     out.append({"fkey": "dns_ip_%s" % nom.replace(".", "_"), "category": "dns", "severity": "critical",
@@ -74279,6 +74294,8 @@ def _aut_dns_corriger(nom: str, typ: str, valeur: str) -> tuple:
     dom = _dom_enregistre(nom)
     if typ != "A" or dom not in _dns_domaines() or not _DNS_NOM_RE.match(nom):
         return False, "enregistrement refusé : seuls les A des zones suivies se corrigent"
+    if _dns_protege(nom):
+        return False, "refusé : %s" % _dns_protege(nom)
     try:
         ip = ipaddress.ip_address(valeur)
     except ValueError:
