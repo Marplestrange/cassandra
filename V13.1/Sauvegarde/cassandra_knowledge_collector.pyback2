@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+import os, sys, time, json, sqlite3
+from datetime import datetime
+
+DB_PATH = "/var/lib/cassandra/cassandra.db"
+LOG_FILE = "/var/log/cassandra-collector.log"
+
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line + "\n")
+    except:
+        pass
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def save_stats_to_db(table, data):
+    if not data:
+        return
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute(f"CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        for item in data:
+            c.execute(f"INSERT INTO {table} (data) VALUES (?)", (json.dumps(item),))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"DB Error ({table}): {e}")
+
+def collect_fp_server_stat(period_hours=24):
+    now_str = datetime.now().isoformat()
+    result = []
+    try:
+        with open('/proc/loadavg') as f:
+            la = f.read().strip().split()[:3]
+            la1, la5, la15 = float(la[0]), float(la[1]), float(la[2])
+    except:
+        la1 = la5 = la15 = 0.0
+    try:
+        with open('/proc/meminfo') as f:
+            meminfo = {}
+            for line in f:
+                parts = line.split(':')
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    val = parts[1].strip().split()[0]
+                    meminfo[key] = int(val) * 1024
+        mem_total = meminfo.get('MemTotal', 0)
+        mem_available = meminfo.get('MemAvailable', 0)
+        mem_used = mem_total - mem_available
+        swap_total = meminfo.get('SwapTotal', 0)
+        swap_free = meminfo.get('SwapFree', 0)
+        swap_used = swap_total - swap_free
+    except:
+        mem_used = mem_total = swap_used = swap_total = 0
+    try:
+        with open('/proc/stat') as f:
+            cpu_line = [l for l in f if l.startswith('cpu ')][0]
+        fields = [int(x) for x in cpu_line.strip().split()[1:]]
+        total = sum(fields)
+        idle = fields[3]
+        cpu_percent = round((1 - idle/total) * 100, 1) if total > 0 else 0
+    except:
+        cpu_percent = 0.0
+    result.append({"ts": now_str, "cpu": cpu_percent, "la1": la1, "la5": la5, "la15": la15, "mem_used": mem_used, "mem_total": mem_total, "swap_used": swap_used, "swap_total": swap_total})
+    return result
+
+def collect_fp_process_stat(period_hours=1):
+    result = []
+    try:
+        pids = [d for d in os.listdir('/proc') if d.isdigit()]
+        processes = []
+        for pid in pids[:200]:
+            try:
+                with open(f'/proc/{pid}/stat') as f:
+                    stat = f.read().strip()
+                name_start = stat.index('(') + 1
+                name_end = stat.index(')')
+                name = stat[name_start:name_end][:50]
+                parts = stat[name_end+2:].split()
+                if len(parts) >= 13:
+                    utime, stime = int(parts[11]), int(parts[12])
+                    total_time = utime + stime
+                    try:
+                        with open(f'/proc/{pid}/status') as f:
+                            status = f.read()
+                        rss = 0
+                        for line in status.split('\n'):
+                            if line.startswith('VmRSS:'):
+                                rss = int(line.split()[1])
+                                break
+                    except:
+                        rss = 0
+                    processes.append((total_time, name, rss))
+            except:
+                pass
+        processes.sort(key=lambda x: x[0], reverse=True)
+        for total_time, name, rss in processes[:20]:
+            result.append({"ts": datetime.now().isoformat(), "name": name, "cpu": 0.0, "mem": round(rss / 1024, 1) if rss > 0 else 0.0})
+    except:
+        pass
+    return result
+
+def collect_fp_disk_stat(period_hours=24):
+    result = []
+    try:
+        out = os.popen('df -B1 --total 2>/dev/null').read()
+        lines = [l.strip() for l in out.split('\n') if l.strip() and not l.startswith('Filesystem')]
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 6:
+                fs = parts[0]
+                total = int(parts[1]) if parts[1].isdigit() else 0
+                used = int(parts[2]) if parts[2].isdigit() else 0
+                avail = int(parts[3]) if parts[3].isdigit() else 0
+                pct = parts[4] if len(parts) > 4 else '0%'
+                mount = parts[5] if len(parts) > 5 else ''
+                result.append({"ts": datetime.now().isoformat(), "filesystem": fs, "total": total, "used": used, "available": avail, "percent": pct, "mount": mount})
+    except:
+        pass
+    return result
+
+def collect_fp_network_stat(period_hours=24):
+    result = []
+    try:
+        with open('/proc/net/dev') as f:
+            lines = f.readlines()
+        for line in lines[2:]:
+            parts = line.strip().split()
+            if len(parts) >= 10:
+                iface = parts[0].replace(':', '')
+                rx_bytes = int(parts[1])
+                tx_bytes = int(parts[9])
+                result.append({"ts": datetime.now().isoformat(), "interface": iface, "rx_bytes": rx_bytes, "tx_bytes": tx_bytes})
+    except:
+        pass
+    return result
+
+def collect_fp_ftp():
+    result = []
+    try:
+        if os.path.exists('/etc/proftpd/proftpd.passwd'):
+            with open('/etc/proftpd/proftpd.passwd') as f:
+                for line in f:
+                    parts = line.strip().split(':')
+                    if len(parts) >= 2:
+                        result.append({"username": parts[0], "uid": parts[2] if len(parts) > 2 else "0"})
+    except:
+        pass
+    return result
+
+if __name__ == "__main__":
+    log("Cassandra Knowledge Collector v6.1 LXC - demarrage")
+    while True:
+        try:
+            log("Collecte des stats serveur...")
+            data = collect_fp_server_stat()
+            save_stats_to_db("fastpanel_server_stats", data)
+            log(f"  -> {len(data)} stats serveur sauvegardees")
+
+            log("Collecte des processus...")
+            data = collect_fp_process_stat()
+            save_stats_to_db("fastpanel_process_stats", data)
+            log(f"  -> {len(data)} processus sauvegardes")
+
+            log("Collecte des disques...")
+            data = collect_fp_disk_stat()
+            save_stats_to_db("fastpanel_disk_stats", data)
+            log(f"  -> {len(data)} disques sauvegardes")
+
+            log("Collecte du reseau...")
+            data = collect_fp_network_stat()
+            save_stats_to_db("fastpanel_network_stats", data)
+            log(f"  -> {len(data)} interfaces sauvegardees")
+
+            log("Collecte des comptes FTP...")
+            data = collect_fp_ftp()
+            save_stats_to_db("fastpanel_ftp", data)
+            log(f"  -> {len(data)} comptes FTP sauvegardes")
+
+        except Exception as e:
+            log(f"ERREUR: {e}")
+        time.sleep(60)

@@ -1,0 +1,110 @@
+# cassandra_alerts.yml — Configuration du moteur d'alerting CASSANDRA v13
+# Emplacement attendu : /etc/cassandra/alerts.yml
+# ──────────────────────────────────────────────────────────────────────────────
+email:
+  enabled: false
+  smtp_host: smtp.example.com
+  smtp_port: 587
+  smtp_tls: true
+  smtp_user: administration@exemple.org
+  smtp_password: "RETIRE"
+  from_addr: "CASSANDRA Alerts <administration@exemple.org>"
+  to_addrs:
+    - contact@exemple.org
+
+webhook:
+  enabled: false
+  url: "chat.cassandra.center"
+  headers: {}
+  # Variables : {message} {severity} {host} {ts}
+  # Slack  : '{"text": "[{severity}] {host}: {message}"}'
+  # Ntfy   : '{"topic": "cassandra", "message": "{message}", "priority": 4}'
+  # Discord: '{"content": "**[{severity}]** {host}: {message}"}'
+  payload_template: '{"text": "[{severity}] {host}: {message}"}'
+
+rules:
+  # ── Disque ────────────────────────────────────────────────────────────────
+  - name: disk_critical
+    metric: disk_pct
+    condition: ">= 90"
+    severity: critical
+    channels: [email, webhook]
+    cooldown_minutes: 120
+    message: "Disque {mount} : {value:.0f}% utilise (seuil {threshold}%)"
+
+  - name: disk_warning
+    metric: disk_pct
+    condition: ">= 80"
+    severity: warning
+    channels: [webhook]
+    cooldown_minutes: 360
+    message: "Disque {mount} : {value:.0f}% utilise"
+
+  # ── RAM ───────────────────────────────────────────────────────────────────
+  - name: ram_critical
+    metric: ram_pct
+    condition: ">= 95"
+    severity: critical
+    channels: [email, webhook]
+    cooldown_minutes: 60
+    message: "RAM critique : {value:.0f}% utilisee"
+
+  - name: ram_warning
+    metric: ram_pct
+    condition: ">= 88"
+    severity: warning
+    channels: [webhook]
+    cooldown_minutes: 120
+    message: "RAM elevee : {value:.0f}% utilisee"
+
+  # ── CPU / Load ────────────────────────────────────────────────────────────
+  - name: load_critical
+    metric: load_per_core
+    condition: ">= 3.0"
+    severity: critical
+    channels: [email, webhook]
+    cooldown_minutes: 30
+    message: "Load Average critique : {value:.2f} par CPU"
+
+  - name: load_warning
+    metric: load_per_core
+    condition: ">= 2.0"
+    severity: warning
+    channels: [webhook]
+    cooldown_minutes: 60
+    message: "Load Average eleve : {value:.2f} par CPU"
+
+  # ── SSL ───────────────────────────────────────────────────────────────────
+  - name: ssl_expiring_soon
+    metric: ssl_days_left
+    condition: "<= 14"
+    severity: warning
+    channels: [email, webhook]
+    cooldown_minutes: 1440
+    message: "SSL '{domain}' expire dans {value} jours !"
+
+  - name: ssl_critical
+    metric: ssl_days_left
+    condition: "<= 3"
+    severity: critical
+    channels: [email, webhook]
+    cooldown_minutes: 360
+    message: "SSL '{domain}' expire dans {value} jours !!!"
+
+  # ── Services ──────────────────────────────────────────────────────────────
+  - name: service_failed
+    metric: failed_services
+    condition: ">= 1"
+    severity: critical
+    channels: [email, webhook]
+    cooldown_minutes: 60
+    message: "{value} service(s) en etat failed : {details}"
+
+  # ── OOM ───────────────────────────────────────────────────────────────────
+  - name: oom_detected
+    metric: oom_count
+    condition: ">= 1"
+    severity: warning
+    channels: [webhook]
+    cooldown_minutes: 120
+    message: "{value} evenement(s) OOM detectes"

@@ -1,0 +1,1026 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CASSANDRA — Infrastructure AI v7.1</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.5/purify.min.js" crossorigin="anonymous"></script>
+<style>
+:root {
+    --bg: #0a0a0f;
+    --bg2: #111118;
+    --bg3: #18181f;
+    --panel: #1c1c25;
+    --border: rgba(255,255,255,0.06);
+    --border2: rgba(255,255,255,0.12);
+    --accent: #00d4aa;
+    --accent2: #7c5cfc;
+    --danger: #ff4757;
+    --warning: #ffa502;
+    --ok: #2ed573;
+    --text: #e8e8f0;
+    --muted: #6b6b80;
+    --mono: 'JetBrains Mono', monospace;
+    --sans: 'Syne', sans-serif;
+    --sidebar-w: 400px;
+    --header-h: 52px;
+}
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: var(--mono);
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: grid;
+    grid-template-rows: var(--header-h) 1fr;
+    grid-template-columns: var(--sidebar-w) 1fr 320px;
+    grid-template-areas: "header header header" "sidebar chat memory";
+    overflow: hidden;
+}
+.login-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(10,10,15,0.95);
+    backdrop-filter: blur(8px);
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.login-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 32px;
+    width: 320px;
+    text-align: center;
+}
+.login-card h2 { font-family: var(--sans); color: var(--accent); margin-bottom: 24px; }
+.login-card input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    margin-bottom: 16px;
+}
+.login-card button { width: 100%; background: var(--accent); border: none;
+    border-radius: 8px; padding: 12px; color: var(--bg); font-weight: 600; cursor: pointer; }
+.login-card .error { color: var(--danger); font-size: 12px; margin-top: 12px; }
+header {
+    grid-area: header;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 16px;
+    z-index: 10;
+}
+.logo { font-family: var(--sans); font-weight: 800; font-size: 18px; color: var(--accent); text-transform: uppercase; }
+.logo-sub { font-size: 10px; color: var(--muted); margin-left: 2px; }
+.logo-badge { font-size: 9px; background: var(--accent2); color: var(--bg); padding: 2px 6px; border-radius: 4px; margin-left: 8px; }
+.header-status { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); margin-left: auto; }
+.status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+.header-time { font-size: 11px; color: var(--muted); margin-left: 20px; }
+.logout-btn { background: var(--bg3); border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 12px; font-size: 11px; color: var(--muted); cursor: pointer; margin-left: 12px; }
+.logout-btn:hover { border-color: var(--danger); color: var(--danger); }
+#sidebar {
+    grid-area: sidebar;
+    background: var(--bg2);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 16px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+#sidebar::-webkit-scrollbar { width: 6px; }
+#sidebar::-webkit-scrollbar-track { background: transparent; }
+#sidebar::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+.sidebar-title {
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.2em;
+    color: var(--accent);
+    text-transform: uppercase;
+    padding: 4px 4px 8px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.sidebar-title .refresh-icon { cursor: pointer; font-size: 10px; opacity: 0.7; color: var(--muted); }
+.sidebar-title .refresh-icon:hover { opacity: 1; color: var(--accent); }
+.gauge-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.gauge-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px 6px 10px; text-align: center; }
+.gauge-label { font-size: 10px; color: var(--muted); text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.1em; }
+.gauge-val { font-size: 14px; font-weight: 700; margin-top: 6px; }
+.sparkline-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+.sparkline-head { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-bottom: 8px; }
+.sparkline-head span:last-child { color: var(--text); font-weight: 600; font-size: 11px; }
+canvas.sparkline { width: 100%; height: 40px; display: block; border-radius: 4px; }
+.stat-bar-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+.stat-bar-head { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 8px; }
+.stat-bar-head span:last-child { color: var(--text); font-weight: 600; }
+.stat-bar-track { background: var(--bg3); border-radius: 4px; height: 6px; overflow: hidden; }
+.stat-bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s ease; }
+.services-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+.service-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; font-size: 11px; border-bottom: 1px solid var(--border); }
+.service-row:last-child { border-bottom: none; }
+.service-name { color: var(--muted); }
+.svc-badge { font-size: 9px; font-weight: 600; padding: 3px 10px; border-radius: 4px; }
+.svc-ok { background: rgba(46,213,115,0.15); color: var(--ok); }
+.svc-err { background: rgba(255,71,87,0.15); color: var(--danger); }
+.load-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+.load-vals { display: flex; gap: 20px; margin-top: 8px; }
+.load-val { text-align: center; }
+.load-val .value { font-size: 16px; font-weight: 700; color: var(--accent); }
+.load-val .label { font-size: 9px; color: var(--muted); margin-top: 2px; }
+.alerts-wrap { display: flex; flex-direction: column; gap: 8px; }
+.alert-item { border-radius: 8px; padding: 10px 12px; font-size: 11px; display: flex; gap: 10px; border-left: 3px solid; }
+.alert-critical { background: rgba(255,71,87,0.1); border-color: var(--danger); }
+.alert-warning { background: rgba(255,165,2,0.1); border-color: var(--warning); }
+.remote-hosts-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+.remote-host { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.remote-host:last-child { border-bottom: none; }
+.remote-host.online .remote-status { color: var(--ok); }
+.remote-host.offline .remote-status { color: var(--danger); }
+.remote-name { font-weight: 600; color: var(--accent); font-size: 12px; }
+.remote-addr { font-size: 9px; color: var(--muted); margin-top: 2px; }
+.remote-status { font-size: 11px; }
+
+.remote-disks-section {
+    background: var(--bg3);
+    border-radius: 16px;
+    padding: 12px;
+    margin: 0 -4px;
+}
+.remote-disks-container {
+    max-height: 300px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 4px;
+}
+.remote-disks-container::-webkit-scrollbar { width: 6px; }
+.remote-disks-container::-webkit-scrollbar-track { background: var(--bg2); border-radius: 3px; }
+.remote-disks-container::-webkit-scrollbar-thumb { background: var(--accent); border-radius: 3px; }
+.remote-disk-card {
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 10px;
+    border-left: 3px solid;
+}
+.remote-disk-name {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--accent);
+    word-break: break-all;
+}
+.remote-disk-stats-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    margin: 6px 0;
+}
+.remote-disk-bar-container {
+    background: var(--bg);
+    border-radius: 4px;
+    height: 6px;
+    margin: 6px 0;
+    overflow: hidden;
+}
+.remote-disk-bar {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.3s ease;
+}
+
+/* Chat */
+#chat-area { grid-area: chat; display: flex; flex-direction: column; overflow: hidden; }
+#messages { flex: 1; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 16px; }
+#messages::-webkit-scrollbar { width: 4px; }
+.msg { max-width: 88%; animation: fadeUp 0.2s ease; }
+@keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+.msg-user { align-self: flex-end; }
+.msg-user .bubble { background: var(--accent2); color: #fff; padding: 10px 14px; border-radius: 14px 14px 2px 14px; font-size: 13px; line-height: 1.5; }
+.msg-bot { align-self: flex-start; max-width: 96%; }
+.msg-bot .bubble { background: var(--panel); border: 1px solid var(--border); padding: 14px 16px; border-radius: 2px 14px 14px 14px; font-size: 13px; line-height: 1.6; }
+.msg-meta { font-size: 10px; color: var(--muted); margin-top: 4px; padding: 0 4px; }
+.bubble h2 { font-family: var(--sans); font-size: 14px; font-weight: 600; color: var(--accent); margin: 10px 0 6px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.bubble h3 { font-family: var(--sans); font-size: 13px; font-weight: 600; color: #a0a0c0; margin: 8px 0 4px; }
+.bubble p { margin: 4px 0; line-height: 1.5; }
+.bubble ul, .bubble .info-list { padding-left: 18px; margin: 6px 0; list-style-type: none; }
+.bubble li { margin: 3px 0; color: #c0c0d8; position: relative; }
+.bubble li::before { content: "▹"; color: var(--accent); position: absolute; left: -14px; }
+.bubble .exec-btn {
+    margin-left: 10px; background: rgba(0,212,170,0.12); border: 1px solid rgba(0,212,170,0.3);
+    border-radius: 4px; padding: 2px 6px; font-size: 9px; color: var(--accent);
+    cursor: pointer; transition: all 0.2s; vertical-align: middle;
+}
+.bubble .exec-btn:hover { background: rgba(0,212,170,0.25); }
+.bubble .exec-btn:disabled { opacity: 0.4; cursor: default; }
+.bubble .command-block { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; margin: 10px 0; overflow: hidden; }
+.bubble .command-header { background: var(--bg3); padding: 7px 12px; font-size: 11px; color: var(--accent); border-bottom: 1px solid var(--border); }
+.bubble .result-content { padding: 10px 12px; font-size: 11px; font-family: var(--mono); }
+.bubble table { width: 100%; border-collapse: collapse; font-size: 11px; margin: 6px 0; }
+.bubble th { background: var(--bg3); color: var(--muted); padding: 5px 8px; text-align: left; font-weight: 600; }
+.bubble td { padding: 4px 8px; border-bottom: 1px solid var(--border); color: #c8c8e0; }
+.bubble .ok { color: var(--ok); font-weight: 600; }
+.bubble .warning { color: var(--warning); font-weight: 600; }
+.bubble .critical { color: var(--danger); font-weight: 600; }
+.typing { display: flex; gap: 4px; align-items: center; padding: 14px 16px; }
+.typing-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes blink { 0%,100% { opacity: 0.3; } 50% { opacity: 1; } }
+#input-area { border-top: 1px solid var(--border); background: var(--bg2); padding: 14px 20px; display: flex; gap: 10px; align-items: flex-end; }
+#input { flex: 1; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; color: var(--text); font-family: var(--mono); font-size: 13px; resize: none; min-height: 42px; max-height: 120px; outline: none; }
+#input:focus { border-color: var(--accent2); }
+#send { background: var(--accent); border: none; border-radius: 8px; width: 42px; height: 42px; cursor: pointer; color: var(--bg); font-size: 18px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+#send:disabled { opacity: 0.3; cursor: default; }
+.quick-actions { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 20px 10px; }
+.qa-btn { background: var(--bg3); border: 1px solid var(--border); border-radius: 20px; padding: 5px 12px; font-size: 11px; color: var(--muted); cursor: pointer; font-family: var(--mono); transition: all 0.2s; }
+.qa-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(0,212,170,0.1); }
+
+/* Memory panel - NOUVEAU */
+#memory-panel {
+    grid-area: memory;
+    background: var(--bg2);
+    border-left: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 16px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+#memory-panel::-webkit-scrollbar { width: 4px; }
+.mem-title { font-family: var(--sans); font-size: 10px; font-weight: 600; letter-spacing: 0.2em; color: var(--accent); text-transform: uppercase; padding: 4px 4px 8px; border-bottom: 1px solid var(--border); }
+.mem-subtitle {
+    font-size: 10px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin: 4px 0 6px;
+}
+
+.processes-panel, .sessions-panel, .ports-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 10px;
+    font-size: 10px;
+    max-height: 150px;
+    overflow-y: auto;
+}
+.process-item, .session-item, .port-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+}
+.process-item:last-child, .session-item:last-child, .port-item:last-child {
+    border-bottom: none;
+}
+.process-cpu {
+    color: var(--warning);
+    font-weight: 600;
+}
+.process-name {
+    color: var(--accent);
+}
+.session-user {
+    color: var(--accent);
+    font-weight: 600;
+}
+.session-ip {
+    color: var(--muted);
+    font-size: 8px;
+}
+.port-number {
+    color: var(--accent);
+    font-weight: 600;
+}
+.port-service {
+    color: var(--muted);
+}
+.mem-stat-row { display: flex; justify-content: space-between; font-size: 11px; padding: 4px 0; border-bottom: 1px solid var(--border); }
+.mem-stat-row span:last-child { color: var(--text); font-weight: 600; }
+.mem-empty { text-align: center; color: var(--muted); font-size: 11px; padding: 16px 8px; }
+.toast { position: fixed; bottom: 20px; right: 20px; background: var(--panel); border: 1px solid var(--border2); border-radius: 8px; padding: 12px 20px; font-size: 12px; z-index: 1000; animation: fadeUp 0.3s ease; }
+.toast-ok { border-color: var(--ok); color: var(--ok); }
+.toast-warning { border-color: var(--warning); color: var(--warning); }
+@media (max-width: 900px) {
+    body { grid-template-columns: 1fr; grid-template-rows: var(--header-h) 1fr auto; grid-template-areas: "header" "chat" "sidebar"; }
+    #memory-panel { display: none; }
+    #sidebar { max-height: 300px; }
+}
+</style>
+</head>
+<body>
+
+<div id="login-overlay" class="login-overlay" style="display: none;">
+    <div class="login-card">
+        <h2>🔐 CASSANDRA v7.1</h2>
+        <input type="password" id="login-password" placeholder="Mot de passe" autofocus>
+        <button onclick="doLogin()">Se connecter</button>
+        <div id="login-error" class="error"></div>
+    </div>
+</div>
+
+<header>
+    <div>
+        <div class="logo">CASSANDRA</div>
+        <div class="logo-sub">Infrastructure AI v7.1</div>
+        <span class="logo-badge">TEMPS RÉEL</span>
+    </div>
+    <div class="header-status">
+        <div class="status-dot" id="dot"></div>
+        <span id="status-txt">En ligne</span>
+    </div>
+    <div class="header-time" id="clock"></div>
+    <button class="logout-btn" onclick="doLogout()" id="logout-btn" style="display: none;">Déconnexion</button>
+</header>
+
+<aside id="sidebar">
+    <div class="sidebar-title">📊 MÉTRIQUES SYSTÈME</div>
+    <div class="gauge-row">
+        <div class="gauge-card">
+            <div class="gauge-label">CPU</div>
+            <svg width="56" height="56" viewBox="0 0 56 56">
+                <circle cx="28" cy="28" r="22" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="5"/>
+                <circle id="g-cpu" cx="28" cy="28" r="22" fill="none" stroke="#00d4aa" stroke-width="5" stroke-dasharray="138.2" stroke-dashoffset="138.2" stroke-linecap="round" transform="rotate(-90 28 28)"/>
+            </svg>
+            <div class="gauge-val" id="v-cpu">–</div>
+        </div>
+        <div class="gauge-card">
+            <div class="gauge-label">RAM</div>
+            <svg width="56" height="56" viewBox="0 0 56 56">
+                <circle cx="28" cy="28" r="22" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="5"/>
+                <circle id="g-ram" cx="28" cy="28" r="22" fill="none" stroke="#7c5cfc" stroke-width="5" stroke-dasharray="138.2" stroke-dashoffset="138.2" stroke-linecap="round" transform="rotate(-90 28 28)"/>
+            </svg>
+            <div class="gauge-val" id="v-ram">–</div>
+        </div>
+        <div class="gauge-card">
+            <div class="gauge-label">DISQUE</div>
+            <svg width="56" height="56" viewBox="0 0 56 56">
+                <circle cx="28" cy="28" r="22" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="5"/>
+                <circle id="g-disk" cx="28" cy="28" r="22" fill="none" stroke="#00d4aa" stroke-width="5" stroke-dasharray="138.2" stroke-dashoffset="138.2" stroke-linecap="round" transform="rotate(-90 28 28)"/>
+            </svg>
+            <div class="gauge-val" id="v-disk">–</div>
+        </div>
+    </div>
+
+    <div class="sparkline-wrap">
+        <div class="sparkline-head"><span>📈 CPU</span><span id="spark-cpu-val">–</span></div>
+        <canvas class="sparkline" id="spark-cpu" width="250" height="40"></canvas>
+    </div>
+    <div class="sparkline-wrap">
+        <div class="sparkline-head"><span>📉 RAM</span><span id="spark-ram-val">–</span></div>
+        <canvas class="sparkline" id="spark-ram" width="250" height="40"></canvas>
+    </div>
+
+    <div class="stat-bar-wrap">
+        <div class="stat-bar-head"><span>🖥️ RAM</span><span id="ram-detail">– / – Go</span></div>
+        <div class="stat-bar-track"><div class="stat-bar-fill" id="bar-ram" style="width:0%"></div></div>
+    </div>
+    <div class="stat-bar-wrap">
+        <div class="stat-bar-head"><span>💿 DISQUE /</span><span id="disk-detail">– / –</span></div>
+        <div class="stat-bar-track"><div class="stat-bar-fill" id="bar-disk" style="width:0%"></div></div>
+    </div>
+
+    <div class="load-card">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;">⚡ LOAD</div>
+        <div class="load-vals">
+            <div class="load-val"><div class="value" id="load1">–</div><div class="label">1m</div></div>
+            <div class="load-val"><div class="value" id="load5">–</div><div class="label">5m</div></div>
+            <div class="load-val"><div class="value" id="load15">–</div><div class="label">15m</div></div>
+        </div>
+    </div>
+
+    <div class="services-wrap">
+        <div class="sidebar-title" style="border:none;margin-bottom:8px;">🔧 SERVICES</div>
+        <div id="services-list"></div>
+    </div>
+
+    <div class="sidebar-title">📡 REMOTES <span class="refresh-icon" onclick="loadRemoteHosts()">↻</span></div>
+    <div class="remote-hosts-wrap" id="remote-hosts-list"><div class="mem-empty">Chargement...</div></div>
+
+    <div class="remote-disks-section">
+        <div class="sidebar-title" style="margin-bottom: 8px;">
+            💾 RCLONE
+            <span class="refresh-icon" onclick="fetchMetrics()" style="font-size: 11px;">↻</span>
+            <span style="font-size: 9px; background: var(--accent2); padding: 2px 8px; border-radius: 20px;" id="remote-disk-count">0</span>
+        </div>
+        <div class="remote-disks-container" id="remote-disks-list">
+            <div class="mem-empty">Chargement...</div>
+        </div>
+    </div>
+
+    <div class="sidebar-title">⚠️ ALERTES</div>
+    <div class="alerts-wrap" id="alerts-wrap"><div class="mem-empty">✅ Aucune</div></div>
+</aside>
+
+<main id="chat-area">
+    <div id="messages"></div>
+    <div class="quick-actions">
+        <button class="qa-btn" onclick="qa('État général ?')">🏠 État</button>
+        <button class="qa-btn" onclick="qa('Disque ?')">💿 Disque</button>
+        <button class="qa-btn" onclick="qa('RAM ?')">🖥️ RAM</button>
+        <button class="qa-btn" onclick="qa('Services ?')">🔧 Services</button>
+        <button class="qa-btn" onclick="qa('Logs erreurs ?')">📋 Erreurs</button>
+        <button class="qa-btn" onclick="qa('Remotes Rclone ?')">☁️ Rclone</button>
+    </div>
+    <div id="input-area">
+        <textarea id="input" placeholder="Demande à CASSANDRA… (Entrée)" rows="1"></textarea>
+        <button id="send" onclick="sendMessage()">➤</button>
+    </div>
+</main>
+
+<aside id="memory-panel">
+    <div class="mem-title">🧠 INFRA</div>
+    
+    <div class="mem-subtitle">🔥 PROCESSUS CPU</div>
+    <div id="processes-list" class="processes-panel"><div class="mem-empty">Chargement...</div></div>
+
+    <div class="mem-subtitle">👥 SESSIONS</div>
+    <div id="sessions-list" class="sessions-panel"><div class="mem-empty">Chargement...</div></div>
+
+    <div class="mem-subtitle">🔌 PORTS</div>
+    <div id="ports-list" class="ports-panel"><div class="mem-empty">Chargement...</div></div>
+
+    <div style="margin-top: 8px;">
+        <div class="mem-stat-row"><span>💬 Messages</span><span id="msg-count">0</span></div>
+        <div class="mem-stat-row"><span>⚡ Commandes</span><span id="cmd-count">0</span></div>
+        <div class="mem-stat-row" style="border:none"><span>⏱️ Durée</span><span id="session-time">0 min</span></div>
+    </div>
+
+    <button id="save-memory-btn" onclick="saveSessionMemory()" style="background:rgba(0,212,170,0.1);border:1px solid rgba(0,212,170,0.2);border-radius:10px;padding:10px;font-size:11px;color:var(--accent);cursor:pointer;width:100%;margin-top:8px;">
+        🧠 Sauvegarder
+    </button>
+</aside>
+
+<script>
+// ════════════════════════════════════════════════════════════════
+// ÉTAT GLOBAL
+// ════════════════════════════════════════════════════════════════
+let csrfToken = '';
+let msgCount = 0;
+let cmdCount = 0;
+let sessionStart = Date.now();
+const CIRC = 138.2;
+let allIncidents = [];
+let useStreaming = false;  // ← Désactivé pour éviter erreur SSE
+let sseRetryCount = 0;
+const MAX_SSE_RETRY = 2;
+
+// ════════════════════════════════════════════════════════════════
+// AUTH
+// ════════════════════════════════════════════════════════════════
+async function checkAuth() {
+    try {
+        const r = await fetch('chat.php?check-auth');
+        const d = await r.json();
+        if (d.auth_required && !d.authenticated) {
+            document.getElementById('login-overlay').style.display = 'flex';
+            document.getElementById('logout-btn').style.display = 'none';
+            return false;
+        } else {
+            document.getElementById('login-overlay').style.display = 'none';
+            document.getElementById('logout-btn').style.display = 'block';
+            return true;
+        }
+    } catch(e) { return false; }
+}
+
+async function doLogin() {
+    const pwd = document.getElementById('login-password').value;
+    const errDiv = document.getElementById('login-error');
+    if (!pwd) { errDiv.textContent = 'Entrez le mot de passe'; return; }
+    try {
+        const form = new URLSearchParams();
+        form.append('password', pwd);
+        const r = await fetch('chat.php?login', { method: 'POST', body: form });
+        const d = await r.json();
+        if (d.success) {
+            csrfToken = d.csrf;
+            document.getElementById('login-overlay').style.display = 'none';
+            document.getElementById('logout-btn').style.display = 'block';
+            init();
+        } else {
+            errDiv.textContent = d.error || 'Mot de passe incorrect';
+        }
+    } catch(e) { errDiv.textContent = 'Erreur réseau'; }
+}
+
+function doLogout() { window.location.href = 'chat.php?logout'; }
+
+async function loadCsrf() {
+    try {
+        const r = await fetch('chat.php?csrf');
+        const d = await r.json();
+        csrfToken = d.token;
+    } catch(e) { console.error('CSRF error', e); }
+}
+
+// ════════════════════════════════════════════════════════════════
+// HORLOGE
+// ════════════════════════════════════════════════════════════════
+function updateClock() {
+    document.getElementById('clock').textContent = new Date().toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+setInterval(updateClock, 1000);
+updateClock();
+setInterval(() => {
+    document.getElementById('session-time').textContent = Math.floor((Date.now() - sessionStart) / 60000) + ' min';
+}, 30000);
+
+function showToast(msg, type = '') {
+    const t = document.createElement('div');
+    t.className = `toast ${type ? 'toast-' + type : ''}`;
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), 3000);
+}
+
+// ════════════════════════════════════════════════════════════════
+// SPARKLINES
+// ════════════════════════════════════════════════════════════════
+function drawSparkline(canvasId, data, color, max = 100) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas || !data || data.length < 2) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+    const pts = data.map((v, i) => ({ x: (i / (data.length - 1)) * W, y: H - (Math.min(v, max) / max) * H }));
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, H);
+    pts.forEach(p => ctx.lineTo(p.x, p.y));
+    ctx.lineTo(pts[pts.length-1].x, H);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, color + '55');
+    grad.addColorStop(1, color + '00');
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.beginPath();
+    pts.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(pts[pts.length-1].x, pts[pts.length-1].y, 3, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+}
+
+// ════════════════════════════════════════════════════════════════
+// MÉTRIQUES
+// ════════════════════════════════════════════════════════════════
+function gaugeOffset(pct) { return CIRC - (pct / 100) * CIRC; }
+function gaugeColor(pct) { if (pct > 85) return 'var(--danger)'; if (pct > 70) return 'var(--warning)'; return 'var(--ok)'; }
+function updateGauge(id, valId, pct) {
+    const el = document.getElementById(id);
+    const vl = document.getElementById(valId);
+    if (el && vl) {
+        el.style.strokeDashoffset = gaugeOffset(pct);
+        el.style.stroke = gaugeColor(pct);
+        vl.textContent = Math.round(pct) + '%';
+        vl.style.color = gaugeColor(pct);
+    }
+}
+function updateBar(barId, pct) {
+    const el = document.getElementById(barId);
+    if (el) { el.style.width = pct + '%'; el.style.background = gaugeColor(pct); }
+}
+
+const sparkHistory = { cpu: [], ram: [] };
+
+function pushSparkValue(key, val) {
+    sparkHistory[key].push(val);
+    if (sparkHistory[key].length > 12) sparkHistory[key].shift();
+}
+
+function timeStr() {
+    return new Date().toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit'});
+}
+
+async function fetchMetrics() {
+    try {
+        const r = await fetch('chat.php?metrics');
+        const d = await r.json();
+        
+        if (d.error) return;
+        
+        if (d.cpu !== undefined) updateGauge('g-cpu', 'v-cpu', d.cpu);
+        if (d.ram !== undefined) updateGauge('g-ram', 'v-ram', d.ram);
+        if (d.disk !== undefined) updateGauge('g-disk', 'v-disk', d.disk);
+        if (d.ram !== undefined) updateBar('bar-ram', d.ram);
+        if (d.disk !== undefined) updateBar('bar-disk', d.disk);
+        
+        if (d.ram_used_gb) document.getElementById('ram-detail').textContent = `${d.ram_used_gb} / ${d.ram_total_gb} Go`;
+        if (d.disk_used) document.getElementById('disk-detail').textContent = `${d.disk_used} / ${d.disk_total}`;
+        if (d.load) {
+            const parts = d.load.split(' ');
+            document.getElementById('load1').textContent = parts[0] || '–';
+            document.getElementById('load5').textContent = parts[1] || '–';
+            document.getElementById('load15').textContent = parts[2] || '–';
+        }
+        
+        if (d.services) {
+            const names = {'nginx':'nginx','php8.1-fpm':'php-fpm','mysql':'mysql','docker':'docker'};
+            let html = '';
+            for (const [svc, ok] of Object.entries(d.services)) {
+                html += `<div class="service-row"><span class="service-name">${names[svc] || svc}</span><span class="svc-badge ${ok ? 'svc-ok' : 'svc-err'}">${ok ? 'ACTIF' : 'ARRÊTÉ'}</span></div>`;
+            }
+            document.getElementById('services-list').innerHTML = html;
+        }
+        
+        const aw = document.getElementById('alerts-wrap');
+        if (d.alerts && d.alerts.length) {
+            aw.innerHTML = d.alerts.map(a => `<div class="alert-item alert-${a.level}"><span>${a.level === 'critical' ? '🔴' : '🟡'}</span><span>${escapeHtml(a.msg)}</span></div>`).join('');
+        } else {
+            aw.innerHTML = '<div class="mem-empty">✅ Aucune</div>';
+        }
+        
+        // Rclone disks
+        if (d.disks && Object.keys(d.disks).length) {
+            let remoteHtml = '';
+            let count = 0;
+            for (const [mount, info] of Object.entries(d.disks)) {
+                if (info.type === 'rclone' || mount.startsWith('rclone:')) {
+                    count++;
+                    remoteHtml += `<div class="remote-disk-card"><div class="remote-disk-name">☁️ ${escapeHtml(mount.replace('rclone:', ''))}</div></div>`;
+                }
+            }
+            document.getElementById('remote-disk-count').textContent = count;
+            document.getElementById('remote-disks-list').innerHTML = remoteHtml || '<div class="mem-empty">Aucun</div>';
+        }
+        
+        if (d.cpu !== undefined && d.ram !== undefined) {
+            pushSparkValue('cpu', d.cpu);
+            pushSparkValue('ram', d.ram);
+            if (sparkHistory.cpu.length >= 2) {
+                drawSparkline('spark-cpu', sparkHistory.cpu, '#00d4aa');
+                drawSparkline('spark-ram', sparkHistory.ram, '#7c5cfc');
+            }
+            document.getElementById('spark-cpu-val').textContent = d.cpu + '%';
+            document.getElementById('spark-ram-val').textContent = d.ram + '%';
+        }
+        
+    } catch(e) { console.error('Metrics error:', e); }
+}
+
+// ════════════════════════════════════════════════════════════════
+// PROCESSUS CPU (nouveau panneau)
+// ════════════════════════════════════════════════════════════════
+async function loadTopProcesses() {
+    try {
+        const r = await fetch('chat.php?metrics');
+        const d = await r.json();
+        const container = document.getElementById('processes-list');
+        
+        if (d.top_processes && d.top_processes.length) {
+            let html = '';
+            for (const proc of d.top_processes.slice(0, 5)) {
+                const parts = proc.trim().split(/\s+/);
+                if (parts.length >= 11) {
+                    const cpu = parts[2];
+                    const mem = parts[3];
+                    const name = parts[10] || 'unknown';
+                    const shortName = name.length > 20 ? name.substring(0, 17) + '...' : name;
+                    html += `<div class="process-item"><span class="process-name">${escapeHtml(shortName)}</span><span class="process-cpu">${cpu}%</span></div>`;
+                }
+            }
+            container.innerHTML = html || '<div class="mem-empty">Aucun</div>';
+        } else {
+            container.innerHTML = '<div class="mem-empty">Aucun</div>';
+        }
+    } catch(e) { 
+        document.getElementById('processes-list').innerHTML = '<div class="mem-empty">Erreur</div>';
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// SESSIONS ACTIVES
+// ════════════════════════════════════════════════════════════════
+async function loadActiveSessions() {
+    try {
+        const r = await fetch('chat.php?active-sessions');
+        let sessions = [];
+        if (r.ok) {
+            sessions = await r.json();
+        }
+        const container = document.getElementById('sessions-list');
+        if (sessions.length) {
+            let html = '';
+            for (const s of sessions) {
+                html += `<div class="session-item"><div><span class="session-user">${escapeHtml(s.user)}</span><span class="session-ip"> (${escapeHtml(s.ip || 'local')})</span></div><span>depuis ${escapeHtml(s.login || '?')}</span></div>`;
+            }
+            container.innerHTML = html;
+        } else {
+            container.innerHTML = '<div class="mem-empty">Aucune session</div>';
+        }
+    } catch(e) { 
+        document.getElementById('sessions-list').innerHTML = '<div class="mem-empty">Erreur</div>';
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// PORTS OUVERTS
+// ════════════════════════════════════════════════════════════════
+async function loadOpenPorts() {
+    try {
+        const r = await fetch('chat.php?ports');
+        let ports = [];
+        if (r.ok) {
+            ports = await r.json();
+        }
+        const container = document.getElementById('ports-list');
+        if (ports.length) {
+            const important = ['22', '80', '443', '3306', '5432', '6379', '8080', '8443'];
+            const services = {'22':'SSH','80':'HTTP','443':'HTTPS','3306':'MySQL','5432':'PG','6379':'Redis','8080':'HTTP-alt','8443':'HTTPS-alt'};
+            let html = '';
+            for (const port of important) {
+                const found = ports.find(p => p.port === port);
+                if (found) {
+                    html += `<div class="port-item"><span class="port-number">${port}</span><span class="port-service">${services[port] || '?'}</span><span>🟢</span></div>`;
+                }
+            }
+            container.innerHTML = html || '<div class="mem-empty">Aucun port</div>';
+        } else {
+            container.innerHTML = '<div class="mem-empty">Aucun port</div>';
+        }
+    } catch(e) { 
+        document.getElementById('ports-list').innerHTML = '<div class="mem-empty">Erreur</div>';
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// REMOTE HOSTS
+// ════════════════════════════════════════════════════════════════
+async function loadRemoteHosts() {
+    try {
+        const r = await fetch('chat.php?remote-hosts');
+        const hosts = await r.json();
+        const container = document.getElementById('remote-hosts-list');
+        if (!hosts.length || hosts.error) {
+            container.innerHTML = '<div class="mem-empty">📭 Aucun</div>';
+            return;
+        }
+        container.innerHTML = hosts.map(h => `
+            <div class="remote-host ${h.reachable ? 'online' : 'offline'}">
+                <div><div class="remote-name">${escapeHtml(h.name)}</div><div class="remote-addr">${escapeHtml(h.host)}:${h.port}</div></div>
+                <div class="remote-status">${h.reachable ? '🟢' : '🔴'}</div>
+            </div>
+        `).join('');
+    } catch(e) { console.warn(e); }
+}
+
+// ════════════════════════════════════════════════════════════════
+// INCIDENTS
+// ════════════════════════════════════════════════════════════════
+async function loadIncidents() {
+    try {
+        const r = await fetch('chat.php?incidents');
+        allIncidents = await r.json();
+        // Pas d'affichage dans la nouvelle UI, juste pour mémoire
+    } catch(e) { console.warn(e); }
+}
+
+async function loadPatterns() {
+    try {
+        const r = await fetch('chat.php?patterns');
+        const data = await r.json();
+        // Pas d'affichage dans la nouvelle UI
+    } catch(e) { console.warn(e); }
+}
+
+async function loadLastAudit() {
+    try {
+        const r = await fetch('chat.php?last-audit');
+        const d = await r.json();
+        // Pas d'affichage dans la nouvelle UI
+    } catch(e) { console.warn(e); }
+}
+
+async function saveSessionMemory() {
+    const btn = document.getElementById('save-memory-btn');
+    btn.disabled = true;
+    btn.textContent = '🧠 Sauvegarde...';
+    try {
+        const form = new URLSearchParams();
+        form.append('csrf', csrfToken);
+        const r = await fetch('chat.php?summarize', { method: 'POST', body: form });
+        const d = await r.json();
+        if (d.success) { showToast('Mémoire sauvegardée', 'ok'); btn.textContent = '✓'; setTimeout(() => { btn.textContent = '🧠 Sauvegarder'; btn.disabled = false; }, 2000); }
+        else { showToast(d.error || 'Erreur', 'warning'); btn.textContent = '🧠 Sauvegarder'; btn.disabled = false; }
+    } catch(e) { btn.textContent = '🧠 Sauvegarder'; btn.disabled = false; }
+}
+
+window.addEventListener('beforeunload', () => {
+    if (msgCount >= 2 && csrfToken) {
+        const form = new FormData();
+        form.append('csrf', csrfToken);
+        navigator.sendBeacon('chat.php?summarize', form);
+    }
+});
+
+// ════════════════════════════════════════════════════════════════
+// CHAT
+// ════════════════════════════════════════════════════════════════
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);
+}
+
+function sanitizeResponse(html) {
+    if (typeof DOMPurify !== 'undefined') {
+        return DOMPurify.sanitize(html, {
+            ALLOWED_TAGS: ['h2','h3','p','ul','li','pre','div','span','table','thead','tbody','tr','th','td','strong','em','br','hr'],
+            ALLOWED_ATTR: ['class', 'style'],
+            FORBID_ATTR: ['onclick','onerror','onload'],
+        });
+    }
+    return html.replace(/<script[^>]*>.*?<\/script>/gi, '');
+}
+
+async function execCommand(btn) {
+    const block = btn.closest('.command-block');
+    const cmdB64 = block.dataset.cmd;
+    const result = block.querySelector('.result-content');
+    if (!cmdB64 || !result) return;
+
+    btn.disabled = true;
+    btn.textContent = '⏳';
+    result.innerHTML = '<span style="color:var(--muted);">Exécution...</span>';
+
+    try {
+        const form = new URLSearchParams();
+        form.append('csrf', csrfToken);
+        form.append('cmd', cmdB64);
+        const r = await fetch('chat.php?exec-cmd', { method: 'POST', body: form });
+        const d = await r.json();
+
+        if (d.success) {
+            result.innerHTML = d.formatted || `<pre>${escapeHtml(d.output || '')}</pre>`;
+            btn.textContent = '✓';
+            btn.style.color = 'var(--ok)';
+            cmdCount++;
+            document.getElementById('cmd-count').textContent = cmdCount;
+        } else {
+            result.innerHTML = `<span style="color:var(--danger);">❌ ${escapeHtml(d.error || 'Erreur')}</span>`;
+            btn.textContent = '✗';
+            btn.style.color = 'var(--danger)';
+            btn.disabled = false;
+        }
+    } catch(e) {
+        result.innerHTML = `<span style="color:var(--danger);">❌ Erreur réseau</span>`;
+        btn.textContent = '▶';
+        btn.disabled = false;
+    }
+}
+
+function addMessage(content, sender) {
+    const msgs = document.getElementById('messages');
+    const div = document.createElement('div');
+    div.className = `msg msg-${sender}`;
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    if (sender === 'bot') {
+        bubble.innerHTML = sanitizeResponse(content);
+        const cmds = bubble.querySelectorAll('.command-block').length;
+        if (cmds > 0) { cmdCount += cmds; document.getElementById('cmd-count').textContent = cmdCount; }
+    } else {
+        bubble.textContent = content;
+    }
+    const meta = document.createElement('div');
+    meta.className = 'msg-meta';
+    meta.textContent = sender === 'bot' ? `CASSANDRA · ${timeStr()}` : `Vous · ${timeStr()}`;
+    div.appendChild(bubble);
+    div.appendChild(meta);
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+    if (sender === 'user') {
+        msgCount++;
+        document.getElementById('msg-count').textContent = msgCount;
+    }
+    return bubble;
+}
+
+function showTyping() {
+    const msgs = document.getElementById('messages');
+    const div = document.createElement('div');
+    div.className = 'msg msg-bot';
+    div.id = 'typing';
+    div.innerHTML = `<div class="bubble"><div class="typing"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div></div>`;
+    msgs.appendChild(div);
+    msgs.scrollTop = msgs.scrollHeight;
+}
+
+function removeTyping() {
+    const t = document.getElementById('typing');
+    if (t) t.remove();
+}
+
+async function sendMessageClassic(message) {
+    const form = new URLSearchParams();
+    form.append('message', message);
+    form.append('csrf', csrfToken);
+    const r = await fetch('chat.php', { method: 'POST', body: form });
+    const d = await r.json();
+    if (d.success) {
+        if (d.csrf) csrfToken = d.csrf;
+        addMessage(d.response, 'bot');
+        return d.response;
+    } else {
+        throw new Error(d.error);
+    }
+}
+
+async function sendMessage() {
+    const input = document.getElementById('input');
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    input.style.height = 'auto';
+    const sendBtn = document.getElementById('send');
+    sendBtn.disabled = true;
+    document.getElementById('dot').style.background = 'var(--warning)';
+    document.getElementById('status-txt').textContent = 'Traitement…';
+    addMessage(text, 'user');
+    showTyping();
+    
+    try {
+        await sendMessageClassic(text);
+        removeTyping();
+        loadRemoteHosts();
+        loadTopProcesses();
+        loadActiveSessions();
+        loadOpenPorts();
+    } catch(e) {
+        removeTyping();
+        addMessage(`<span style="color:var(--danger)">❌ Erreur : ${escapeHtml(e)}</span>`, 'bot');
+    }
+    
+    sendBtn.disabled = false;
+    document.getElementById('dot').style.background = 'var(--ok)';
+    document.getElementById('status-txt').textContent = 'En ligne';
+}
+
+function qa(text) {
+    document.getElementById('input').value = text;
+    sendMessage();
+}
+
+document.getElementById('input').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+document.getElementById('input').addEventListener('input', function() {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+
+// ════════════════════════════════════════════════════════════════
+// INIT
+// ════════════════════════════════════════════════════════════════
+async function init() {
+    await loadCsrf();
+    const authenticated = await checkAuth();
+    if (!authenticated) return;
+    
+    fetchMetrics();
+    loadRemoteHosts();
+    loadTopProcesses();
+    loadActiveSessions();
+    loadOpenPorts();
+    
+    setInterval(fetchMetrics, 5000);
+    setInterval(loadRemoteHosts, 60000);
+    setInterval(loadTopProcesses, 10000);
+    setInterval(loadActiveSessions, 30000);
+    setInterval(loadOpenPorts, 60000);
+    
+    // Pas de message de bienvenue
+}
+
+init();
+</script>
+</body>
+</html>

@@ -1,0 +1,1892 @@
+#!/usr/bin/env python3
+"""
+CASSANDRA v9.1 - Agent unifié
+Sert une interface futuriste, lit la DB collector, dialogue avec DeepSeek
+"""
+
+import os          # FIX [BUG-1] : manquait → os.getenv("DEEPSEEK_API_KEY") retournait None → 401 DeepSeek
+import asyncio
+import json
+import sqlite3
+import subprocess
+import hashlib
+import secrets
+from datetime import datetime
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+import urllib.parse
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+DB_PATH = "/var/lib/cassandra/cassandra.db"
+MEMORY_DB_PATH = "/var/lib/cassandra/cassandra_memory.db"
+PORT = 9000
+
+# FIX [BUG-1] : charger le .env manuellement si python-dotenv absent
+# (os.getenv ne lit pas .env automatiquement — c'est pourquoi la clé était None)
+def _load_dotenv():
+    for candidate in ["/root/.env", "/etc/cassandra/.env", "/var/lib/cassandra/.env", ".env"]:
+        try:
+            p = Path(candidate)
+            if p.exists():
+                for line in p.read_text().splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, _, v = line.partition("=")
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+                break
+        except Exception:
+            pass
+
+_load_dotenv()
+
+# ============================================================
+# 2. BASE DE DONNÉES MÉMOIRE
+# ============================================================
+def init_memory_db():
+    """Crée les tables pour la mémoire conversationnelle"""
+    # FIX [BUG-2] : try/finally garantit la fermeture même sur exception
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                msg_range TEXT,
+                ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+# ============================================================
+# 3. LECTURE DB COLLECTOR
+# ============================================================
+def query_db(sql, params=[]):
+    """Interroge la base du collector"""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(sql, params)
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"[DB] Erreur: {e}")
+        return []
+
+def get_metrics():
+    """Métriques temps réel"""
+    rows = query_db("""
+        SELECT cpu_pct, ram_pct, disk_pct, swap_pct,
+               load_1m, load_5m, load_15m,
+               ram_total_gb, ram_used_gb,
+               disk_total_gb, disk_used_gb, disk_free_gb
+        FROM metrics_realtime ORDER BY id DESC LIMIT 1
+    """)
+    if rows:
+        r = rows[0]
+        return {
+            "cpu": r.get("cpu_pct", 0),
+            "ram": r.get("ram_pct", 0),
+            "disk": r.get("disk_pct", 0),
+            "swap": r.get("swap_pct", 0),
+            "load_1m": r.get("load_1m", 0),
+            "load_5m": r.get("load_5m", 0),
+            "load_15m": r.get("load_15m", 0),
+            "ram_total_gb": r.get("ram_total_gb", 0),
+            "ram_used_gb": r.get("ram_used_gb", 0),
+            "disk_total_gb": r.get("disk_total_gb", 0),
+            "disk_used_gb": r.get("disk_used_gb", 0),
+            "disk_free_gb": r.get("disk_free_gb", 0),
+        }
+    return {
+        "cpu": 0, "ram": 0, "disk": 0, "swap": 0,
+        "load_1m": 0, "load_5m": 0, "load_15m": 0,
+        "ram_total_gb": 0, "ram_used_gb": 0,
+        "disk_total_gb": 0, "disk_used_gb": 0, "disk_free_gb": 0
+    }
+
+def get_metrics_history(limit=60):
+    """Historique pour les graphiques"""
+    rows = query_db("""
+        SELECT cpu_pct, ram_pct, disk_pct, ts
+        FROM metrics_realtime
+        ORDER BY id DESC LIMIT ?
+    """, [limit])
+    return list(reversed(rows))  # Ordre chronologique
+
+def get_rclone_remotes():
+    """Liste des remotes Rclone"""
+    rows = query_db("SELECT name, type, used_gb FROM rclone_remotes")
+    return rows
+
+def get_ssl_certificates():
+    """Certificats SSL"""
+    rows = query_db("""
+        SELECT domain, days_left, status, expiry_date
+        FROM ssl_certificates
+        ORDER BY days_left ASC
+        LIMIT 20
+    """)
+    return rows
+
+def get_active_sessions():
+    """Sessions SSH actives"""
+    rows = query_db("""
+        SELECT user, ip, login_time
+        FROM ssh_sessions
+        ORDER BY id DESC
+        LIMIT 10
+    """)
+    return rows
+
+def get_open_ports():
+    """Ports ouverts"""
+    rows = query_db("""
+        SELECT port, protocol, process
+        FROM open_ports
+        ORDER BY port
+    """)
+    return rows
+
+def get_top_processes(limit=10):
+    """Top processus CPU"""
+    rows = query_db("""
+        SELECT top_processes
+        FROM metrics_realtime
+        ORDER BY id DESC LIMIT 1
+    """)
+    if rows and rows[0].get("top_processes"):
+        return json.loads(rows[0]["top_processes"])[:limit]
+    return []
+
+def get_health_score():
+    """Health score"""
+    rows = query_db("""
+        SELECT score, status, breakdown
+        FROM health_scores
+        ORDER BY id DESC LIMIT 1
+    """)
+    return rows[0] if rows else {"score": 0, "status": "unknown", "breakdown": {}}
+
+def get_fail2ban_banned():
+    """IPs bannies fail2ban"""
+    rows = query_db("SELECT jail, ip, banned_at FROM fail2ban_banned_ips LIMIT 20")
+    return rows
+
+def get_tailscale_peers():
+    """Peers Tailscale"""
+    rows = query_db("SELECT name, online, tailscale_ip FROM tailscale_peers")
+    return rows
+
+def get_oom_events():
+    """Événements OOM"""
+    rows = query_db("""
+        SELECT ts, killed_process, memory_used_mb
+        FROM oom_events
+        ORDER BY id DESC LIMIT 10
+    """)
+    return rows
+
+def get_failed_units():
+    """Unités systemd failed"""
+    rows = query_db("SELECT unit, active_state FROM failed_units")
+    return rows
+
+def get_web_sites():
+    """Sites web détectés"""
+    rows = query_db("SELECT domain, ssl_enabled, php_version FROM web_sites")
+    return rows
+
+def get_dashboard():
+    """Vue dashboard consolidée"""
+    return {
+        "sites": len(get_web_sites()),
+        "remotes": len(get_rclone_remotes()),
+        "ssl_expiring": len([c for c in get_ssl_certificates() if c.get("days_left", 999) <= 30]),
+        "fail2ban_banned": len(get_fail2ban_banned()),
+        "tailscale_peers": len([p for p in get_tailscale_peers() if p.get("online")]),
+        "oom_events_24h": len(get_oom_events()),
+        "failed_units": len(get_failed_units()),
+        "health_score": get_health_score().get("score", 0),
+    }
+
+# ============================================================
+# 4. MÉMOIRE CONVERSATIONNELLE
+# ============================================================
+def save_conversation(session_id, role, content):
+    """Sauvegarde un message dans la mémoire"""
+    # FIX [BUG-2] : try/finally sur toutes les connexions mémoire
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO conversations (session_id, role, content) VALUES (?,?,?)",
+            (session_id, role, content[:4000])
+        )
+        # Purge automatique : garder 200 messages max par session
+        conn.execute(
+            "DELETE FROM conversations WHERE session_id = ? AND id NOT IN "
+            "(SELECT id FROM conversations WHERE session_id = ? ORDER BY id DESC LIMIT 200)",
+            (session_id, session_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_conversation_history(session_id, limit=20):
+    """Récupère l'historique des messages"""
+    # FIX [BUG-3] : filtre rôles autorisés pour éviter injection prompt via DB
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT role, content FROM conversations "
+            "WHERE session_id = ? AND role IN ('user','assistant') "
+            "ORDER BY id DESC LIMIT ?",
+            (session_id, limit)
+        ).fetchall()
+    finally:
+        conn.close()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+def save_summary(session_id, summary, msg_range):
+    """Sauvegarde un résumé de conversation"""
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO conversation_summaries (session_id, summary, msg_range) VALUES (?,?,?)",
+            (session_id, summary, msg_range)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_summaries(session_id):
+    """Récupère les résumés précédents"""
+    conn = sqlite3.connect(MEMORY_DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT summary FROM conversation_summaries WHERE session_id = ? ORDER BY id DESC LIMIT 5",
+            (session_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    return [r[0] for r in rows]
+
+# ============================================================
+# 5. APPEL DEEPSEEK
+# ============================================================
+from openai import OpenAI
+
+# ============================================================
+# 5. APPEL DEEPSEEK
+# ============================================================
+from openai import OpenAI
+
+# FIX [BUG-1] : la clé est chargée via _load_dotenv() en haut du fichier
+# os.getenv retourne None si la variable n'est pas dans l'environnement ET que
+# le .env n'a pas été sourcé par le shell — _load_dotenv() pallie cela
+_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+if not _api_key:
+    print("[CASSANDRA] ⚠️  DEEPSEEK_API_KEY non définie — les appels échoueront avec 401", flush=True)
+
+client = OpenAI(api_key=_api_key or "missing", base_url="https://api.deepseek.com/v1")
+
+def call_deepseek_stream(messages):
+    """Appelle DeepSeek en streaming"""
+    # FIX [BUG-4] : chunk.choices[0].delta.content peut être None (fin de stream)
+    # "if token:" bloquait les espaces seuls et les retours à la ligne → rendu haché
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            temperature=0.4,
+            max_tokens=2000,
+            stream=True
+        )
+        for chunk in response:
+            if chunk.choices and chunk.choices[0].delta:
+                token = chunk.choices[0].delta.content
+                if token is not None:
+                    yield token
+    except Exception as e:
+        yield f"[Erreur DeepSeek: {e}]"
+    """Construit le prompt système avec TOUTES les données du collector"""
+    metrics = get_metrics()
+    remotes = get_rclone_remotes()
+    ssl_certs = get_ssl_certificates()
+    sessions = get_active_sessions()
+    ports = get_open_ports()
+    processes = get_top_processes()
+    health = get_health_score()
+    banned = get_fail2ban_banned()
+    tailscale = get_tailscale_peers()
+    oom = get_oom_events()
+    failed = get_failed_units()
+    sites = get_web_sites()
+    summaries = get_summaries(session_id)
+    
+    remotes_text = "\n".join([f"  • {r['name']} ({r.get('type', 'unknown')})" for r in remotes])
+    ssl_text = "\n".join([f"  • {c['domain']} : expire dans {c['days_left']} jours" for c in ssl_certs if c.get('days_left', 999) <= 30])
+    sessions_text = "\n".join([f"  • {s['user']} depuis {s['ip']} (connecté le {s['login_time'][:16]})" for s in sessions])
+    ports_text = "\n".join([f"  • {p['port']}/{p['protocol']} : {p.get('process', 'unknown')}" for p in ports[:15]])
+    processes_text = "\n".join([f"  • {p.get('command', 'unknown')[:50]} - {p.get('cpu', 0)}%" for p in processes])
+    tailscale_text = "\n".join([f"  • {t['name']} : {'🟢 en ligne' if t.get('online') else '🔴 hors ligne'}" for t in tailscale])
+    oom_text = "\n".join([f"  • {o['killed_process']} ({o['memory_used_mb']}MB) le {o['ts'][:16]}" for o in oom])
+    failed_text = "\n".join([f"  • {f['unit']} : {f['active_state']}" for f in failed])
+    sites_text = "\n".join([f"  • {s['domain']} (SSL: {'✅' if s.get('ssl_enabled') else '❌'}, PHP: {s.get('php_version', '?')})" for s in sites])
+    
+    memory_context = "\n".join([f"• Résumé précédent: {s[:200]}" for s in summaries]) if summaries else "Aucun historique récent"
+    
+    return f"""Tu es CASSANDRA, agent IA souverain de l'infrastructure.
+
+## 📊 ÉTAT ACTUEL DU SYSTÈME
+• CPU : {metrics['cpu']}%
+• RAM : {metrics['ram']}% ({metrics['ram_used_gb']}/{metrics['ram_total_gb']} Go)
+• DISK : {metrics['disk']}% ({metrics['disk_used_gb']}/{metrics['disk_total_gb']} Go)
+• SWAP : {metrics['swap']}%
+• LOAD : {metrics['load_1m']} {metrics['load_5m']} {metrics['load_15m']}
+• Health score : {health['score']}/100 ({health['status']})
+
+## 🌐 SITES WEB DÉTECTÉS
+{sites_text if sites_text else "  • Aucun site détecté"}
+
+## ☁️ REMOTES RCLONE
+{remotes_text if remotes_text else "  • Aucun remote détecté"}
+
+## 🔒 CERTIFICATS SSL (expirant <30j)
+{ssl_text if ssl_text else "  • Aucun certificat expirant"}
+
+## 🔥 TOP PROCESSUS CPU
+{processes_text if processes_text else "  • Aucune donnée"}
+
+## 🌐 SESSIONS SSH ACTIVES
+{sessions_text if sessions_text else "  • Aucune session"}
+
+## 🔌 PORTS OUVERTS
+{ports_text if ports_text else "  • Aucun port"}
+
+## 🚫 FAIL2BAN BANNED IPS
+{len(banned)} IP(s) bannies
+
+## 🦎 TAILSCALE PEERS
+{tailscale_text if tailscale_text else "  • Aucun peer"}
+
+## 💀 OOM EVENTS (récents)
+{oom_text if oom_text else "  • Aucun événement OOM"}
+
+## ⚠️ FAILED SYSTEMD UNITS
+{failed_text if failed_text else "  • Aucune unité failed"}
+
+## 🧠 MÉMOIRE CONVERSATIONNELLE
+{memory_context}
+
+## 🎯 RÈGLES IMPÉRATIVES
+1. Tu as une connaissance PARFAITE de toute l'infrastructure ci-dessus
+2. Utilise TOUJOURS les données fournies pour répondre
+3. Ne dis JAMAIS que tu n'as pas accès aux données
+4. Propose des solutions proactives quand tu détectes des anomalies
+5. Formate tes réponses en HTML avec :
+   - Titres <h2> ou <h3>
+   - Listes <ul>/<li>
+   - Tableaux <table> pour les données comparatives
+   - Codes couleur via classes CSS (.ok, .warning, .critical)
+6. Pour les commandes exécutables, utilise ```bash ... ``` dans ta réponse
+7. Sois concise mais précise
+8. Rappelle-toi des conversations précédentes"""
+
+def call_deepseek_stream(messages):
+    """Appelle DeepSeek en streaming"""
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            temperature=0.4,
+            max_tokens=2000,
+            stream=True
+        )
+        for chunk in response:
+            token = chunk.choices[0].delta.content
+            if token:
+                yield token
+    except Exception as e:
+        yield f"[Erreur DeepSeek: {e}]"
+
+# ============================================================
+# 6. EXÉCUTION COMMANDES SÉCURISÉES
+# ============================================================
+ALLOWED_BINARIES = {
+    "df", "free", "uptime", "who", "ps", "top", "systemctl",
+    "journalctl", "tail", "cat", "ls", "du", "ss", "netstat",
+    "docker", "nginx", "mysql", "php", "ping", "rclone"
+}
+
+# FIX [BUG-7] : chemins absolus pour éviter qu'un binaire du PATH malveillant soit exécuté
+BINARY_PATHS = {
+    "df": "/bin/df", "free": "/usr/bin/free", "uptime": "/usr/bin/uptime",
+    "who": "/usr/bin/who", "ps": "/bin/ps", "top": "/usr/bin/top",
+    "systemctl": "/bin/systemctl", "journalctl": "/bin/journalctl",
+    "tail": "/usr/bin/tail", "cat": "/bin/cat", "ls": "/bin/ls",
+    "du": "/usr/bin/du", "ss": "/bin/ss", "netstat": "/usr/bin/netstat",
+    "docker": "/usr/bin/docker", "nginx": "/usr/bin/nginx",
+    "mysql": "/usr/bin/mysql", "php": "/usr/bin/php",
+    "ping": "/bin/ping", "rclone": "/usr/bin/rclone",
+}
+
+import shlex
+
+def secure_execute(cmd):
+    """Exécute une commande sécurisée avec whitelist"""
+    # FIX [BUG-7] : shlex.split au lieu de .split() — gère les args avec espaces
+    try:
+        parts = shlex.split(cmd.strip())
+    except ValueError as e:
+        return f"Commande invalide : {e}"
+
+    if not parts:
+        return "Commande vide"
+
+    binary = parts[0].split("/")[-1]
+    if binary not in ALLOWED_BINARIES:
+        return f"Commande '{binary}' non autorisée"
+
+    # Détection d'injections basiques
+    dangerous = ["&&", "||", ";", "|", "`", "$(", "${"]
+    for tok in parts[1:]:
+        for d in dangerous:
+            if d in tok:
+                return f"Injection détectée : '{d}' non autorisé"
+
+    # FIX [BUG-7] : utiliser le chemin absolu, pas le binaire brut
+    abs_bin = BINARY_PATHS.get(binary, f"/usr/bin/{binary}")
+    final_cmd = [abs_bin] + parts[1:]
+
+    try:
+        result = subprocess.run(
+            final_cmd,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env={"PATH": "/bin:/usr/bin:/sbin:/usr/sbin"},
+            shell=False
+        )
+        output = result.stdout + result.stderr
+        return output[:5000] if output else "[Commande exécutée sans sortie]"
+    except subprocess.TimeoutExpired:
+        return "Timeout (15s)"
+    except FileNotFoundError:
+        return f"Binaire introuvable : {abs_bin}"
+    except Exception as e:
+        return f"Erreur : {e}"
+
+# ============================================================
+# 7. SERVEUR HTTP
+# ============================================================
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Serveur multi-thread"""
+    allow_reuse_address = True
+
+class CassandraHandler(BaseHTTPRequestHandler):
+    """Gestionnaire des requêtes HTTP"""
+    
+    def log_message(self, format, *args):
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {args}")
+    
+    def send_json(self, data, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+    
+    def send_html(self, content, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(content.encode())
+    
+    def send_sse(self, generator):
+        """Server-Sent Events streaming"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        try:
+            for token in generator:
+                if token:
+                    self.wfile.write(f"data: {json.dumps({'token': token})}\n\n".encode())
+                    self.wfile.flush()
+            # FIX [BUG-9] : envoyer done:True pour que le JS sache que le stream est terminé
+            self.wfile.write(f"data: {json.dumps({'done': True})}\n\n".encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            # FIX [BUG-9] : client a fermé la connexion — ne pas crasher le thread
+            pass
+    
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
+        
+        # Route principale
+        if path == "/" or path == "/index.html":
+            self.send_html(HTML_TEMPLATE)
+            return
+        
+        # API routes
+        if path == "/api/metrics":
+            self.send_json(get_metrics())
+            return
+        if path == "/api/metrics/history":
+            limit = int(query.get("limit", [60])[0])
+            self.send_json(get_metrics_history(limit))
+            return
+        if path == "/api/dashboard":
+            self.send_json(get_dashboard())
+            return
+        if path == "/api/remotes":
+            self.send_json(get_rclone_remotes())
+            return
+        if path == "/api/ssl":
+            self.send_json(get_ssl_certificates())
+            return
+        if path == "/api/sessions":
+            self.send_json(get_active_sessions())
+            return
+        if path == "/api/ports":
+            self.send_json(get_open_ports())
+            return
+        if path == "/api/processes":
+            self.send_json(get_top_processes())
+            return
+        if path == "/api/health":
+            self.send_json(get_health_score())
+            return
+        if path == "/api/fail2ban":
+            self.send_json(get_fail2ban_banned())
+            return
+        if path == "/api/tailscale":
+            self.send_json(get_tailscale_peers())
+            return
+        if path == "/api/oom":
+            self.send_json(get_oom_events())
+            return
+        if path == "/api/failed":
+            self.send_json(get_failed_units())
+            return
+        if path == "/api/sites":
+            self.send_json(get_web_sites())
+            return
+        
+        # 404
+        self.send_json({"error": "Not found"}, 404)
+    
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
+        
+        # Lire le body
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length).decode() if content_length > 0 else "{}"
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            data = {}
+        
+        # Login
+        if path == "/api/login":
+            password = data.get("password", "")
+            expected_hash = os.getenv("CASSANDRA_PASSWORD_HASH", "")
+            if not expected_hash or hashlib.sha256(password.encode()).hexdigest() == expected_hash:
+                session_id = secrets.token_hex(32)
+                self.send_json({"success": True, "session": session_id})
+            else:
+                self.send_json({"success": False, "error": "Mot de passe incorrect"}, 401)
+            return
+        
+        # Chat (streaming)
+        if path == "/api/chat/stream":
+            message = data.get("message", "")
+            session_id = data.get("session", "")
+
+            # FIX [BUG-6] : session "default" permettait à n'importe qui de lire
+            # l'historique d'un autre utilisateur — rejeter les sessions vides/invalides
+            if not session_id or len(session_id) < 8:
+                self.send_json({"error": "Session invalide — reconnectez-vous"}, 401)
+                return
+
+            if not message:
+                self.send_json({"error": "Message vide"}, 400)
+                return
+            if len(message) > 4000:
+                self.send_json({"error": "Message trop long (max 4000 car.)"}, 400)
+                return
+
+            # FIX [BUG-5] : ORDRE CORRECT
+            # 1. Récupérer l'historique AVANT de sauvegarder le message courant
+            #    (sinon le message est dans l'historique ET ajouté manuellement → doublon)
+            history = get_conversation_history(session_id, 20)
+
+            # 2. Sauvegarder le message utilisateur
+            save_conversation(session_id, "user", message)
+
+            # 3. Construire les messages : system + historique + message courant
+            messages = [{"role": "system", "content": build_system_prompt(session_id)}]
+            for msg in history:
+                messages.append({"role": msg["role"], "content": msg["content"]})
+            messages.append({"role": "user", "content": message})
+
+            # Streamer la réponse
+            def generate():
+                full_response = ""
+                for token in call_deepseek_stream(messages):
+                    full_response += token
+                    yield token
+                # Sauvegarder la réponse complète
+                save_conversation(session_id, "assistant", full_response)
+
+            self.send_sse(generate())
+            return
+        
+        # Exécution commande — FIX [SEC-1] : vérification session obligatoire
+        if path == "/api/exec":
+            # FIX [SEC-1] : /api/exec était accessible sans aucune vérification d'auth
+            session_id = data.get("session", "")
+            if not session_id or len(session_id) < 8:
+                self.send_json({"error": "Non autorisé"}, 401)
+                return
+            cmd = data.get("cmd", "")
+            if not cmd:
+                self.send_json({"error": "Commande vide"}, 400)
+                return
+            result = secure_execute(cmd)
+            self.send_json({"success": True, "output": result})
+            return
+        
+        # 404
+        self.send_json({"error": "Not found"}, 404)
+
+# ============================================================
+# 8. TEMPLATE HTML (intégré)
+# ============================================================
+HTML_TEMPLATE = '''<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CASSANDRA v9.0 - Infrastructure AI</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #0a0a0f;
+            color: #e8e8f0;
+            height: 100vh;
+            overflow: hidden;
+            position: relative;
+        }
+
+        /* Canvas pour particules */
+        #particles-canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* Grille hexagonale animée */
+        .hex-grid {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image: 
+                linear-gradient(to right, rgba(0, 255, 170, 0.03) 1px, transparent 1px),
+                linear-gradient(to bottom, rgba(0, 255, 170, 0.03) 1px, transparent 1px);
+            background-size: 50px 50px;
+            pointer-events: none;
+            z-index: 0;
+            animation: gridMove 20s linear infinite;
+        }
+
+        @keyframes gridMove {
+            0% { transform: translate(0, 0); }
+            100% { transform: translate(50px, 50px); }
+        }
+
+        /* Container principal */
+        .app-container {
+            position: relative;
+            z-index: 1;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Header */
+        .header {
+            background: rgba(17, 17, 24, 0.9);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(0, 255, 170, 0.2);
+            padding: 12px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logo {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+            font-size: 18px;
+            background: linear-gradient(135deg, #00ffcc, #7c5cfc);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+        }
+        .logo-badge {
+            background: rgba(0, 255, 170, 0.15);
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-size: 9px;
+            color: #00ffcc;
+            margin-left: 8px;
+        }
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #00ffcc;
+            box-shadow: 0 0 8px #00ffcc;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .session-time {
+            font-size: 11px;
+            color: #6b6b80;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .logout-btn {
+            background: rgba(255, 71, 87, 0.15);
+            border: 1px solid rgba(255, 71, 87, 0.3);
+            border-radius: 6px;
+            padding: 6px 14px;
+            font-size: 11px;
+            color: #ff4757;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .logout-btn:hover {
+            background: rgba(255, 71, 87, 0.25);
+            border-color: #ff4757;
+        }
+
+        /* Layout principal */
+        .main-layout {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+            gap: 1px;
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        /* Panels */
+        .panel {
+            background: rgba(17, 17, 24, 0.8);
+            backdrop-filter: blur(10px);
+            overflow-y: auto;
+            padding: 16px;
+        }
+        .panel-left {
+            width: 320px;
+            border-right: 1px solid rgba(0, 255, 170, 0.1);
+        }
+        .panel-right {
+            width: 320px;
+            border-left: 1px solid rgba(0, 255, 170, 0.1);
+        }
+        .panel-center {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 0;
+        }
+
+        /* Cartes */
+        .card {
+            background: rgba(28, 28, 37, 0.8);
+            border-radius: 12px;
+            padding: 14px;
+            margin-bottom: 16px;
+            border: 1px solid rgba(0, 255, 170, 0.1);
+            transition: all 0.3s;
+        }
+        .card:hover {
+            border-color: rgba(0, 255, 170, 0.3);
+            box-shadow: 0 0 15px rgba(0, 255, 170, 0.05);
+        }
+        .card-title {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.2em;
+            color: #00ffcc;
+            margin-bottom: 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        /* Métriques en barres */
+        .metric-bar {
+            margin-bottom: 12px;
+        }
+        .metric-label {
+            font-size: 11px;
+            color: #a0a0b0;
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+        }
+        .bar-track {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+            height: 6px;
+            overflow: hidden;
+        }
+        .bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+        .bar-fill.cpu { background: linear-gradient(90deg, #00ffcc, #7c5cfc); }
+        .bar-fill.ram { background: linear-gradient(90deg, #7c5cfc, #00ffcc); }
+        .bar-fill.disk { background: linear-gradient(90deg, #00ffcc, #2ed573); }
+
+        /* Graphique */
+        .chart-container {
+            height: 120px;
+            margin: 10px 0;
+        }
+
+        /* Liste remotes */
+        .remote-item {
+            padding: 6px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            font-size: 11px;
+            font-family: 'JetBrains Mono', monospace;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .remote-name {
+            color: #00ffcc;
+        }
+        .remote-type {
+            font-size: 9px;
+            color: #7c5cfc;
+        }
+
+        /* SSL */
+        .ssl-item {
+            padding: 6px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            font-size: 11px;
+        }
+        .ssl-domain {
+            font-weight: 600;
+        }
+        .ssl-days {
+            font-size: 10px;
+        }
+        .ssl-days.critical { color: #ff4757; }
+        .ssl-days.warning { color: #ffa502; }
+        .ssl-days.ok { color: #2ed573; }
+
+        /* Chat */
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+        }
+        .message {
+            margin-bottom: 16px;
+            display: flex;
+            flex-direction: column;
+        }
+        .message.user {
+            align-items: flex-end;
+        }
+        .message.bot {
+            align-items: flex-start;
+        }
+        .message-bubble {
+            max-width: 85%;
+            padding: 10px 14px;
+            border-radius: 12px;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        .message.user .message-bubble {
+            background: linear-gradient(135deg, #7c5cfc, #00ffcc);
+            color: #0a0a0f;
+            border-radius: 12px 12px 2px 12px;
+        }
+        .message.bot .message-bubble {
+            background: rgba(28, 28, 37, 0.9);
+            border: 1px solid rgba(0, 255, 170, 0.2);
+            border-radius: 12px 12px 12px 2px;
+        }
+        .message.bot .message-bubble h2 {
+            font-size: 13px;
+            color: #00ffcc;
+            margin: 6px 0 4px;
+        }
+        .message.bot .message-bubble h3 {
+            font-size: 12px;
+            color: #7c5cfc;
+            margin: 5px 0 3px;
+        }
+        .message.bot .message-bubble ul {
+            margin: 5px 0;
+            padding-left: 18px;
+        }
+        .message.bot .message-bubble li {
+            margin: 2px 0;
+        }
+        .message.bot .message-bubble table {
+            font-size: 10px;
+            border-collapse: collapse;
+            width: 100%;
+            margin: 8px 0;
+        }
+        .message.bot .message-bubble th {
+            background: rgba(0, 255, 170, 0.1);
+            padding: 4px 8px;
+            text-align: left;
+        }
+        .message.bot .message-bubble td {
+            padding: 3px 8px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .command-block {
+            background: #0a0a0f;
+            border-radius: 6px;
+            margin: 8px 0;
+            border: 1px solid rgba(0, 255, 170, 0.2);
+        }
+        .command-header {
+            padding: 6px 10px;
+            background: rgba(0, 255, 170, 0.05);
+            font-size: 10px;
+            font-family: monospace;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .exec-btn {
+            background: rgba(0, 255, 170, 0.15);
+            border: none;
+            border-radius: 4px;
+            padding: 2px 8px;
+            color: #00ffcc;
+            cursor: pointer;
+            font-size: 9px;
+        }
+        .exec-btn:hover {
+            background: rgba(0, 255, 170, 0.3);
+        }
+        .command-result {
+            padding: 8px 10px;
+            font-size: 10px;
+            font-family: monospace;
+            white-space: pre-wrap;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .chat-input-area {
+            padding: 16px;
+            border-top: 1px solid rgba(0, 255, 170, 0.1);
+            display: flex;
+            gap: 10px;
+        }
+        .chat-input {
+            flex: 1;
+            background: rgba(28, 28, 37, 0.9);
+            border: 1px solid rgba(0, 255, 170, 0.2);
+            border-radius: 8px;
+            padding: 10px 14px;
+            color: #e8e8f0;
+            font-family: 'Inter', monospace;
+            font-size: 13px;
+            resize: none;
+        }
+        .chat-input:focus {
+            outline: none;
+            border-color: #00ffcc;
+        }
+        .send-btn {
+            background: linear-gradient(135deg, #00ffcc, #7c5cfc);
+            border: none;
+            border-radius: 8px;
+            width: 42px;
+            height: 42px;
+            cursor: pointer;
+            font-size: 18px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .send-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .typing {
+            display: flex;
+            gap: 4px;
+            padding: 8px 12px;
+        }
+        .typing-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #00ffcc;
+            animation: typingAnim 1.4s infinite;
+        }
+        @keyframes typingAnim {
+            0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+            30% { transform: translateY(-4px); opacity: 1; }
+        }
+
+        /* Loader */
+        .loader {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(0, 255, 170, 0.2);
+            border-top-color: #00ffcc;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #00ffcc; border-radius: 2px; }
+
+        /* Modal login */
+        .login-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(10, 10, 15, 0.98);
+            backdrop-filter: blur(20px);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .login-card {
+            background: rgba(28, 28, 37, 0.95);
+            border: 1px solid rgba(0, 255, 170, 0.3);
+            border-radius: 20px;
+            padding: 32px;
+            width: 340px;
+            text-align: center;
+        }
+        .login-card h1 {
+            background: linear-gradient(135deg, #00ffcc, #7c5cfc);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            margin-bottom: 24px;
+        }
+        .login-card input {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid rgba(0, 255, 170, 0.2);
+            border-radius: 8px;
+            padding: 12px;
+            color: #fff;
+            font-size: 14px;
+            margin-bottom: 16px;
+        }
+        .login-card input:focus {
+            outline: none;
+            border-color: #00ffcc;
+        }
+        .login-card button {
+            width: 100%;
+            background: linear-gradient(135deg, #00ffcc, #7c5cfc);
+            border: none;
+            border-radius: 8px;
+            padding: 12px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .login-error {
+            color: #ff4757;
+            font-size: 12px;
+            margin-top: 12px;
+        }
+
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="particles-canvas"></canvas>
+    <div class="hex-grid"></div>
+
+    <div id="login-modal" class="login-modal">
+        <div class="login-card">
+            <h1>🔐 CASSANDRA v9.0</h1>
+            <input type="password" id="login-password" placeholder="Mot de passe" autofocus>
+            <button onclick="login()">Se connecter</button>
+            <div id="login-error" class="login-error"></div>
+        </div>
+    </div>
+
+    <div id="app-container" class="app-container hidden">
+        <div class="header">
+            <div>
+                <span class="logo">CASSANDRA</span>
+                <span class="logo-badge">v9.0 · AI AGENT</span>
+            </div>
+            <div class="status">
+                <div class="status-dot"></div>
+                <span id="status-text">SYSTEM ONLINE</span>
+                <span class="session-time" id="session-time">-- min</span>
+                <button class="logout-btn" onclick="logout()">Déconnexion</button>
+            </div>
+        </div>
+
+        <div class="main-layout">
+            <!-- PANEL GAUCHE -->
+            <div class="panel panel-left">
+                <div class="card">
+                    <div class="card-title">📊 MÉTRIQUES SYSTÈME</div>
+                    <div class="metric-bar">
+                        <div class="metric-label"><span>CPU</span><span id="cpu-val">0%</span></div>
+                        <div class="bar-track"><div class="bar-fill cpu" id="cpu-bar" style="width:0%"></div></div>
+                    </div>
+                    <div class="metric-bar">
+                        <div class="metric-label"><span>RAM</span><span id="ram-val">0%</span></div>
+                        <div class="bar-track"><div class="bar-fill ram" id="ram-bar" style="width:0%"></div></div>
+                    </div>
+                    <div class="metric-bar">
+                        <div class="metric-label"><span>DISQUE</span><span id="disk-val">0%</span></div>
+                        <div class="bar-track"><div class="bar-fill disk" id="disk-bar" style="width:0%"></div></div>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="cpu-chart" style="height: 100px; width: 100%;"></canvas>
+                    </div>
+                    <div class="metric-label" style="margin-top:8px"><span>LOAD</span><span id="load-val">0.00</span></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">💚 HEALTH SCORE <span id="health-score">--</span></div>
+                    <div id="health-status" style="font-size:11px;color:#7c5cfc"></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">☁️ REMOTES RCLONE</div>
+                    <div id="remotes-list"></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">🔒 CERTIFICATS SSL</div>
+                    <div id="ssl-list"></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">🦎 TAILSCALE PEERS</div>
+                    <div id="tailscale-list"></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">🚫 FAIL2BAN BANNIS</div>
+                    <div id="fail2ban-count">0 IP</div>
+                </div>
+            </div>
+
+            <!-- PANEL CENTRAL (CHAT) -->
+            <div class="panel panel-center">
+                <div class="chat-messages" id="chat-messages">
+                    <div class="message bot">
+                        <div class="message-bubble">
+                            👋 Bonjour, je suis <strong>CASSANDRA v9.0</strong>. Je connais toute ton infrastructure. Que veux-tu savoir ?
+                        </div>
+                    </div>
+                </div>
+                <div class="chat-input-area">
+                    <textarea class="chat-input" id="chat-input" placeholder="Pose ta question... (Entrée pour envoyer)" rows="1"></textarea>
+                    <button class="send-btn" id="send-btn" onclick="sendMessage()">➤</button>
+                </div>
+            </div>
+
+            <!-- PANEL DROIT -->
+            <div class="panel panel-right">
+                <div class="card">
+                    <div class="card-title">🔥 TOP PROCESSUS</div>
+                    <div id="processes-list"></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">🌐 SESSIONS SSH</div>
+                    <div id="sessions-list"></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">🔌 PORTS OUVERTS</div>
+                    <div id="ports-list"></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">💀 OOM EVENTS</div>
+                    <div id="oom-list"></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-title">⚠️ FAILED UNITS</div>
+                    <div id="failed-list"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ============================================================
+        // ÉTAT GLOBAL
+        // ============================================================
+        let sessionId = localStorage.getItem('cassandra_session') || '';
+        let isAuthenticated = false;
+        let sessionStart = Date.now();
+        let cpuChart = null;
+        let ramChart = null;
+        let cpuHistory = [];
+        let ramHistory = [];
+        let labels = [];
+
+        // ============================================================
+        // AUTHENTIFICATION
+        // ============================================================
+        async function login() {
+            const password = document.getElementById('login-password').value;
+            const errorDiv = document.getElementById('login-error');
+            
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: password })
+                });
+                const data = await response.json();
+                
+                if (data.success) {
+                    sessionId = data.session;
+                    localStorage.setItem('cassandra_session', sessionId);
+                    isAuthenticated = true;
+                    document.getElementById('login-modal').classList.add('hidden');
+                    document.getElementById('app-container').classList.remove('hidden');
+                    startApp();
+                } else {
+                    errorDiv.textContent = data.error || 'Mot de passe incorrect';
+                }
+            } catch(e) {
+                errorDiv.textContent = 'Erreur de connexion';
+            }
+        }
+
+        function logout() {
+            localStorage.removeItem('cassandra_session');
+            isAuthenticated = false;
+            document.getElementById('login-modal').classList.remove('hidden');
+            document.getElementById('app-container').classList.add('hidden');
+        }
+
+        // ============================================================
+        // FONCTIONS API
+        // ============================================================
+        async function apiGet(endpoint) {
+            const response = await fetch(endpoint);
+            return response.json();
+        }
+
+        async function apiPost(endpoint, data) {
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...data, session: sessionId })
+            });
+            return response.json();
+        }
+
+        // ============================================================
+        // MÉTRIQUES
+        // ============================================================
+        async function loadMetrics() {
+            try {
+                const data = await apiGet('/api/metrics');
+                const cpu = Math.round(data.cpu || 0);
+                const ram = Math.round(data.ram || 0);
+                const disk = Math.round(data.disk || 0);
+                
+                document.getElementById('cpu-val').textContent = cpu + '%';
+                document.getElementById('ram-val').textContent = ram + '%';
+                document.getElementById('disk-val').textContent = disk + '%';
+                document.getElementById('cpu-bar').style.width = cpu + '%';
+                document.getElementById('ram-bar').style.width = ram + '%';
+                document.getElementById('disk-bar').style.width = disk + '%';
+                document.getElementById('load-val').textContent = `${data.load_1m || 0} ${data.load_5m || 0} ${data.load_15m || 0}`;
+                
+                // Historique pour graphiques
+                cpuHistory.push(cpu);
+                ramHistory.push(ram);
+                if (cpuHistory.length > 60) cpuHistory.shift();
+                if (ramHistory.length > 60) ramHistory.shift();
+                
+                updateCharts();
+            } catch(e) { console.error('Metrics error:', e); }
+        }
+
+        async function loadMetricsHistory() {
+            try {
+                const data = await apiGet('/api/metrics/history?limit=60');
+                cpuHistory = data.map(d => d.cpu_pct);
+                ramHistory = data.map(d => d.ram_pct);
+                labels = data.map((_, i) => i);
+                updateCharts();
+            } catch(e) { console.error('History error:', e); }
+        }
+
+        function initCharts() {
+            const cpuCtx = document.getElementById('cpu-chart').getContext('2d');
+            cpuChart = new Chart(cpuCtx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'CPU %',
+                        data: [],
+                        borderColor: '#00ffcc',
+                        backgroundColor: 'rgba(0, 255, 204, 0.05)',
+                        fill: true,
+                        tension: 0.4,
+                        pointRadius: 0,
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: { legend: { display: false } },
+                    scales: { y: { beginAtZero: true, max: 100, grid: { color: 'rgba(255,255,255,0.05)' } } }
+                }
+            });
+        }
+
+        function updateCharts() {
+            if (cpuChart) {
+                cpuChart.data.labels = cpuHistory.map((_, i) => i);
+                cpuChart.data.datasets[0].data = cpuHistory;
+                cpuChart.update('none');
+            }
+        }
+
+        // ============================================================
+        // DASHBOARD
+        // ============================================================
+        async function loadDashboard() {
+            try {
+                const data = await apiGet('/api/dashboard');
+                document.getElementById('health-score').textContent = data.health_score || 0;
+                document.getElementById('health-status').textContent = data.health_status || 'unknown';
+            } catch(e) { console.error('Dashboard error:', e); }
+        }
+
+        async function loadRemotes() {
+            try {
+                const data = await apiGet('/api/remotes');
+                const container = document.getElementById('remotes-list');
+                if (data.length) {
+                    container.innerHTML = data.map(r => `
+                        <div class="remote-item">
+                            <span class="remote-name">${escapeHtml(r.name)}</span>
+                            <span class="remote-type">${escapeHtml(r.type || '?')}</span>
+                        </div>
+                    `).join('');
+                } else {
+                    container.innerHTML = '<div style="font-size:10px;color:#6b6b80">Aucun remote</div>';
+                }
+            } catch(e) { console.error('Remotes error:', e); }
+        }
+
+        async function loadSSLCerts() {
+            try {
+                const data = await apiGet('/api/ssl');
+                const container = document.getElementById('ssl-list');
+                if (data.length) {
+                    container.innerHTML = data.slice(0, 10).map(c => {
+                        const days = c.days_left;
+                        let statusClass = 'ok';
+                        if (days <= 7) statusClass = 'critical';
+                        else if (days <= 30) statusClass = 'warning';
+                        return `
+                            <div class="ssl-item">
+                                <div class="ssl-domain">${escapeHtml(c.domain)}</div>
+                                <div class="ssl-days ${statusClass}">expire dans ${days} jours</div>
+                            </div>
+                        `;
+                    }).join('');
+                } else {
+                    container.innerHTML = '<div style="font-size:10px;color:#6b6b80">Aucun certificat</div>';
+                }
+            } catch(e) { console.error('SSL error:', e); }
+        }
+
+        async function loadTailscale() {
+            try {
+                const data = await apiGet('/api/tailscale');
+                const container = document.getElementById('tailscale-list');
+                if (data.length) {
+                    container.innerHTML = data.map(p => `
+                        <div class="remote-item">
+                            <span class="remote-name">${escapeHtml(p.name)}</span>
+                            <span class="remote-type">${p.online ? '🟢 en ligne' : '🔴 hors ligne'}</span>
+                        </div>
+                    `).join('');
+                } else {
+                    container.innerHTML = '<div style="font-size:10px;color:#6b6b80">Aucun peer</div>';
+                }
+            } catch(e) { console.error('Tailscale error:', e); }
+        }
+
+        async function loadFail2ban() {
+            try {
+                const data = await apiGet('/api/fail2ban');
+                document.getElementById('fail2ban-count').textContent = `${data.length || 0} IP bannie(s)`;
+            } catch(e) { console.error('Fail2ban error:', e); }
+        }
+
+        async function loadProcesses() {
+            try {
+                const data = await apiGet('/api/processes');
+                const container = document.getElementById('processes-list');
+                if (data.length) {
+                    container.innerHTML = data.map(p => `
+                        <div class="remote-item">
+                            <span class="remote-name">${escapeHtml((p.command || '?').substring(0, 35))}</span>
+                            <span class="remote-type">${p.cpu || 0}%</span>
+                        </div>
+                    `).join('');
+                } else {
+                    container.innerHTML = '<div style="font-size:10px;color:#6b6b80">Chargement...</div>';
+                }
+            } catch(e) { console.error('Processes error:', e); }
+        }
+
+        async function loadSessions() {
+            try {
+                const data = await apiGet('/api/sessions');
+                const container = document.getElementById('sessions-list');
+                if (data.length) {
+                    container.innerHTML = data.map(s => `
+                        <div class="remote-item">
+                            <span class="remote-name">${escapeHtml(s.user)}</span>
+                            <span class="remote-type">${escapeHtml(s.ip || 'local')}</span>
+                        </div>
+                    `).join('');
+                } else {
+                    container.innerHTML = '<div style="font-size:10px;color:#6b6b80">Aucune session</div>';
+                }
+            } catch(e) { console.error('Sessions error:', e); }
+        }
+
+        async function loadPorts() {
+            try {
+                const data = await apiGet('/api/ports');
+                const container = document.getElementById('ports-list');
+                if (data.length) {
+                    container.innerHTML = data.slice(0, 12).map(p => `
+                        <div class="remote-item">
+                            <span class="remote-name">${p.port}/${p.protocol}</span>
+                            <span class="remote-type">${escapeHtml(p.process || '?')}</span>
+                        </div>
+                    `).join('');
+                } else {
+                    container.innerHTML = '<div style="font-size:10px;color:#6b6b80">Aucun port</div>';
+                }
+            } catch(e) { console.error('Ports error:', e); }
+        }
+
+        async function loadOOM() {
+            try {
+                const data = await apiGet('/api/oom');
+                const container = document.getElementById('oom-list');
+                if (data.length) {
+                    container.innerHTML = data.slice(0, 5).map(o => `
+                        <div class="remote-item">
+                            <span class="remote-name">${escapeHtml(o.killed_process || '?')}</span>
+                            <span class="remote-type">${o.memory_used_mb || 0}MB</span>
+                        </div>
+                    `).join('');
+                } else {
+                    container.innerHTML = '<div style="font-size:10px;color:#6b6b80">Aucun OOM</div>';
+                }
+            } catch(e) { console.error('OOM error:', e); }
+        }
+
+        async function loadFailedUnits() {
+            try {
+                const data = await apiGet('/api/failed');
+                const container = document.getElementById('failed-list');
+                if (data.length) {
+                    container.innerHTML = data.slice(0, 5).map(f => `
+                        <div class="remote-item">
+                            <span class="remote-name">${escapeHtml(f.unit || '?')}</span>
+                            <span class="remote-type">${escapeHtml(f.active_state || 'failed')}</span>
+                        </div>
+                    `).join('');
+                } else {
+                    container.innerHTML = '<div style="font-size:10px;color:#6b6b80">Aucune unité failed</div>';
+                }
+            } catch(e) { console.error('Failed units error:', e); }
+        }
+
+        // ============================================================
+        // CHAT
+        // ============================================================
+        let isStreaming = false;
+        let currentResponseDiv = null;
+
+        function escapeHtml(text) {
+            if (!text) return '';
+            return text.replace(/[&<>]/g, function(m) {
+                if (m === '&') return '&amp;';
+                if (m === '<') return '&lt;';
+                if (m === '>') return '&gt;';
+                return m;
+            });
+        }
+
+        function addMessage(content, isUser = false) {
+            const container = document.getElementById('chat-messages');
+            const div = document.createElement('div');
+            div.className = `message ${isUser ? 'user' : 'bot'}`;
+            div.innerHTML = `<div class="message-bubble">${content}</div>`;
+            container.appendChild(div);
+            container.scrollTop = container.scrollHeight;
+            return div;
+        }
+
+        function addTypingIndicator() {
+            const container = document.getElementById('chat-messages');
+            const div = document.createElement('div');
+            div.className = 'message bot';
+            div.id = 'typing-indicator';
+            div.innerHTML = `<div class="message-bubble"><div class="typing"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div></div>`;
+            container.appendChild(div);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function removeTypingIndicator() {
+            const indicator = document.getElementById('typing-indicator');
+            if (indicator) indicator.remove();
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('chat-input');
+            const message = input.value.trim();
+            if (!message || isStreaming) return;
+            
+            input.value = '';
+            input.style.height = 'auto';
+            
+            addMessage(escapeHtml(message), true);
+            addTypingIndicator();
+            isStreaming = true;
+            
+            try {
+                const response = await fetch('/api/chat/stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: message, session: sessionId })
+                });
+                
+                removeTypingIndicator();
+                
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let fullResponse = '';
+                let messageDiv = null;
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\n');
+                    
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const data = JSON.parse(line.slice(6));
+                                if (data.token) {
+                                    fullResponse += data.token;
+                                    if (!messageDiv) {
+                                        const container = document.getElementById('chat-messages');
+                                        const div = document.createElement('div');
+                                        div.className = 'message bot';
+                                        div.innerHTML = `<div class="message-bubble"></div>`;
+                                        container.appendChild(div);
+                                        messageDiv = div.querySelector('.message-bubble');
+                                    }
+                                    messageDiv.innerHTML = formatResponse(fullResponse);
+                                    document.getElementById('chat-messages').scrollTop = document.getElementById('chat-messages').scrollHeight;
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                }
+            } catch(e) {
+                removeTypingIndicator();
+                addMessage(`<span style="color:#ff4757">❌ Erreur: ${e.message}</span>`, false);
+            }
+            
+            isStreaming = false;
+        }
+
+        function formatResponse(text) {
+            // Remplacer les blocs de code
+            let formatted = text.replace(/```bash\n(.*?)\n```/gs, function(match, code) {
+                return `<div class="command-block">
+                            <div class="command-header">
+                                <span>💻 Exécuter</span>
+                                <button class="exec-btn" onclick="executeCommand('${escapeHtml(code.replace(/'/g, "\\'"))}')">▶ EXÉCUTER</button>
+                            </div>
+                            <div class="command-result" id="result-${Date.now()}">En attente...</div>
+                        </div>`;
+            });
+            
+            // Remplacer les titres
+            formatted = formatted.replace(/## (.*?)\n/g, '<h2>$1</h2>');
+            formatted = formatted.replace(/### (.*?)\n/g, '<h3>$1</h3>');
+            
+            // Remplacer les listes
+            formatted = formatted.replace(/• (.*?)\n/g, '<li>$1</li>');
+            formatted = formatted.replace(/(<li>.*?<\/li>)+/gs, '<ul>$&</ul>');
+            
+            // Remplacer les pourcentages colorés
+            formatted = formatted.replace(/(\d{1,3})%/g, function(match, pct) {
+                const p = parseInt(pct);
+                let color = '';
+                if (p > 85) color = '#ff4757';
+                else if (p > 70) color = '#ffa502';
+                else color = '#2ed573';
+                return `<span style="color:${color};font-weight:bold">${p}%</span>`;
+            });
+            
+            return formatted;
+        }
+
+        async function executeCommand(cmd) {
+            if (!confirm(`Exécuter :\n${cmd}\n\nConfirmer ?`)) return;
+            
+            const resultDiv = document.querySelector('.command-result:last-child');
+            if (resultDiv) resultDiv.innerHTML = '<div class="loader"></div> Exécution...';
+            
+            try {
+                const response = await fetch('/api/exec', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ cmd: cmd, session: sessionId })
+                });
+                const data = await response.json();
+                if (resultDiv) {
+                    resultDiv.innerHTML = `<pre style="margin:0;font-size:10px;white-space:pre-wrap">${escapeHtml(data.output || 'Aucune sortie')}</pre>`;
+                }
+            } catch(e) {
+                if (resultDiv) resultDiv.innerHTML = `<span style="color:#ff4757">❌ ${e.message}</span>`;
+            }
+        }
+
+        // ============================================================
+        // INITIALISATION
+        // ============================================================
+        function updateSessionTime() {
+            const minutes = Math.floor((Date.now() - sessionStart) / 60000);
+            document.getElementById('session-time').textContent = minutes + ' min';
+        }
+        setInterval(updateSessionTime, 30000);
+        updateSessionTime();
+
+        // Particules canvas
+        function initParticles() {
+            const canvas = document.getElementById('particles-canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            
+            const particles = [];
+            for (let i = 0; i < 100; i++) {
+                particles.push({
+                    x: Math.random() * canvas.width,
+                    y: Math.random() * canvas.height,
+                    radius: Math.random() * 2 + 1,
+                    alpha: Math.random() * 0.5 + 0.2,
+                    vx: (Math.random() - 0.5) * 0.5,
+                    vy: (Math.random() - 0.5) * 0.5
+                });
+            }
+            
+            function animate() {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                for (const p of particles) {
+                    p.x += p.vx;
+                    p.y += p.vy;
+                    if (p.x < 0) p.x = canvas.width;
+                    if (p.x > canvas.width) p.x = 0;
+                    if (p.y < 0) p.y = canvas.height;
+                    if (p.y > canvas.height) p.y = 0;
+                    
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+                    ctx.fillStyle = `rgba(0, 255, 204, ${p.alpha})`;
+                    ctx.fill();
+                }
+                requestAnimationFrame(animate);
+            }
+            animate();
+            
+            window.addEventListener('resize', () => {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+            });
+        }
+
+        async function startApp() {
+            initCharts();
+            initParticles();
+            
+            await loadMetricsHistory();
+            
+            // Chargement initial
+            await loadMetrics();
+            await loadDashboard();
+            await loadRemotes();
+            await loadSSLCerts();
+            await loadTailscale();
+            await loadFail2ban();
+            await loadProcesses();
+            await loadSessions();
+            await loadPorts();
+            await loadOOM();
+            await loadFailedUnits();
+            
+            // Rafraîchissement périodique
+            setInterval(loadMetrics, 5000);
+            setInterval(loadRemotes, 30000);
+            setInterval(loadSSLCerts, 60000);
+            setInterval(loadTailscale, 30000);
+            setInterval(loadProcesses, 10000);
+            setInterval(loadSessions, 30000);
+            setInterval(loadPorts, 60000);
+            setInterval(loadDashboard, 30000);
+        }
+
+        // Auto-resize textarea
+        const input = document.getElementById('chat-input');
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+        input.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = Math.min(this.scrollHeight, 100) + 'px';
+        });
+
+        // Vérifier session existante
+        if (localStorage.getItem('cassandra_session')) {
+            sessionId = localStorage.getItem('cassandra_session');
+            isAuthenticated = true;
+            document.getElementById('login-modal').classList.add('hidden');
+            document.getElementById('app-container').classList.remove('hidden');
+            startApp();
+        }
+    </script>
+</body>
+</html>
+'''
+
+# ============================================================
+# 9. DÉMARRAGE
+# ============================================================
+if __name__ == "__main__":
+    # Initialisation
+    init_memory_db()
+
+    # FIX [BUG-1] : afficher l'état de la clé au démarrage pour détecter le problème immédiatement
+    _key_display = f"****{_api_key[-4:]}" if len(_api_key) >= 4 else "(non définie)"
+    print(f"\n{'='*60}")
+    print(f"🔥 CASSANDRA v9.1 - Agent unifié")
+    print(f"📍 Port: {PORT}")
+    print(f"📁 DB Collector: {DB_PATH}")
+    print(f"🧠 DB Mémoire: {MEMORY_DB_PATH}")
+    print(f"🔑 DeepSeek API key: {_key_display}")
+    print(f"🌐 Interface: http://localhost:{PORT}")
+    print(f"{'='*60}\n")
+
+    # Démarrer le serveur
+    server = ThreadedHTTPServer(("0.0.0.0", PORT), CassandraHandler)
+    
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n👋 Arrêt de CASSANDRA...")
+        server.shutdown()

@@ -154,6 +154,7 @@ def init_all_tables():
         CREATE TABLE IF NOT EXISTS nginx_access_stats (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, domain TEXT, total_reqs INTEGER, req_4xx INTEGER, req_5xx INTEGER, top_ips TEXT, top_paths TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS backup_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, remote TEXT UNIQUE, ts TEXT, status TEXT, size_gb REAL, files_count INTEGER, error TEXT, last_check TEXT);
         CREATE TABLE IF NOT EXISTS changelog (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, entity_type TEXT, entity_name TEXT, change_type TEXT, old_value TEXT, new_value TEXT, severity TEXT);
+        CREATE TABLE IF NOT EXISTS world_model (wkey TEXT PRIMARY KEY, category TEXT, value TEXT, detail TEXT, severity TEXT DEFAULT 'info', source TEXT DEFAULT 'observed', observed_at TEXT, updated_at TEXT);
         CREATE TABLE IF NOT EXISTS health_scores (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, score INTEGER, breakdown TEXT, alerts_count INTEGER, status TEXT);
         CREATE TABLE IF NOT EXISTS dns_servers (id INTEGER PRIMARY KEY AUTOINCREMENT, server_type TEXT UNIQUE, version TEXT, config_file TEXT, zones_count INTEGER, running INTEGER, last_check TEXT);
         CREATE TABLE IF NOT EXISTS dns_zones (id INTEGER PRIMARY KEY AUTOINCREMENT, zone_name TEXT, server_type TEXT, zone_file TEXT, serial TEXT, last_check TEXT);
@@ -2458,6 +2459,17 @@ def save_many(table: str, rows: list):
     conn = get_conn()
     try:
         cols  = list(rows[0].keys())
+        # AUTO-MIGRATION : ajoute les colonnes manquantes pour absorber toute dérive de
+        # schéma (ex: le code produit 'aliases' mais la table ne l'a pas). Évite les
+        # erreurs 'has no column named X' qui vidaient la table en silence.
+        try:
+            existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for c in cols:
+                if c not in existing:
+                    conn.execute(f'ALTER TABLE {table} ADD COLUMN "{c}"')
+                    print(f"[DB] {table}: colonne '{c}' ajoutée (auto-migration)", file=sys.stderr)
+        except Exception as _me:
+            print(f"[DB] {table}: auto-migration impossible: {_me}", file=sys.stderr)
         place = ",".join(["?"] * len(cols))
         # PERF[O3]: pré-calcul des valeurs hors lock DB pour minimiser le temps de transaction
         values = [[r.get(c) for c in cols] for r in rows]
@@ -2615,6 +2627,137 @@ def detect_diff(entity_type: str, current_names: list):
 
 
 # ============================================================
+# SENSORIUM — MODÈLE DU MONDE (état courant grounded + changements de valeur)
+# ============================================================
+def upsert_world(conn, key, category, value, detail=None, severity="info"):
+    """Upsert une entrée du world model sur la connexion fournie. Si la VALEUR change,
+    journalise le changement (old→new) dans changelog. Robuste : n'élève jamais."""
+    try:
+        value = "" if value is None else str(value)[:500]
+        now = datetime.now().isoformat()
+        row = conn.execute("SELECT value FROM world_model WHERE wkey=?", (key,)).fetchone()
+        det = json.dumps(detail) if detail is not None else None
+        if row is None:
+            conn.execute(
+                "INSERT INTO world_model (wkey, category, value, detail, severity, source, observed_at, updated_at) "
+                "VALUES (?,?,?,?,?, 'observed', ?, ?)",
+                (key, category, value, det, severity, now, now))
+        elif row[0] != value:
+            conn.execute(
+                "UPDATE world_model SET value=?, detail=?, severity=?, observed_at=?, updated_at=? WHERE wkey=?",
+                (value, det, severity, now, now, key))
+            conn.execute(
+                "INSERT INTO changelog (ts, entity_type, entity_name, change_type, old_value, new_value, severity) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (now, category, key, "modified", str(row[0])[:500], value, severity))
+        else:
+            conn.execute("UPDATE world_model SET severity=?, observed_at=? WHERE wkey=?", (severity, now, key))
+    except Exception as e:
+        print(f"[WORLD] upsert {key}: {e}", file=sys.stderr)
+
+
+def build_world_model():
+    """Dérive l'état courant compact (clé→valeur) depuis les tables déjà collectées,
+    en UNE transaction. Chaque source est isolée : un échec n'empêche jamais les autres,
+    et ne casse jamais le collector. C'est le socle 'vérité-terrain' de la mémoire."""
+    try:
+        conn = get_conn()
+    except Exception:
+        return
+    def _q(sql, *p):
+        try:
+            return conn.execute(sql, p).fetchall()
+        except Exception:
+            return []
+    try:
+        # Identité système
+        try:
+            u = os.uname()
+            upsert_world(conn, "system.hostname", "system", u.nodename)
+            upsert_world(conn, "system.kernel", "system", u.release)
+        except Exception:
+            pass
+        # Ressources (dernière métrique)
+        m = _q("SELECT cpu_pct, ram_pct, disk_pct, swap_pct, load_1m, ram_used_gb, ram_total_gb, "
+               "disk_used_gb, disk_total_gb FROM metrics_realtime ORDER BY id DESC LIMIT 1")
+        if m:
+            r = m[0]
+            def _sev(p, thr=90):
+                return "warning" if (isinstance(p, (int, float)) and p >= thr) else "info"
+            upsert_world(conn, "cpu.load", "resource", "%.0f%%" % (r["cpu_pct"] or 0), severity=_sev(r["cpu_pct"]))
+            upsert_world(conn, "ram.usage", "resource",
+                         "%.0f%% (%.1f/%.1f Go)" % (r["ram_pct"] or 0, r["ram_used_gb"] or 0, r["ram_total_gb"] or 0),
+                         severity=_sev(r["ram_pct"]))
+            upsert_world(conn, "disk./.usage", "resource",
+                         "%.0f%% (%.0f/%.0f Go)" % (r["disk_pct"] or 0, r["disk_used_gb"] or 0, r["disk_total_gb"] or 0),
+                         severity=_sev(r["disk_pct"]))
+            upsert_world(conn, "swap.usage", "resource", "%.0f%%" % (r["swap_pct"] or 0), severity=_sev(r["swap_pct"], 50))
+            upsert_world(conn, "load.1m", "resource", str(r["load_1m"] or 0))
+        # Services système
+        for r in _q("SELECT name, status FROM system_services LIMIT 120"):
+            nm = (r["name"] or "").strip()
+            if nm:
+                st = (r["status"] or "?")
+                upsert_world(conn, "service.%s" % nm, "service", st,
+                             severity="warning" if st not in ("active", "running", "listening") else "info")
+        # Sites web
+        for r in _q("SELECT domain, php_version, ssl_enabled, status FROM web_sites LIMIT 120"):
+            d = (r["domain"] or "").strip()
+            if d:
+                upsert_world(conn, "web.%s" % d, "web",
+                             "php %s · ssl %s · %s" % (r["php_version"] or "?",
+                             "oui" if r["ssl_enabled"] else "non", r["status"] or "?"))
+        # Certificats SSL (expiration)
+        for r in _q("SELECT domain, days_left FROM ssl_certificates WHERE days_left IS NOT NULL ORDER BY days_left ASC LIMIT 60"):
+            d = (r["domain"] or "").strip()
+            if d:
+                dl = r["days_left"]
+                upsert_world(conn, "ssl.%s" % d, "security", "%s jours" % dl,
+                             severity="warning" if (isinstance(dl, (int, float)) and dl <= 14) else "info")
+        # Ports ouverts
+        for r in _q("SELECT port, process FROM open_ports LIMIT 120"):
+            if r["port"] is not None:
+                upsert_world(conn, "port.%s" % r["port"], "network", r["process"] or "?")
+        # Sysctl sécurité
+        for r in _q("SELECT param, value, status FROM sysctl_security LIMIT 60"):
+            pr = (r["param"] or "").strip()
+            if pr:
+                upsert_world(conn, "security.%s" % pr, "security", "%s (%s)" % (r["value"], r["status"]),
+                             severity="warning" if r["status"] == "critical" else "info")
+        # Flotte (Tailscale)
+        for r in _q("SELECT name, online FROM tailscale_peers LIMIT 60"):
+            nm = (r["name"] or "").strip()
+            if nm:
+                upsert_world(conn, "fleet.%s" % nm, "fleet", "en ligne" if r["online"] else "hors ligne",
+                             severity="info" if r["online"] else "warning")
+        # Conteneurs docker
+        for r in _q("SELECT name, status FROM docker_containers LIMIT 60"):
+            nm = (r["name"] or "").strip()
+            if nm:
+                upsert_world(conn, "docker.%s" % nm, "service", r["status"] or "?")
+        # Unités en échec
+        try:
+            n_failed = conn.execute("SELECT COUNT(*) FROM failed_units WHERE active_state='failed'").fetchone()[0]
+            upsert_world(conn, "systemd.failed_units", "system", str(n_failed),
+                         severity="warning" if n_failed else "info")
+        except Exception:
+            pass
+        # Santé globale
+        h = _q("SELECT score, status FROM health_scores ORDER BY id DESC LIMIT 1")
+        if h:
+            upsert_world(conn, "health.score", "system", "%s/100 (%s)" % (h[0]["score"], h[0]["status"]),
+                         severity="warning" if (h[0]["status"] in ("degraded", "critical")) else "info")
+        conn.commit()
+    except Exception as e:
+        print(f"[WORLD] build: {e}", file=sys.stderr)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ============================================================
 # SOCKET SERVER
 # ============================================================
 def cleanup_socket():
@@ -2713,6 +2856,51 @@ class SharedMemorySocket:
                         client.send(b"[]")
                 else:
                     client.send(b"[]")
+            elif data == "GET_WORLD" or data.startswith("GET_WORLD:"):
+                prefix = data.split(":", 1)[1].strip() if ":" in data else ""
+                try:
+                    conn = get_conn()
+                    if prefix:
+                        rows = conn.execute(
+                            "SELECT wkey, category, value, severity, observed_at FROM world_model "
+                            "WHERE wkey LIKE ? ORDER BY wkey LIMIT 500", (prefix + "%",)).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT wkey, category, value, severity, observed_at FROM world_model "
+                            "ORDER BY wkey LIMIT 800").fetchall()
+                    conn.close()
+                    client.send(json.dumps([dict(r) for r in rows]).encode())
+                except Exception:
+                    client.send(b"[]")
+            elif data.startswith("QUERY_WORLD:"):
+                term = data.split(":", 1)[1].strip()
+                try:
+                    conn = get_conn()
+                    like = "%" + term + "%"
+                    rows = conn.execute(
+                        "SELECT wkey, category, value, severity, observed_at FROM world_model "
+                        "WHERE wkey LIKE ? OR value LIKE ? ORDER BY (severity='warning') DESC, wkey LIMIT 60",
+                        (like, like)).fetchall()
+                    conn.close()
+                    client.send(json.dumps([dict(r) for r in rows]).encode())
+                except Exception:
+                    client.send(b"[]")
+            elif data == "GET_CHANGES" or data.startswith("GET_CHANGES:"):
+                since = data.split(":", 1)[1].strip() if ":" in data else ""
+                try:
+                    conn = get_conn()
+                    if since:
+                        rows = conn.execute(
+                            "SELECT ts, entity_type, entity_name, change_type, old_value, new_value, severity "
+                            "FROM changelog WHERE ts >= ? ORDER BY id DESC LIMIT 100", (since,)).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT ts, entity_type, entity_name, change_type, old_value, new_value, severity "
+                            "FROM changelog ORDER BY id DESC LIMIT 50").fetchall()
+                    conn.close()
+                    client.send(json.dumps([dict(r) for r in rows]).encode())
+                except Exception:
+                    client.send(b"[]")
             else:
                 client.send(b"ERROR")
         except Exception as e:
@@ -2769,6 +2957,7 @@ class KnowledgeCollector:
         self._last_dns_servers = []
         self.last_vacuum       = 0    # [EVO2] dernier run retention vacuum
         self.last_config_check = 0    # [EVO4] dernier snapshot config
+        self.last_world        = 0    # [SENSORIUM] dernière construction du world model
 
     # PERF[O6]: _run_parallel() — collecteurs indépendants exécutés en parallèle.
     # Avant : 25+ collecteurs séquentiels = somme de toutes les latences (subprocess, réseau).
@@ -2888,6 +3077,12 @@ class KnowledgeCollector:
         )
         save_health_score(health)
 
+        # [SENSORIUM] Première construction du modèle du monde, prêt dès le démarrage
+        try:
+            build_world_model()
+        except Exception as _we:
+            print(f"[WORLD] build initial: {_we}", file=sys.stderr)
+
         elapsed = round(time.time() - t0, 1)
         print(f"[COLLECTOR] ✅ PRÊT en {elapsed}s — Socket: {SOCKET_PATH}")
 
@@ -2898,6 +3093,11 @@ class KnowledgeCollector:
                 if now - self.last_metrics >= 5:
                     save_metrics(collect_metrics())
                     self.last_metrics = now
+
+                # [SENSORIUM] Reconstruit le modèle du monde (état grounded) toutes les 30s
+                if now - self.last_world >= 30:
+                    threading.Thread(target=build_world_model, daemon=True).start()
+                    self.last_world = now
 
                 # [EVO2] Rétention vacuum — toutes les heures (thread daemon)
                 if now - self.last_vacuum >= 3600:
