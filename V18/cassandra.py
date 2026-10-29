@@ -74147,14 +74147,14 @@ def _dns_norm(typ: str, val: str) -> str:
 
 def _dns_protege(nom: str) -> str:
     """Pourquoi Cassandra ne touche JAMAIS à ce nom ('' si elle peut). Décision de Drisse (10-11) : www.cassandra.center renvoie vers Athena
-    (Dolibarr), pas vers Orion ; le courrier de app.cassandra.center et de administration@maisonboheme.org est routé par Cloudflare vers OVH."""
+    (Dolibarr), pas vers Orion ; le courrier de app.cassandra.center et de administration@exemple.org est routé par Cloudflare vers OVH."""
     nom = str(nom or "").lower().strip(".")
     listes = {x.strip().lower() for x in str(_mem_cfg("dns_ne_pas_toucher", "www.cassandra.center") or "").split(",") if x.strip()}
     if nom in listes:
         return "« %s » est réservé (il ne pointe pas sur Orion)" % nom
     etiquette = nom.split(".")[0]
     # Le courrier de cassandra.center est LIBRE (Drisse, 10-11 : « j'ai plus de MX, on peut exploiter le mail ») ; celui des autres domaines
-    # (maisonboheme.org : OVH) reste intouchable. Réglage : dns_courrier_libre.
+    # (exemple.org : OVH) reste intouchable. Réglage : dns_courrier_libre.
     libres = {x.strip().lower() for x in str(_mem_cfg("dns_courrier_libre", "cassandra.center") or "").split(",") if x.strip()}
     if _dom_enregistre(nom) in libres:
         return ""

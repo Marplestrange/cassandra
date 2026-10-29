@@ -151,7 +151,7 @@ const MISSIONS = [
    p: "Trivy : 7 failles critiques dans l’image ; la version publiée en corrige 3.",
    e: [["f", "sauvegarde de la base (508 secrets, intègre)"], ["f", "nouvelle image"], ["f", "redémarrage"], ["f", "santé : healthy"], ["f", "coffre déverrouillé, 15 secrets lus"]],
    pied: "critiques 7 → 4 · défaire possible 30 jours (image et base gardées)"},
-  {etat: "fait", h: "06:01", t: "Fermer /xmlrpc.php sur maisonboheme.org", qui: "Cassandra",
+  {etat: "fait", h: "06:01", t: "Fermer /xmlrpc.php sur exemple.org", qui: "Cassandra",
    p: "61 906 appels en 10 jours : la porte de la force brute contre WordPress. Aucune extension du site ne s’en sert.",
    e: [["f", "copie du réglage nginx"], ["f", "règle posée"], ["f", "nginx -t : réussi"], ["f", "xmlrpc → 403, accueil → 200"]],
    pied: "les appels restent au journal (fail2ban, CrowdSec, diagrammes)"},
@@ -169,13 +169,13 @@ const MISSIONS = [
    p: "3 failles critiques dans Authentik (PyJWT, anyio, libxml2), à corriger par l’éditeur. Exposé sur Internet : priorité.",
    e: [["c", "surveille les versions publiées"], ["a", "dès la sortie : sauvegarde, mise à jour, test de connexion"]],
    pied: "Itare rend compte à Cassandra, qui décide"},
-  {etat: "plan", h: "dim. 04:00", t: "Freiner meta-externalagent sur maisonboheme.org", qui: "Cassandra",
+  {etat: "plan", h: "dim. 04:00", t: "Freiner meta-externalagent sur exemple.org", qui: "Cassandra",
    p: "92 % du trafic du site vient de robots, 63 % d’un seul. Elle mesure une semaine de plus avant de limiter son débit.",
    e: [["a", "mesure de référence"], ["a", "limite de débit nginx"], ["a", "vérifier que les humains passent"]], pied: ""}
 ];
 const JOURNAL = [
   {h: "06:28", qui: "root", par: "SSH depuis Hermès · Claude Code", quoi: "Déploiement de Cassandra (deploy.sh) — 3 fois depuis 05:34", type: "humain"},
-  {h: "06:01", qui: "root", par: "SSH depuis Hermès · Claude Code", quoi: "nginx : maisonboheme.org.includes modifié (bloc /xmlrpc.php), nginx rechargé", type: "humain",
+  {h: "06:01", qui: "root", par: "SSH depuis Hermès · Claude Code", quoi: "nginx : exemple.org.includes modifié (bloc /xmlrpc.php), nginx rechargé", type: "humain",
    arb: ["garde", "va dans le sens de sa politique (chemin sondé 61 906 fois) ; elle l’ajoute à ses règles"]},
   {h: "05:03", qui: "Cassandra", par: "moteur d’évolution", quoi: "Quarantaine de vault_native_get_pour_agent", type: "cassandra"},
   {h: "04:56", qui: "Drisse", par: "écran de Cassandra", quoi: "Sensorium : Trivy accepté jusqu’à hausse des critiques", type: "humain",

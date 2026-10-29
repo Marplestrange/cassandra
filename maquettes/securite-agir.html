@@ -180,7 +180,7 @@ const JOURS = [["29-09",3859,386],["30-09",29094,2],["01-10",4304,152],["02-10",
   ["06-10",4208,433],["07-10",7658,324],["08-10",5728,1160],["09-10",5057,247],["10-10",284,11]];
 const IPS = [["203.0.113.11", 10001, "le 30-09 seulement"], ["203.0.113.12", 4725, "07-10 17 h · Google Cloud"], ["203.0.113.15", 4725, "07-10 17 h · Google Cloud"],
   ["203.0.113.13", 4725, "07-10 17 h"], ["203.0.113.14", 1601, "un jour"]];
-const CHEMINS = [["/xmlrpc.php", 61906, "fermé le 10-10 sur maisonboheme.org"], ["/.git", 558], ["/.env", 370], ["/api", 321], ["/@fs", 266], ["/cgi-bin", 251], ["/.env.local", 194]];
+const CHEMINS = [["/xmlrpc.php", 61906, "fermé le 10-10 sur exemple.org"], ["/.git", 558], ["/.env", 370], ["/api", 321], ["/@fs", 266], ["/cgi-bin", 251], ["/.env.local", 194]];
 const NS = "http://www.w3.org/2000/svg", tip = document.getElementById("tip"), menuEl = document.getElementById("menu");
 const el = (n, a, p) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); if (p) p.appendChild(e); return e; };
 const fr = n => n.toLocaleString("fr-FR");
@@ -303,7 +303,7 @@ function chemins(){
     const v = el("text", {x: x0 + l + 6, y: y + 13, class: "val"}, s); v.textContent = fr(c[1]) + (coupe ? " ↑" : "") + (c[2] ? " · fermé" : "");
     survol(g, "<b>" + c[0] + "</b><br>" + fr(c[1]) + " appels" + (c[2] ? "<br>" + c[2] : "") + "<br><i>clic : agir</i>");
     g.addEventListener("click", e => menu(e, c[0], [["Fermer sur tous les sites", () => direct("Fermer " + c[0] + " partout", "nginx : règle posée, testée, rechargée · accueils contrôlés", "vu. Je l’ajoute à mes chemins fermés et je surveille qu’aucun site n’en souffre.")],
-      ["Fermer sur maisonboheme.org", () => direct("Fermer " + c[0] + " sur maisonboheme.org", "nginx : règle posée, testée, rechargée", "vu.")], ["Cassandra, ce chemin sert-il à un de mes sites ?", () => demander("Ce qu’ils cherchent", "Est-ce que " + c[0] + " sert à un de mes sites ?"), "c"]]));
+      ["Fermer sur exemple.org", () => direct("Fermer " + c[0] + " sur exemple.org", "nginx : règle posée, testée, rechargée", "vu.")], ["Cassandra, ce chemin sert-il à un de mes sites ?", () => demander("Ce qu’ils cherchent", "Est-ce que " + c[0] + " sert à un de mes sites ?"), "c"]]));
   });
 }
 function lignes(){
@@ -317,10 +317,10 @@ function lignes(){
     ["ok", "RÉSEAU", "DNS local (53)", "le réseau de la maison", B("Fermer", "demander('Qui peut joindre quoi','Ferme le DNS local au réseau.')", "d")],
     ["ok", "PARC", "Grafana (3000)", "le parc et Tailscale", B("Limiter à la machine", "direct('Limiter Grafana à la machine', 'écoute sur 127.0.0.1, redémarré, contrôlé', 'vu. Mis à jour sur ma carte d’exposition.')", "direct") + B("Arrêter", "direct('Arrêter Grafana', 'service arrêté et désactivé', 'vu. Prometheus l’alimentait encore : je le garde, je te dirai s’il devient inutile.')", "d direct")],
     ["ok", "PARC", "avahi (5353)", "découverte réseau · sensible", B("Arrêter", "direct('Arrêter avahi', 'service arrêté et désactivé', 'vu. Plus de découverte réseau d’Orion.')", "d direct")]]);
-  R("robots", [["warn", "92 %", "maisonboheme.org", "1,4 M requêtes de robots · meta-externalagent en tête", B("Freiner ce robot", "direct('Freiner meta-externalagent', 'nginx : 1 requête/s pour ce robot sur maisonboheme.org', 'vu. Je mesure l’effet une semaine : si le trafic des humains bouge, je te le dis.')", "direct") + B("Bloquer", "direct('Bloquer meta-externalagent', 'nginx : 403 pour ce robot', 'vu. C’est le robot qui collecte pour l’IA de Meta ; les aperçus de liens Facebook (facebookexternalhit) ne sont pas touchés.')", "d direct")],
+  R("robots", [["warn", "92 %", "exemple.org", "1,4 M requêtes de robots · meta-externalagent en tête", B("Freiner ce robot", "direct('Freiner meta-externalagent', 'nginx : 1 requête/s pour ce robot sur exemple.org', 'vu. Je mesure l’effet une semaine : si le trafic des humains bouge, je te le dis.')", "direct") + B("Bloquer", "direct('Bloquer meta-externalagent', 'nginx : 403 pour ce robot', 'vu. C’est le robot qui collecte pour l’IA de Meta ; les aperçus de liens Facebook (facebookexternalhit) ne sont pas touchés.')", "d direct")],
     ["ok", "27 %", "auth.cassandra.center", "2 439 requêtes", B("Expliquer", "demander('Robots et humains','Pourquoi 27 % de robots sur auth ?')")]]);
   R("courriel", [["warn", "SPF", "cassandra.center", "souple, sans cette machine", B("Corriger", "scenario('audit')")],
-    ["danger", "DKIM", "maisonboheme.org", "aucune signature (OVH)", B("Me guider", "demander('Courriel et certificats','Comment activer DKIM chez OVH ?')")],
+    ["danger", "DKIM", "exemple.org", "aucune signature (OVH)", B("Me guider", "demander('Courriel et certificats','Comment activer DKIM chez OVH ?')")],
     ["warn", "DMARC", "les 2 domaines", "en surveillance seulement", B("Passer en quarantaine", "scenario('audit')")],
     ["ok", "79 j", "certificats", "6 domaines · Let’s Encrypt", B("Renouveler maintenant", "direct('Renouveler les certificats', 'Let’s Encrypt : 6 domaines, sites contrôlés', 'vu.')", "direct")]]);
 }

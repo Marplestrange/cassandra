@@ -12,7 +12,7 @@ logpath  = /var/www/*/data/logs/*-frontend.access.log
 maxretry = 3
 findtime = 1h
 bantime  = 1d
-ignoreip = 127.0.0.1/8 ::1 192.168.1.0/24 100.64.0.0/10 fd7a:115c:a1e0::/48 198.51.100.7
+ignoreip = 127.0.0.1/8 ::1 192.168.1.0/24 100.64.0.0/10 fd7a:115c:a1e0::/48
 
 [cassandra-connexions]
 # Cassandra et le coffre : 8 refus en 30 min (Cassandra freine déjà par elle-même, et un humain se trompe), 6 h.
@@ -23,7 +23,7 @@ logpath  = /var/www/*/data/logs/*-frontend.access.log
 maxretry = 8
 findtime = 30m
 bantime  = 6h
-ignoreip = 127.0.0.1/8 ::1 192.168.1.0/24 100.64.0.0/10 fd7a:115c:a1e0::/48 198.51.100.7
+ignoreip = 127.0.0.1/8 ::1 192.168.1.0/24 100.64.0.0/10 fd7a:115c:a1e0::/48
 
 [cassandra-sondes]
 enabled  = true
@@ -33,4 +33,4 @@ logpath  = /var/www/*/data/logs/*-frontend.access.log
 maxretry = 2
 findtime = 1h
 bantime  = 1d
-ignoreip = 127.0.0.1/8 ::1 192.168.1.0/24 100.64.0.0/10 fd7a:115c:a1e0::/48 198.51.100.7
+ignoreip = 127.0.0.1/8 ::1 192.168.1.0/24 100.64.0.0/10 fd7a:115c:a1e0::/48

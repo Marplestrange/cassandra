@@ -1230,9 +1230,9 @@ def _init_bookstack_config():
     cfg = get_cassandra_config()
     changed = False
     defaults = {
-        "bookstack_url":          "https://administration.cassandra.center",
-        "bookstack_token_id":     "RETIRE",
-        "bookstack_token_secret": "RETIRE",
+        "bookstack_url":          "",
+        "bookstack_token_id":     "",
+        "bookstack_token_secret": "",
     }
     for k, v in defaults.items():
         if not cfg.get(k):

@@ -157,7 +157,7 @@ table{border-collapse:collapse;width:100%;margin-top:6px} td,th{padding:3px 6px;
       <h2>Ce qu’ils cherchent</h2>
       <p class="sous">Les chemins les plus sondés, 10 jours.</p>
       <svg id="chemins" viewBox="0 0 520 230" width="100%" role="img" aria-label="Chemins sondés"></svg>
-      <div class="trouvaille"><b>Trouvaille :</b> /xmlrpc.php — 61 906 appels sur maisonboheme.org. C’est la porte de la force brute contre WordPress (des centaines de mots de passe par requête). Le couper dans nginx ne gêne pas le site.</div>
+      <div class="trouvaille"><b>Trouvaille :</b> /xmlrpc.php — 61 906 appels sur exemple.org. C’est la porte de la force brute contre WordPress (des centaines de mots de passe par requête). Le couper dans nginx ne gêne pas le site.</div>
     </section>
     <section class="carte">
       <h2>Robots et humains</h2>
@@ -202,7 +202,7 @@ table{border-collapse:collapse;width:100%;margin-top:6px} td,th{padding:3px 6px;
     <section class="carte tuile"><h2>fail2ban</h2><div class="chiffre">5</div><div class="lib">prisons · 24 bannissements depuis le démarrage · 0 en cours</div><span class="pastille ok">ACTIF</span></section>
   </div>
 
-  <div class="mq"><b>À trancher sur cette maquette :</b> l’ordre des cartes et celles à retirer ; garder ou non l’indice chiffré ; couper /xmlrpc.php sur maisonboheme.org (trouvaille de cette maquette) ; la période des attaques (12 jours = ce que gardent les journaux nginx ; Cassandra peut garder plus en les relevant chaque nuit).</div>
+  <div class="mq"><b>À trancher sur cette maquette :</b> l’ordre des cartes et celles à retirer ; garder ou non l’indice chiffré ; couper /xmlrpc.php sur exemple.org (trouvaille de cette maquette) ; la période des attaques (12 jours = ce que gardent les journaux nginx ; Cassandra peut garder plus en les relevant chaque nuit).</div>
 </div>
 <div class="tip" id="tip"></div>
 
@@ -325,7 +325,7 @@ function lynis(){
 // ── les indices ────────────────────────────────────────────────────────────
 const KPI = [["3", "ports ouverts sur Internet", "80, 443 (sites) · 49153 (Plex)", "ok"],
   ["773", "adresses attaquantes", "10 jours · les 10 plus actives font 45 %", "warn"],
-  ["79 j", "avant le 1er certificat", "coffre et maisonboheme.org", "ok"],
+  ["79 j", "avant le 1er certificat", "coffre et exemple.org", "ok"],
   ["2 / 6", "contrôles courriel au vert", "SPF, DKIM, DMARC × 2 domaines", "warn"],
   ["0", "correctif en attente", "correctifs automatiques chaque nuit", "ok"],
   ["4 / 4", "gardiens en service", "Lynis, Trivy, ClamAV, CrowdSec", "ok"]];
@@ -369,13 +369,13 @@ function chemins(){
     ["/cgi-bin", 251], ["/.env.local", 194], ["/.env.production", 190]], 1200, "var(--s1)", "", 130);
 }
 function robots(){
-  hbarres("robots", [["maisonboheme.org", 92, "", "92 %", "1 565 262 requêtes, dont 1 446 651 de robots"], ["auth", 27, "", "27 %", "2 439 requêtes"],
+  hbarres("robots", [["exemple.org", 92, "", "92 %", "1 565 262 requêtes, dont 1 446 651 de robots"], ["auth", 27, "", "27 %", "2 439 requêtes"],
     ["coffre", 2, "", "2 %", "4 651 requêtes"], ["app", 1, "", "1 %", "171 119 requêtes"], ["search", 1, "", "1 %", "5 801 requêtes"], ["omniroute", 0, "", "0 %", "87 194 requêtes"]],
     100, "var(--s2)", "", 130);
 }
 function certs(){
   const s = document.getElementById("certs"); s.innerHTML = "";
-  const C = [["coffre", 79], ["maisonboheme.org", 79], ["app", 81], ["search", 82], ["omniroute", 83], ["auth", 85]], x0 = 130, w = 330, max = 90;
+  const C = [["coffre", 79], ["exemple.org", 79], ["app", 81], ["search", 82], ["omniroute", 83], ["auth", 85]], x0 = 130, w = 330, max = 90;
   [21, 30].forEach(j => { const x = x0 + w * j / max; el("line", {x1: x, x2: x, y1: 0, y2: 168, stroke: j === 21 ? "var(--danger)" : "var(--txt-faint)", "stroke-dasharray": "3 3", "stroke-opacity": .6}, s);
     const t = el("text", {x, y: 184, "text-anchor": "middle"}, s); t.textContent = j + " j"; });
   C.forEach((c, i) => { const y = 4 + i * 27, l = w * c[1] / max;
@@ -386,7 +386,7 @@ function certs(){
 }
 function courriel(){
   const C = [["cassandra.center", ["warn", "souple, sans cette machine"], ["ok", "signé (dkim)"], ["warn", "surveillance seule"]],
-             ["maisonboheme.org", ["ok", "souple (~all)"], ["danger", "aucune signature"], ["warn", "surveillance seule"]]];
+             ["exemple.org", ["ok", "souple (~all)"], ["danger", "aucune signature"], ["warn", "surveillance seule"]]];
   const ic = {ok: "✓", warn: "!", danger: "✕"};
   document.getElementById("courriel").innerHTML = '<div></div><div class="h">SPF</div><div class="h">DKIM</div><div class="h">DMARC</div>' +
     C.map(d => '<div class="d">' + d[0] + '</div>' + d.slice(1).map(c => '<div class="cel ' + c[0] + '"><i>' + ic[c[0]] + '</i>' + c[1] + '</div>').join("")).join("");
