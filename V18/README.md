@@ -6,6 +6,72 @@ local. Cassandra tient la machine ; Itare, son agent second, relit, veille et pr
 
 Licence : [AGPL-3.0-or-later](LICENSE). Copyright (C) 2026 Drisse ATEK.
 
+> **V18 est la version de production.** Une réécriture modulaire, la V19 (un noyau et des modules), est développée à côté, dans le dépôt
+> [cassandra-v19](https://github.com/Marplestrange/cassandra-v19). Ce dépôt garde l'histoire de Cassandra, version après version.
+
+## Ce que fait Cassandra
+
+Cassandra est un administrateur système qui ne dort pas. Elle tourne sur votre serveur, voit ce qui s'y passe et le comprend,
+agit quand c'est sûr, et vous le raconte. Vous lui parlez comme à une personne ; elle répond en regardant la machine, pas en devinant.
+
+**Elle voit.** Un collecteur à part (basse priorité) relève en continu l'état de la machine : processeur, mémoire, disque, services,
+conteneurs, ports ouverts, connexions, journaux, certificats, versions de PHP, tâches planifiées, sauvegardes. Elle en garde l'historique.
+
+**Elle comprend.** Une anomalie n'est pas une alerte de plus : elle recoupe les signaux (un disque qui se remplit, un service qui
+redémarre, des visites suspectes) avant de conclure. La page *Proactivité* montre ce qu'elle a vu, ce
+qu'elle a fait, ce qu'elle propose.
+
+**Elle agit, dans une cage.** Chaque geste passe par un catalogue explicite, avec ses gardes et, quand c'est possible, son retour
+arrière :
+
+| Domaine | Ce qu'elle peut faire |
+|---|---|
+| Système | correctifs de sécurité et mises à jour automatiques, verrouiller SSH, arrêter les services inutiles, redémarrer un service (statut vérifié après coup), installer ou retirer un paquet, vider des caches |
+| Réseau | bannir ou débannir une adresse ou un pays (jamais la maison, le tailnet ni les adresses de confiance), liste blanche, fermer ou rouvrir un chemin nginx, freiner ou bloquer un robot, ouvrir ou fermer le pare-feu **à l'essai** (retour automatique) |
+| Conteneurs | mettre à jour une image (retour automatique si elle devient « unhealthy »), Docker Compose dans des dossiers connus |
+| Base de données | lire les connexions MySQL et en tuer une |
+| Sécurité | lancer un scan (ClamAV, Lynis, Trivy, CrowdSec) parmi une liste blanche d'outils, fermer une session SSH |
+| Flotte | joindre d'autres machines (SSH, SFTP vers un dépôt borné) |
+
+Un geste dangereux ou irréversible reste à l'humain : tout ce qui est derrière le mot de passe maître, une confirmation explicite,
+ou simplement absent des catalogues des agents. Ce que Cassandra lit sur le web ou dans un courriel est une **donnée**, jamais une
+consigne. L'inventaire exact de ce que les agents font, peuvent et ne peuvent pas faire est dans
+[docs/INVENTAIRE_AUTONOMIE.md](docs/INVENTAIRE_AUTONOMIE.md).
+
+**Elle se souvient.** Une mémoire à part, dans sa propre base, qu'elle consulte avant de répondre ; l'onglet *Mémoire* montre ce qu'elle sait.
+
+**Elle se corrige.** Un onglet *Évolution* sert à proposer et éprouver des variantes de son propre comportement avant de les adopter.
+
+## Itare, l'agent second
+
+Itare ne touche pas à la machine. Il relit, veille et propose, et il sert le **bureau** de chaque personne : son courrier, ses
+projets, son agenda, ses documents. Ses outils sont confinés à l'espace du compte qui l'appelle. Sa vigie autonome **ne déclenche
+rien** : elle signale. Cassandra et Itare peuvent se parler dans un **salon** (fils de travail avec un budget qui borne les échanges
+entre agents). Les rôles et leurs modèles sont décrits dans [docs/PROFILS_ITARE.md](docs/PROFILS_ITARE.md).
+
+## L'interface
+
+Une application web unique (servie par `cassandra.py`), avec un onglet par domaine :
+
+| Onglet | Rôle |
+|---|---|
+| Vue d'ensemble, Dashboard | l'état de la machine et de ses services d'un coup d'œil |
+| Proactivité | ce qu'elle a vu, fait et propose ; les autonomies réglables |
+| Sensorium, Historique | les mesures en continu et leur mémoire |
+| Sécurité | les gestes, les audits, le pare-feu |
+| Hébergement, Mes sites | le panneau d'hébergement (FastPanel pris en charge), les sites suivis |
+| Flotte | le parc de machines (Tailscale, SSH) |
+| Tâches planifiées | tout ce qui tourne tout seul, et si ça va |
+| Coffre | les secrets (Vaultwarden) |
+| Salon, Journal | les conversations entre personnes et agents, le journal des consultations |
+| Mémoire | ce que Cassandra sait, et comment elle le sait |
+| Bureau | l'espace de chaque compte : courrier, agenda, projets, documents, notes |
+| Évolution | l'auto-évolution contrôlée |
+| Réglages | modèles, modules, comptes, alertes |
+
+Les comptes sont **cloisonnés** : chacun ne voit que ses propres données ; l'administrateur
+gère les comptes mais ne lit pas le bureau des autres.
+
 ## Pré-requis
 
 - Debian 12 ou Ubuntu 22.04 / 24.04, avec `systemd` et `apt` ; root.
@@ -17,7 +83,7 @@ Licence : [AGPL-3.0-or-later](LICENSE). Copyright (C) 2026 Drisse ATEK.
   services, certificats, tâches planifiées, versions PHP). Plesk, cPanel, HestiaCP,
   DirectAdmin et Webmin sont détectés et signalés.
 
-## Les trois commandes
+## Installer et mettre à jour
 
 ```bash
 sudo bash install.sh
@@ -26,12 +92,6 @@ Installe tout, crée les services, démarre Cassandra sur `127.0.0.1:9000`. Le s
 questions au plus (Ollama en local ? Tailscale ?) ; chacune se force par variable
 d'environnement pour une installation sans écran : `WITH_OLLAMA=0 WITH_TAILSCALE=0 WITH_VAULT=0
 ENABLE_SEMANTIC=0 WITH_SEARXNG=0 sudo -E bash install.sh` donne l'installation allégée.
-
-```bash
-sudo bash banc-nu.sh
-```
-Prouve, dans un conteneur Debian vierge, que Cassandra s'installe et fonctionne sur un serveur
-nu, sans clé ni panneau (Docker requis, cinq à dix minutes).
 
 ```bash
 sudo bash deploy.sh
@@ -58,6 +118,14 @@ Les réglages, leurs défauts et les variables d'environnement sont décrits dan
 [CONFIG.md](CONFIG.md) ; un exemple de fichier de configuration dans
 [config.example.json](config.example.json).
 
+## Les produits tiers (tous facultatifs)
+
+Chacun se détecte au démarrage et s'absente proprement : pas d'onglet, pas d'outil, pas de tâche s'il manque.
+
+FastPanel (et les autres panneaux, détectés), Tailscale (la Flotte), Vaultwarden (le coffre), SearxNG (la recherche web),
+Ollama (les modèles locaux), Telegram (les notifications par compte), Plex et Canva. L'état de chacun se lit dans
+Réglages › Modules.
+
 ## Ce que contient ce dépôt
 
 | Fichier | Rôle |
@@ -65,8 +133,21 @@ Les réglages, leurs défauts et les variables d'environnement sont décrits dan
 | `cassandra.py` | l'application entière : serveur web, agent, mémoire, cage d'exécution, salon des agents, modules |
 | `cassandra_knowledge_collector.py` | le collecteur d'état de la machine (service à part, basse priorité) |
 | `install.sh`, `deploy.sh` | installation et mise à jour |
-| `banc-nu.sh`, `banc_genericite.py` | les deux bancs de publication |
-| `docs/` | l'exemple nginx, les documents de conception |
+| `tools/` | les outils de sécurité appelés par la cage |
+| `docs/` | l'exemple nginx, l'inventaire de l'autonomie, les profils d'Itare, les documents de conception |
+
+## Et après
+
+La V18 est un seul fichier de plus de 150 000 lignes : elle a fait ses preuves, mais elle ne se prête ni à l'ouverture à d'autres
+développeurs ni à une évolution maîtrisée. La **V19** en reprend les idées dans un noyau minuscule et des modules qui se déclarent
+par un manifeste, avec les mêmes garanties (preuve, retour arrière, cloisonnement) tenues par le noyau plutôt que par chaque
+fonction. Ce dépôt est la version de production ; la V19 est son successeur.
+
+## Qui porte le projet
+
+Cassandra est portée par **La Maison Bohème**, association loi 1901 (SIREN 899 553 093, RNA W751260323), qui accepte les dons. Les dons ouvrent
+droit à une réduction d'impôt de 66 % de leur montant, dans les limites fixées par la loi. Pour soutenir le projet, écrivez à
+marplestrange@cassandra.center.
 
 Cassandra est un logiciel indépendant, sans affiliation avec les produits tiers qu'elle sait
 lire ou piloter (FastPanel, Tailscale, Vaultwarden, SearxNG, Telegram, Canva, Plex).
