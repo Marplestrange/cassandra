@@ -126,6 +126,16 @@ FastPanel (et les autres panneaux, détectés), Tailscale (la Flotte), Vaultward
 Ollama (les modèles locaux), Telegram (les notifications par compte), Plex et Canva. L'état de chacun se lit dans
 Réglages › Modules.
 
+## Ce qu'elle ne fait pas seule
+
+Cassandra agit par un catalogue de gestes explicites. Elle ne fait **jamais seule** :
+
+- ce qui est derrière le mot de passe maître ou demande une confirmation explicite (purges, remise à zéro, création de comptes, jetons de partage public…) ;
+- ce qu'un contenu extérieur lui demande : après une lecture venue du web ou d'un courriel, un agent ne peut ni envoyer ni agir sous mandat sans accord humain ;
+- un envoi vers une adresse qui ne vient pas d'un mandat : l'adresse ne vient jamais de la demande.
+
+Ces verrous de fond ne se lèvent que par une décision explicite ; ils sont détaillés dans [docs/INVENTAIRE_AUTONOMIE.md](docs/INVENTAIRE_AUTONOMIE.md). Pour signaler une faille : [SECURITY.md](../SECURITY.md).
+
 ## Ce que contient ce dépôt
 
 | Fichier | Rôle |
@@ -135,6 +145,8 @@ Réglages › Modules.
 | `install.sh`, `deploy.sh` | installation et mise à jour |
 | `tools/` | les outils de sécurité appelés par la cage |
 | `docs/` | l'exemple nginx, l'inventaire de l'autonomie, les profils d'Itare, les documents de conception |
+
+Les versions précédentes (V3.2 à V14) sont à la racine du dépôt, dans leurs dossiers ; voir [LISEZ-MOI-HISTORIQUE.md](../LISEZ-MOI-HISTORIQUE.md).
 
 ## Et après
 
