@@ -46,6 +46,8 @@ indépendants, chacun avec son manifeste, ses droits et ses tests). Pour une id�
 
 ## Qui porte le projet
 
+<p align="center"><img src="assets/logo-maison-boheme.png" alt="Logo de La Maison Bohème" width="180"></p>
+
 Cassandra est portée par **La Maison Bohème**, association loi 1901 (SIREN 899 553 093, RNA W751260323), qui accepte les dons et délivre des reçus fiscaux. Les dons
 ouvrent droit à une réduction d'impôt de 66 % de leur montant, dans les limites fixées par la loi. Pour soutenir le projet, écrivez à
 marplestrange@cassandra.center.
