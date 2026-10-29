@@ -14,6 +14,14 @@ Licence : [AGPL-3.0-or-later](LICENSE). Copyright (C) 2026 Drisse ATEK.
 | **V19** | la réécriture modulaire (un noyau minuscule, des modules qui se déclarent par un manifeste), développée à côté | dépôt [cassandra-v19](https://github.com/Marplestrange/cassandra-v19) |
 | V3.2 à V14 | l'histoire : les versions successives, de l'agent minimal au tableau de bord complet | dossiers `V3.2` … `V14`, voir [`LISEZ-MOI-HISTORIQUE.md`](LISEZ-MOI-HISTORIQUE.md) |
 
+## Aperçu
+
+La V18 en service (noms, adresses et domaines remplacés par des exemples).
+
+![La vue d'ensemble : le verdict du matin, les compteurs, ce qui demande un geste](assets/captures/vue-d-ensemble.jpg)
+
+![La proactivité : le fil de ce que Cassandra a vu, fait et propose](assets/captures/proactivite.jpg)
+
 ## Démarrer
 
 Avec la V18, sur un serveur Debian 12 ou Ubuntu 22.04 / 24.04, en root :
