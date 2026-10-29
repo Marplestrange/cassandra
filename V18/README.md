@@ -118,6 +118,14 @@ Les réglages, leurs défauts et les variables d'environnement sont décrits dan
 [CONFIG.md](CONFIG.md) ; un exemple de fichier de configuration dans
 [config.example.json](config.example.json).
 
+## Le coffre des secrets : Vaultwarden
+
+Les secrets (clés d'API, mots de passe de boîtes, jetons) ne vont ni dans la mémoire de Cassandra ni dans ses journaux : ils vont dans un **coffre Vaultwarden**,
+l'implémentation libre et légère du serveur **Bitwarden**, hébergée sur votre serveur (installée avec Cassandra en Docker, ou désactivée avec `WITH_VAULT=0`).
+Chaque personne a son propre coffre ; un secret ne se lit qu'à la demande et chaque lecture est inscrite au journal. Un agent qui croise un secret dans une conversation
+est invité à le ranger dans le coffre plutôt qu'à le garder. Pour une organisation, la V19 ajoute un coffre par société, avec rôles et collections
+([cassandra-v19](https://github.com/Marplestrange/cassandra-v19)).
+
 ## Les produits tiers (tous facultatifs)
 
 Chacun se détecte au démarrage et s'absente proprement : pas d'onglet, pas d'outil, pas de tâche s'il manque.
