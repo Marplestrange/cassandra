@@ -163,6 +163,10 @@ développeurs ni à une évolution maîtrisée. La **V19** en reprend les idées
 par un manifeste, avec les mêmes garanties (preuve, retour arrière, cloisonnement) tenues par le noyau plutôt que par chaque
 fonction. Ce dépôt est la version de production ; la V19 est son successeur.
 
+## Les clés du registre de modules (V19)
+
+La V19 installe ses modules depuis un [registre officiel signé](https://github.com/Marplestrange/cassandra-registre). Empreintes (SHA-256 de la clé publique) de ses deux clés racine, à comparer à celles publiées dans ce dépôt-là : principale `b8480dd60c5fb3c58a78b96c1adb3e9ecf2f82dc9deae60ed174fbbfa8e5e40b`, secours `d40407cfa327559acd7fbd6d867690417cfd77e36efe423ba99ce04c8181d4ae`.
+
 ## Qui porte le projet
 
 Cassandra est portée par **La Maison Bohème**, association loi 1901 (SIREN 899 553 093, RNA W751260323), qui accepte les dons. Les dons ouvrent
