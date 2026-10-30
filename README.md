@@ -1,5 +1,12 @@
 # Cassandra
 
+[![Licence AGPL-3.0](https://img.shields.io/badge/licence-AGPL--3.0-blue)](LICENSE)
+![Version de production](https://img.shields.io/badge/V18-production-2e7d32)
+![Auto-hébergée](https://img.shields.io/badge/auto--h%C3%A9berg%C3%A9e-oui-2e7d32)
+[![Successeur : V19](https://img.shields.io/badge/successeur-V19-8e6cf0)](https://github.com/Marplestrange/cassandra-v19)
+
+*English summary: [`README.en.md`](README.en.md).*
+
 **Une agente IA souveraine d'administration système.** Elle tourne sur votre serveur, voit ce qui s'y passe, le comprend, agit quand c'est sûr — dans une cage, avec
 un retour arrière quand c'est possible — et vous le raconte. Vous lui parlez comme à une personne ; elle répond en regardant la machine, pas en devinant.
 Elle ne dépend d'aucun fournisseur unique : une clé d'API, un serveur compatible OpenAI, ou Ollama en local.
@@ -32,6 +39,22 @@ sudo bash V18/install.sh
 
 Cassandra écoute alors sur `127.0.0.1:9000` ; l'assistant du premier lancement crée le compte administrateur et branche le modèle d'IA. Les prérequis, les options
 d'installation, les trois façons d'y accéder et la mise à jour sont décrits dans [`V18/README.md`](V18/README.md).
+
+## Le chemin d'un geste
+
+```mermaid
+flowchart LR
+    A["Une demande,<br>ou ce que Cassandra a vu"] --> B["Le catalogue des gestes :<br>existe-t-il, et pour qui ?"]
+    B -->|absent ou derrière le mot de passe maître| H["Elle le propose,<br>l'utilisateur décide"]
+    B -->|autorisé| C["Les gardes :<br>jamais la maison, le tailnet, les adresses de confiance"]
+    C --> D["Dans la cage,<br>à l'essai quand c'est possible"]
+    D --> E["Elle relit le résultat<br>(statut, santé, journal)"]
+    E -->|raté| R["Retour arrière automatique"]
+    E -->|réussi| F["Elle le raconte :<br>Proactivité et Journal"]
+    R --> F
+```
+
+Un geste hors du catalogue n'existe pas : c'est ce qui borne ce qu'elle peut faire seule.
 
 ## Ce qu'elle ne fait pas seule
 
